@@ -43,7 +43,20 @@ use super::derived_confidence;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 输出上限：本判定的输出是一个 JSON 对象，长输出即契约失败。
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1024;
+///
+/// 取值依据是「该 provider 的 thinking 模型把 reasoning token 也算进 `max_output_tokens`」
+/// 这条实测事实，而不是「防止模型啰嗦」：调小只会截断思考，不会让输出更简短。
+///
+/// 2026-09-22 真调（同一提示词直调 `/responses`）：
+/// cap 1024 → `incomplete`（`reason=max_output_tokens`，预算被 reasoning 吃光）；
+/// cap 8192 → 已能完成，但同一提示词（`case-003`）重跑时 reasoning 用到 8481、11425 token，
+/// 仍会被 8192 截断（判断器 4 次调用因此失败 1 次）；
+/// cap 16384 → `completed`（reasoning 8481 / 4493），cap 32768 亦被服务端接受。
+///
+/// 取 16384 是两头取中：实测完成所需的 reasoning 最长 11425，16384 覆盖它；而按实测速率
+/// （约 4.5 ms/token）跑满 16384 约 74 s，仍在 [`DEFAULT_TIMEOUT`] 的 120 s 之内——
+/// 再往上（如 32768）跑满预算就会超时，失败形态从「截断」变成「超时」，反而更差。
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 
 /// 错误信息里保留的模型原始输出长度，用于定位契约漂移。
 const RAW_OUTPUT_PREVIEW: usize = 200;
@@ -99,8 +112,15 @@ impl Judge for LlmJudge {
                 return Err(Error::CallFailed(format!("通道返回失败响应：{detail}")));
             }
             if response.status != ResponseStatus::Completed {
+                // 截断原因随错误一起落进报告：只写「状态不是 completed」时，
+                // 报告本身分不清是预算被 reasoning 吃光还是内容过滤，还得回头重跑才知道。
+                let reason = response
+                    .incomplete_details
+                    .as_ref()
+                    .map(|details| format!("，incomplete_details.reason={:?}", details.reason))
+                    .unwrap_or_default();
                 return Err(Error::InvalidResponse(format!(
-                    "响应状态是 {:?}，不是 completed",
+                    "响应状态是 {:?}{reason}，不是 completed",
                     response.status
                 )));
             }
