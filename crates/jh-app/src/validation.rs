@@ -182,6 +182,9 @@ pub async fn run(
         .filter(|case| case.pair == pair)
         .collect();
     let mut cases = Vec::with_capacity(cases_of_pair.len());
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut usage_seen = false;
 
     for case in cases_of_pair {
         let request = JudgeRequest {
@@ -229,6 +232,11 @@ pub async fn run(
                     result.brier = scored.as_ref().map(|score| score.brier).unwrap_or(f64::NAN);
                     result.log_loss = scored.as_ref().and_then(|score| score.log_loss);
                     result.version_label = Some(record.version.clone());
+                    if let Some(usage) = &record.usage {
+                        usage_seen = true;
+                        input_tokens += usage.input_tokens.unwrap_or(0);
+                        output_tokens += usage.output_tokens.unwrap_or(0);
+                    }
                     calls.append(&CallEntry::Judgment {
                         run: run_id.to_owned(),
                         case: format!("validation-{}", case.id),
@@ -262,7 +270,9 @@ pub async fn run(
         cases.push(result);
     }
 
-    let stats = summarize(&cases);
+    let mut stats = summarize(&cases);
+    stats.input_tokens = usage_seen.then_some(input_tokens);
+    stats.output_tokens = usage_seen.then_some(output_tokens);
     Ok(ValidationRun {
         question: question.clone(),
         version: spec.version,

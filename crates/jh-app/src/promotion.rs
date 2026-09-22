@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 use jh_core::{
     ActionId, Answer, FieldSelection, Invalidation, Judgment, JudgmentRecord, NewQuestion, NodeId,
@@ -660,7 +661,34 @@ pub fn publish(
     Ok((records, invalidation_summary(&invalidation)))
 }
 
-/// 在既有状态里补一条该问题的判断记录（发布/回退的失效联动要作用在真有判断的状态上）。
+/// 记一次验证读数（§6.3 的「验证记录」：读数按原值进问题库）。
+pub fn record_validation(
+    library: &mut QuestionLibrary,
+    question: &QuestionId,
+    version: QuestionVersion,
+    kind: jh_core::ValidationKind,
+    readings: BTreeMap<String, f64>,
+    note: String,
+    at_unix_ms: u64,
+) -> Result<(), Error> {
+    Ok(library.record_validation(
+        question,
+        version,
+        jh_core::ValidationRecord {
+            at_unix_ms,
+            kind,
+            readings,
+            note,
+        },
+    )?)
+}
+
+/// 把问题库落盘（报告里的「维护成本」与回退目标靠它复核）。
+pub fn write_library(path: &Path, library: &QuestionLibrary) -> Result<(), Error> {
+    crate::compare::write_json(path, library)
+}
+
+/// 在状态里补一条该问题的判断记录（发布/回退的失效联动要作用在真有判断的状态上）。
 ///
 /// 投影按当时仍有效的证据整体登记（保守口径，与循环里的装配规则同源）。
 pub fn record_judgment(

@@ -124,6 +124,8 @@ pub struct H3Report {
     pub promotion: PromotionSection,
     /// 判定器 × 臂读数。
     pub arms: Vec<ArmReport>,
+    /// 精化收益（扣除成本之后的净读数）。
+    pub gains: GainsSection,
     /// 逐任务的原始位置与摘要。
     pub raw: RawPaths,
     /// 成本账。
@@ -354,6 +356,10 @@ pub struct ArmTotals {
     pub recovered: String,
     /// 未恢复的必需动作。
     pub unrecovered: Vec<String>,
+    /// 必需动作总数（这一臂的分母）。
+    pub required_actions: u32,
+    /// 其中真的发出的数量。
+    pub recovered_actions: u32,
     /// 不该发出的动作次数。
     pub wrong_actions: u32,
     /// 基于失效前提发出的动作次数。
@@ -416,6 +422,10 @@ pub struct TaskSummary {
     pub wrong_actions: Vec<String>,
     /// 必需动作与恢复情况。
     pub unrecovered: Vec<String>,
+    /// 必需动作总数。
+    pub required_actions: u32,
+    /// 其中真的发出的数量。
+    pub recovered_actions: u32,
     /// 观察动作与成本。
     pub observations: Vec<String>,
     /// 观察动作的计价成本合计。
@@ -447,6 +457,45 @@ impl TaskSummary {
     }
 }
 
+/// 精化收益（§10.1「未见任务上的精化收益」）：两臂之差与它对应的成本并排给出。
+///
+/// 本项目不虚构货币价格：收益与成本都用可核的量（验收通过数、错误动作数、调用数、token、
+/// 动作计价单位），净读数写成文字，不做「收益 > 成本」的自动判定——那是实验层的结论。
+#[derive(Debug, Clone, Serialize)]
+pub struct GainsSection {
+    /// 逐判定器的收益读数。
+    pub per_judge: Vec<GainReading>,
+    /// 口径说明。
+    pub note: String,
+}
+
+/// 一个判定器上的收益读数（精化臂 − 固定臂）。
+#[derive(Debug, Clone, Serialize)]
+pub struct GainReading {
+    /// 判定器。
+    pub judge: String,
+    /// 验收通过与任务数：固定 → 精化。
+    pub acceptance: String,
+    /// 验收通过数之差。
+    pub acceptance_delta: i32,
+    /// 不该发出的动作数：固定 → 精化。
+    pub wrong_actions: (u32, u32),
+    /// 不该发出的动作数之差。
+    pub wrong_actions_delta: i32,
+    /// 恢复的必需动作：固定 → 精化。
+    pub recovered: (String, String),
+    /// 观察动作计价成本：固定 → 精化。
+    pub observation_cost_units: (f64, f64),
+    /// 判断调用数：固定 → 精化。
+    pub calls: (u32, u32),
+    /// 精化循环本身的调用数（生成 + 验证 + 影子）。
+    pub refinement_calls: u32,
+    /// 精化循环本身的 token（通道上报，缺报时为 `None`）。
+    pub refinement_tokens: Option<u64>,
+    /// 净读数（文字）：收益是什么、代价是什么、哪一条读不出。
+    pub net: String,
+}
+
 /// 原始数据位置。
 #[derive(Debug, Clone, Serialize)]
 pub struct RawPaths {
@@ -466,6 +515,10 @@ pub struct RawPaths {
     pub candidates_file: String,
     /// 反例记录。
     pub counterexamples_file: String,
+    /// 固定臂的问题库（只有 v1）。
+    pub fixed_library: String,
+    /// 精化臂的问题库（带发布/回退记录与验证记录）。
+    pub refined_library: String,
 }
 
 /// 成本账：按用途分组的调用读数（货币成本不虚构）。
@@ -749,8 +802,48 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             version: version.0,
             run: validation_run.clone(),
         });
+        // 验证记录下来（§6.3 的「验证记录」）：读数按原值进问题库。
+        promotion::record_validation(
+            &mut refined_library,
+            &pair.question,
+            version,
+            jh_core::ValidationKind::Development,
+            BTreeMap::from([
+                ("cases".to_owned(), f64::from(validation_run.stats.cases)),
+                (
+                    "agreement_rate".to_owned(),
+                    validation_run.stats.agreement_rate.unwrap_or(0.0),
+                ),
+                (
+                    "positive_rate".to_owned(),
+                    validation_run.stats.positive_rate.unwrap_or(0.0),
+                ),
+                (
+                    "negative_rate".to_owned(),
+                    validation_run.stats.negative_rate.unwrap_or(0.0),
+                ),
+            ]),
+            "开发案例、正例与反例上的检验（jev h3 的验证步骤）".to_owned(),
+            unix_ms(),
+        )?;
+        promotion::record_validation(
+            &mut refined_library,
+            &pair.question,
+            version,
+            jh_core::ValidationKind::UnseenVariant,
+            BTreeMap::from([(
+                "unseen_wording_rate".to_owned(),
+                validation_run
+                    .rate_of(validation::CaseKind::Unseen)
+                    .unwrap_or(0.0),
+            )]),
+            "不同表述 / 不同服务的未见用例一致率".to_owned(),
+            unix_ms(),
+        )?;
 
-        // 影子运行：控制路径用固定问题集，候选版本只判定不进决策
+        // 影子运行：控制路径用固定问题集，候选版本只判定不进决策。
+        // 影子只跑这一对的开发案例：影子读数按对读，别的对的任务在它们自己的影子运行里。
+        let dev_entry = family.dev_case(&pair.id).expect("每对一个开发案例");
         promotion::start_shadow(
             &mut refined_library,
             &pair.question,
@@ -766,7 +859,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
         );
         let shadow_readings = shadow::run(
             family,
-            &dev_tasks,
+            &[dev_entry],
             &family.question_set(),
             &plan,
             cycle_judge_built.as_ref(),
@@ -779,9 +872,30 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
         .await?;
         clean &= shadow::clean(&shadow_readings);
         shadow_entries.push(shadow_readings.clone());
+        promotion::record_validation(
+            &mut refined_library,
+            &pair.question,
+            version,
+            jh_core::ValidationKind::ShadowRun,
+            BTreeMap::from([
+                (
+                    "toward_justified".to_owned(),
+                    f64::from(shadow_readings.stats.toward_justified),
+                ),
+                (
+                    "toward_unjustified".to_owned(),
+                    f64::from(shadow_readings.stats.toward_unjustified),
+                ),
+                (
+                    "shadow_judgments".to_owned(),
+                    f64::from(shadow_readings.stats.shadow_judgments),
+                ),
+            ]),
+            "影子运行：新问题参与判断、不进决策；记「若采纳会不会改变有价值的行动分支」".to_owned(),
+            unix_ms(),
+        )?;
 
         // 晋升判据
-        let dev_entry = family.dev_case(&pair.id).expect("每对一个开发案例");
         // 区分口径：**材料足够**的判断里读出「正确一侧」的比例——固定版本一次都没读到关键证据，
         // 按 0 记（它区分不了），不是「没有读数」。
         let dev_rate = discrimination_rate(
@@ -910,7 +1024,17 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
         });
 
         // 回退演练：在晋升后的库副本上把旧版本重新设为启用，核「旧版本还在、可回退」。
+        // 先在状态里补一条 v2 上的判断：回退会把它标成待重查（联动失效看得见）。
         let mut drill_library = refined_library.clone();
+        let on_new_version = promotion::record_judgment(
+            &mut promote_state,
+            &pair.question,
+            version,
+            dev_answer(&dev_run, &pair.dev_case, &pair.question)
+                .unwrap_or(Answer::Noul(jh_core::NoulAnswer { noul: 1.0 })),
+            &format!("rollback-drill-{}", pair.dev_case),
+            cycle_judge.source(),
+        )?;
         let (_, rollback_invalidation) = promotion::publish(
             &mut drill_library,
             &mut promote_state,
@@ -919,6 +1043,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             unix_ms(),
             "回退演练：新版本在未见变体上退化时回到旧版本".to_owned(),
         )?;
+        let _ = on_new_version;
         rollback_record = Some(RollbackRecord {
             pair: pair.id.clone(),
             from: version.0,
@@ -944,6 +1069,11 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             enabled: promotion::enabled_version(&refined_library, &pair.question).map(|v| v.0),
         })
         .collect();
+    // 两臂的问题库各自落盘：回退目标、版本状态与验证记录都能单独复核。
+    let fixed_library_path = options.out_dir.join("question-library-fixed.json");
+    let refined_library_path = options.out_dir.join("question-library-refined.json");
+    promotion::write_library(&fixed_library_path, &fixed_library)?;
+    promotion::write_library(&refined_library_path, &refined_library)?;
 
     // ---- 5. 两臂对照 --------------------------------------------------------------
     let fixed_view = family.question_set_from_library(&fixed_library);
@@ -1017,6 +1147,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
 
     // ---- 6. 成本账与报告 -----------------------------------------------------------
     let cost = cost_section(&calls_path, &options.run, generation_calls)?;
+    let gains = gains_section(&arms, &options.judges, &cost);
     let mut protocols = Vec::new();
     for pair in &family.pairs {
         protocols.push(format!(
@@ -1145,6 +1276,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             library: library_entries,
         },
         arms,
+        gains,
         raw: RawPaths {
             out_dir: absolute(&options.out_dir),
             fixed_traces: absolute(&fixed_dir),
@@ -1154,6 +1286,8 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             calls_log: absolute(&calls_path),
             candidates_file: absolute(&candidates_file),
             counterexamples_file: absolute(&counterexample_path),
+            fixed_library: absolute(&fixed_library_path),
+            refined_library: absolute(&refined_library_path),
         },
         cost,
         notes: declared_notes(),
@@ -1384,6 +1518,8 @@ fn summary_of(
             .collect(),
         executions,
         wrong_actions,
+        required_actions: required.len() as u32,
+        recovered_actions: (required.len() - unrecovered.len()) as u32,
         unrecovered,
         observations,
         observation_cost_units,
@@ -1414,6 +1550,8 @@ fn totals_of(tasks: &[TaskSummary]) -> ArmTotals {
     totals.acceptance = format!("{passed}/{}", tasks.len());
     for task in tasks {
         totals.unrecovered.extend(task.unrecovered.clone());
+        totals.required_actions += task.required_actions;
+        totals.recovered_actions += task.recovered_actions;
         totals.judgments += task.judgments;
         totals.agreements += task.agreements;
         totals.material_insufficient += task.material_insufficient;
@@ -1425,7 +1563,7 @@ fn totals_of(tasks: &[TaskSummary]) -> ArmTotals {
         totals.action_cost_units += task.action_cost_units;
         totals.wrong_actions += task.wrong_actions.len() as u32;
     }
-    totals.recovered = format!("{}/{}", 0, 0);
+    totals.recovered = format!("{}/{}", totals.recovered_actions, totals.required_actions);
     totals
 }
 
@@ -1767,6 +1905,111 @@ fn dev_answer(run: &ArmRun, task: &str, question: &QuestionId) -> Option<Answer>
         .map(|judgment| judgment.answer.clone())
 }
 
+/// 精化收益：两臂之差与精化循环的成本并排（§10.1、§6.5）。
+fn gains_section(arms: &[ArmReport], judges: &[JudgeName], cost: &CostSection) -> GainsSection {
+    let refinement_calls: u32 = cost
+        .by_purpose
+        .iter()
+        .filter(|purpose| {
+            matches!(
+                purpose.purpose.as_str(),
+                "generation" | "validation" | "shadow"
+            )
+        })
+        .map(|purpose| purpose.calls)
+        .sum();
+    let refinement_tokens: Option<u64> = {
+        let input: u64 = cost
+            .by_purpose
+            .iter()
+            .filter(|purpose| {
+                matches!(
+                    purpose.purpose.as_str(),
+                    "generation" | "validation" | "shadow"
+                )
+            })
+            .filter_map(|purpose| purpose.input_tokens)
+            .sum();
+        let output: u64 = cost
+            .by_purpose
+            .iter()
+            .filter(|purpose| {
+                matches!(
+                    purpose.purpose.as_str(),
+                    "generation" | "validation" | "shadow"
+                )
+            })
+            .filter_map(|purpose| purpose.output_tokens)
+            .sum();
+        (input + output > 0).then_some(input + output)
+    };
+
+    let mut per_judge = Vec::new();
+    for name in judges {
+        let find = |arm: &str| {
+            arms.iter()
+                .find(|entry| entry.judge == name.cli_name() && entry.arm == arm)
+        };
+        let (Some(fixed), Some(refined)) = (find("fixed"), find("refined")) else {
+            continue;
+        };
+        let acceptance_of = |arm: &ArmReport| {
+            arm.totals
+                .acceptance
+                .split_once('/')
+                .and_then(|(passed, _)| passed.parse::<u32>().ok())
+                .unwrap_or(0) as i32
+        };
+        let acceptance_delta = acceptance_of(refined) - acceptance_of(fixed);
+        let wrong_actions_delta =
+            refined.totals.wrong_actions as i32 - fixed.totals.wrong_actions as i32;
+        let net = format!(
+            "收益：验收 {} → {}（{:+} 个任务）、不该发出的动作 {} → {}（{:+}）；代价：精化循环 {} 次调用（生成 + 验证 + 影子）{}、两臂判断调用 {} vs {}、观察计价 {} vs {} 单位。读数只记原值：不做「收益大于成本」的自动判定，货币成本本项目不虚构。",
+            fixed.totals.acceptance,
+            refined.totals.acceptance,
+            acceptance_delta,
+            fixed.totals.wrong_actions,
+            refined.totals.wrong_actions,
+            wrong_actions_delta,
+            refinement_calls,
+            refinement_tokens
+                .map(|tokens| format!("（{tokens} token）"))
+                .unwrap_or_else(|| "（token 未上报）".to_owned()),
+            fixed.calls.attempted,
+            refined.calls.attempted,
+            fixed.totals.observation_cost_units,
+            refined.totals.observation_cost_units,
+        );
+        per_judge.push(GainReading {
+            judge: name.cli_name().to_owned(),
+            acceptance: format!(
+                "{} → {}",
+                fixed.totals.acceptance, refined.totals.acceptance
+            ),
+            acceptance_delta,
+            wrong_actions: (fixed.totals.wrong_actions, refined.totals.wrong_actions),
+            wrong_actions_delta,
+            recovered: (
+                fixed.totals.recovered.clone(),
+                refined.totals.recovered.clone(),
+            ),
+            observation_cost_units: (
+                fixed.totals.observation_cost_units,
+                refined.totals.observation_cost_units,
+            ),
+            calls: (fixed.calls.attempted, refined.calls.attempted),
+            refinement_calls,
+            refinement_tokens,
+            net,
+        });
+    }
+
+    GainsSection {
+        per_judge,
+        note: "精化收益按判定器分别给出：差值是精化臂 − 固定臂，两臂共享任务集、初始证据、判定器配置与决策时机，差别只有问题库启用的版本。成本侧包含生成、验证、影子（后续评估）与两臂判断调用；维护成本的一等表达是问题库的版本数与停用/替代记录（见 promotion.library）。".to_owned(),
+    }
+}
+
 /// 成本账：从调用记录里按 `run` 标识统计每个用途的调用读数。
 fn cost_section(calls_path: &Path, run: &str, generation_calls: u32) -> Result<CostSection, Error> {
     let entries = crate::calls::read_entries(calls_path)?;
@@ -1870,6 +2113,14 @@ fn cost_section(calls_path: &Path, run: &str, generation_calls: u32) -> Result<C
 /// 指标口径声明。
 pub fn metric_definitions() -> BTreeMap<String, String> {
     BTreeMap::from([
+        (
+            "validation".to_owned(),
+            "候选在开发案例、正例（材料足够）、反例（材料不足 → other）与不同表述 / 不同服务的未见用例上各判一次；材料按被验证版本声明的读取范围裁剪，读数（一致率、Brier、对数损失、调用与 token）按原值进报告与问题库的验证记录。".to_owned(),
+        ),
+        (
+            "promotion".to_owned(),
+            "晋升标准与阈值在跑之前写死在 promotion::DECLARED_CRITERIA 与 declared_thresholds 里；没达标就不发布（保留固定问题模式），标准不因读数而下调。".to_owned(),
+        ),
         (
             "acceptance".to_owned(),
             "独立验收只读证据日志与隐藏真值：必需动作（含观察动作）是否在某轮真的发出、有没有不该发出的动作；控制器的完成声明不参与判定。".to_owned(),
@@ -2013,6 +2264,21 @@ impl H3Report {
                 ));
             }
             lines.push(format!("   {}", arm.verification.detail));
+        }
+        for reading in &self.gains.per_judge {
+            lines.push(format!(
+                "精化收益（{}）：验收 {}（{:+}）｜错动作 {} → {}｜恢复 {} → {}｜调用 {} vs {}｜精化循环 {} 次",
+                reading.judge,
+                reading.acceptance,
+                reading.acceptance_delta,
+                reading.wrong_actions.0,
+                reading.wrong_actions.1,
+                reading.recovered.0,
+                reading.recovered.1,
+                reading.calls.0,
+                reading.calls.1,
+                reading.refinement_calls,
+            ));
         }
         for purpose in &self.cost.by_purpose {
             lines.push(format!(
