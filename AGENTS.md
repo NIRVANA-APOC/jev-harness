@@ -29,4 +29,4 @@ Jev 的详细定位、用法与风险，以及项目决策记录，见 `docs/pro
 - **类型安全**：问题定义、答案结构、状态流转尽量用 Rust 类型表达，让编译期承担尽可能多的约束。
 - **Jev 客户端需自建**：官方只有 Python / JS SDK，Rust 侧自行实现 HTTP 客户端；类型映射与契约边界见 `docs/jev-research.md` §10 与 §14.3 E5。
 - **工具链**：以 `cargo fmt`、`cargo clippy`、`cargo test` 为提交前的标准检查；代码风格服从工具默认，不引入个人偏好。
-- 模块划分与依赖选型尚未确定；需要时在改动中一并明确，并同步更新本文件。
+- **目录布局与依赖清单已定**：workspace 分 `crates/jh-app`、`jh-jev`、`jh-openai`、`jh-tui` 四个 crate，依赖版本统一登记在根 `Cargo.toml` 的 `[workspace.dependencies]`（各 crate 一律 `workspace = true` 引用），`Cargo.lock` 已入库锁定；各 crate 内部的模块划分仍待定，需要时在改动中一并明确。
