@@ -1,0 +1,17 @@
+[package]
+name = "jh-openai"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust client for the OpenAI Responses API (POST /v1/responses, SSE streaming)"
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
