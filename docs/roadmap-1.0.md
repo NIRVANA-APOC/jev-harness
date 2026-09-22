@@ -8,12 +8,14 @@
 | 项 | 结论 |
 | --- | --- |
 | 语言 / 界面 | Rust 全栈；TUI（极简：对话 + 决策轨迹 + 审批） |
-| LLM 侧 | OpenAI 兼容协议（`POST /chat/completions` + SSE 流式），默认 DeepSeek（`deepseek-chat`），`base_url` / `model` 可配 |
+| LLM 侧 | OpenAI **Responses API**（`POST /v1/responses` + SSE 流式事件），默认 DeepSeek（`deepseek-chat`），`base_url` / `model` 可配 |
 | Jev 侧 | 使用真实 API（key 只经环境变量 / 本地 `.env` 注入，绝不入库） |
 | 探索重点 | 门控+循环边界 / 路由 / 评估 judge —— **三条都做最小闭环** |
 | 项目原则 | 个人学习、奥卡姆剃刀（如无必要勿增实体）、禁止过度防御性编程、不做降级容灾 |
 
-> 术语约定：「OpenAI 兼容协议」指 `chat/completions`（DeepSeek 支持该端点；OpenAI 新的 `/v1/responses` DeepSeek 并不支持）。若日后确需 Responses API 形态，单独讨论。
+> 术语约定：LLM 侧一律按 **OpenAI Responses API** 口径实现——`POST {base_url}/responses`、`stream: true` + SSE 事件（客户端见 `crates/jh-openai`）；早期文档里的「OpenAI 兼容协议 / `chat/completions`」不再是本项目的目标协议。
+
+> **风险（未验证）**：所选 provider（DeepSeek）是否提供 `/responses` 端点**尚未验证**，M1 需用真实调用确认；若不可用，则需换 provider 或另议协议。
 
 ## 1. 核心命题与设计回答
 
@@ -41,7 +43,7 @@ jev-harness/
 ├── crates/
 │   ├── jh-app/               # 组装层，bin: jev（chat / ask / run / exp 四个子命令）
 │   ├── jh-jev/               # Jev 客户端（POST /v1/systemone，serde 内部标签枚举）
-│   ├── jh-openai/            # OpenAI 兼容客户端（SSE 流式，reqwest + 手写 SSE 解析）
+│   ├── jh-openai/            # OpenAI Responses 客户端（POST /v1/responses，SSE 流式，reqwest + 手写 SSE 解析）
 │   └── jh-tui/               # ratatui + crossterm：对话流 / 决策轨迹 / 输入与审批
 ├── docs/                     # 文档（含本路线图与 experiments-1.0.md）
 └── var/                      # 运行产物（sessions/*.jsonl），gitignore
@@ -49,8 +51,8 @@ jev-harness/
 
 四个 crate 按「外部边界」切分：三个通道（Jev / OpenAI / TUI）各自独立，`jh-app` 负责把它们组装成 Agent 循环；crate 内部的模块划分（领域类型、决策策略、轨迹记录等）随各自实现落地。
 
-> **Cargo.lock 暂不入库**（`.gitignore` 已忽略）：并行开发阶段 lockfile 改动会互相冲突，且不在各任务 scope 内。
-> 1.0 批次末尾由专门任务统一 `cargo update` 并提交 `Cargo.lock`；此后按二进制项目惯例入库。
+> **Cargo.lock 已锁定入库**：四个 crate 全部合并后，由专门任务执行 `cargo generate-lockfile` 生成完整解析，并用 `git add -f` 强制提交（并行开发阶段它一直被 `.gitignore` 忽略，以免各分支的 lockfile 改动互相冲突）。
+> 维护提醒：`.gitignore` 里的 `Cargo.lock` 条目保留不动；但已跟踪文件的改动不受 ignore 规则影响，后续更新依赖后需显式 `git add` lockfile。
 
 **依赖选型（刻意的短清单，统一登记在根 `Cargo.toml` 的 `[workspace.dependencies]`，各 crate 一律 `workspace = true` 引用）**：`tokio`（异步运行时）、`reqwest`（rustls；HTTP + SSE 手写解析）、`serde` / `serde_json`、`toml` + `dotenvy`（配置）、`thiserror`（显式错误枚举，不引入 anyhow）、`clap`（子命令）、`tracing` + `tracing-subscriber`（日志）、`ratatui 0.30` + `crossterm 0.29`（TUI）、`unicode-width` / `unicode-segmentation` / `textwrap`（TUI 排版）、`futures` / `bytes`（流式与字节缓冲）。TUI 相关版本取 crates.io 当前稳定版，不再对齐 grok-tui 研究的 0.29 / 0.28。**不引入** `async-openai`：协议层自己写（约 200 行），也更贴合「Jev 客户端需自建」的学习目标。
 
@@ -73,8 +75,8 @@ jev-harness/
 
 | # | 里程碑 | 交付物 | 验收标准 |
 | --- | --- | --- | --- |
-| **M0** | 工作区骨架（半天） | workspace 根配置（`members = ["crates/*"]`、`resolver = "2"`、统一 `[workspace.dependencies]` 清单）+ bin `jev`（`--version` 与 chat / ask / run / exp 四个子命令壳，均未实现）+ `.gitignore`（`target/`、`Cargo.lock`、`.env`、`var/`，Cargo.lock 暂不入库）+ 路线图同步；四个 crate（jh-app / jh-jev / jh-openai / jh-tui）的实现由 M1–M3 补齐，领域类型 / `Decider` / `Tool` trait / 配置（`jev.toml`）/ Jev fixture 随之延后 | `cargo test` 全绿；`jev --version` 可运行；`git status` 无残留未跟踪文件；**无任何网络调用** |
-| **M1** | LLM 通道（1 天） | OpenAI 兼容客户端（流式）+ `jev chat` 纯 CLI 对话 | 与 DeepSeek 真实对话跑通；401/429 显式报错、不吞 |
+| **M0** | 工作区骨架（半天） | workspace 根配置（`members = ["crates/*"]`、`resolver = "2"`、统一 `[workspace.dependencies]` 清单）+ bin `jev`（`--version` 与 chat / ask / run / exp 四个子命令壳，均未实现）+ `.gitignore`（`target/`、`Cargo.lock`、`.env`、`var/`；Cargo.lock 当时暂不入库，批次末尾已锁定入库，见 §2）+ 路线图同步；四个 crate（jh-app / jh-jev / jh-openai / jh-tui）的实现由 M1–M3 补齐，领域类型 / `Decider` / `Tool` trait / 配置（`jev.toml`）/ Jev fixture 随之延后 | `cargo test` 全绿；`jev --version` 可运行；`git status` 无残留未跟踪文件；**无任何网络调用** |
+| **M1** | LLM 通道（1 天） | OpenAI Responses 客户端（`POST /v1/responses`，流式）+ `jev chat` 纯 CLI 对话 | 先确认 provider 的 `/responses` 可用（见 §0 未验证风险），再与 DeepSeek 真实对话跑通；401/429 显式报错、不吞 |
 | **M2** | Jev 通道（1 天） | Jev HTTP 客户端 + `jev ask --noul/--choice/--score`；pin 版本；录制真实响应为 fixture | 真实调用成功并打印答案 / 概率 / 延迟 / request_id；fixture 离线回放可复现 |
 | **M2.5** | **E1 中文基线（提前跑）** | 30–50 条中文样本 × 三种 prompt 条件的最小对照 | 得出「中文是否可用」的初步结论，避免后程返工 |
 | **M3** | 循环 + 三条闭环（2–3 天） | 三个工具；Agent 循环；Gate / Route / Boundary / Judge 各自三种实现可切换；JSONL 轨迹 | 一个真实任务端到端跑通；轨迹里能看到每条判定的概率与阈值 |
@@ -92,7 +94,7 @@ jev-harness/
 
 ## 6. 1.0 明确不做（non-goals）
 
-- 多 provider 生态（只 OpenAI 兼容一家，DeepSeek 默认）
+- 多 provider 生态（只 OpenAI Responses API 一家，DeepSeek 默认）
 - TUI 的主题体系、多面板、鼠标、多会话（留给 1.x）
 - MCP、子代理 / 多智能体、插件系统
 - 降级 / 容灾 / 重试编排（项目已决定接受该风险；错误一律显式暴露）
