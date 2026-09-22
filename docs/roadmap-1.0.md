@@ -4,10 +4,10 @@
 > **本文不产生研究结论**，也不新增阈值、效应量、工期或性能数字：所有实验设计与指标口径以研究目标 §9–§10 为准，本文只给落点与章节引用。
 > **引用约定**：不带文档名的 `§x` 一律指本文件；引用其他文档时写明「研究目标 §x」或「[Jev 调研报告](jev-research.md) §x」。
 >
-> - 版本：1.0 研究路线（本版重写）
+> - 版本：1.0 研究路线（本版重写；2026-09-22 追加 M0 实现回写，见 §11）
 > - 日期：2026-09-22
 > - 上游文档：[研究目标](RESEARCH_GOALS.md)、[Jev 调研报告](jev-research.md)、[项目笔记](project-notes.md)、[Grok TUI 设计调研](grok-tui-design.md)、[项目总纲](../AGENTS.md)
-> - 代码基线：`crates/` 下现有四个 crate，事实逐条见 §1.3
+> - 代码基线：`crates/` 下现有五个 crate（`jh-core` 于 M0 落地），事实逐条见 §1.3
 > - 研究目标 §12 的 M0–M4 是本文 §5 的直接来源；M5 不在 1.0 范围内（见 §5、§8）
 
 ## 1. 前提与现状
@@ -25,8 +25,9 @@
 
 - **语言与形态**：Rust 全栈（[AGENTS.md](../AGENTS.md) 技术栈要求）；1.0 的可执行形态是批处理实验 + CLI（决定 4）。
 - **LLM 通道**：OpenAI **Responses API** 为目标协议，实现见 `crates/jh-openai`（`crates/jh-openai/src/client.rs:65` `Client::create`、`:84` `Client::stream`）。模型必填、无内建默认（`:144` `ClientBuilder::model`）；key 来自环境变量 `OPENAI_API_KEY`（`:16`），base URL 可覆盖（`:139` `ClientBuilder::base_url`）。
-  **未验证**：所选 provider 是否提供 `/responses` 端点（provider 与模型由配置给出，crate 内无默认值），M0 需用真实调用确认；本 crate 至今未对线上 API 发过请求（`crates/jh-openai/src/lib.rs` 的 *Verification status* 一节）。
-  provider 具体是谁仍按项目既有口径（旧版路线图记为 DeepSeek，`crates/jh-tui` 的示例与快照也用 `deepseek-chat`，但那是 UI 示例值、不是配置默认）。
+  **provider 与配置口径（2026-09-22 回写）**：LLM 侧走 DeepSeek，模型 `deepseek-flash`；`OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` 三者都必填（缺 `OPENAI_BASE_URL` 显式失败，避免 key 被发往 crate 自带的官方缺省端点；`crates/jh-app/src/judge/llm.rs:57-81`），base URL 写法为 `https://api.deepseek.com`（不带尾斜杠；`ClientBuilder::build` 同时会裁剪尾斜杠，端点即 `{base_url}/responses`，`crates/jh-openai/src/client.rs:169`、`:109`）。
+  **`/responses`：文档确认提供、实测未完成**。DeepSeek 官方[《Using the Responses API》](https://api-docs.deepseek.com/guides/responses_api/)写明 “our API now supports the Responses API format, with the base_url being https://api.deepseek.com”，示例即 `client.responses.create(model="deepseek-flash", …)`（本文 2026-09-22 亲自核对）；官方 Codex 集成页的 `wire_api = "responses"` 与定价页的 `Responses API ✓` 同向（M11 探测抓取）。**运行层面仍未验证**：本环境无 API key，`crates/jh-openai` 至今未对线上 API 发过请求（`crates/jh-openai/src/lib.rs` 的 *Verification status* 一节），端点的实际状态码、SSE 事件名吻合度与响应体反序列化都待真调（解锁命令见 §5 M0）。
+  **无状态约束**：DeepSeek 的 Responses 实现无状态（`store`、`previous_response_id` 不支持，未支持参数被静默忽略），因此每次判断请求自带全部材料，判定契约放进用户消息而不是可能被丢弃的 `instructions` 字段（`crates/jh-app/src/judge/llm.rs:18-26`）。
 - **Jev 通道**：使用真实 API；key 只经环境变量（`TYPESAFE_API_KEY`，`crates/jh-jev/src/client.rs:69` `Client::from_env`），不入库、不进文档与日志；模型 pin `jev-1.13.0`（`crates/jh-jev/src/client.rs:20` `DEFAULT_MODEL`），请求显式带版本化 ID、不用别名（依据：[Jev 调研报告](jev-research.md) §5.1、§13.3.5）。
 - **判定分层与概率优先**：能让确定性代码判断的不调模型，能让 Jev 判断的不调 LLM；`probabilities` / `confidence` / `noul` 原值保留，不提前塌缩成布尔值（[AGENTS.md](../AGENTS.md) 技术栈要求；[Jev 调研报告](jev-research.md) §13.3.3）。
 - **项目性质**：个人学习项目、不商用；奥卡姆剃刀、禁止过度防御性编程、错误显式失败（[AGENTS.md](../AGENTS.md) 核心理念）。
@@ -36,18 +37,18 @@
 
 | # | 能力 | 现状 | 证据（路径 / 符号） |
 | --- | --- | --- | --- |
-| 1 | workspace 与依赖锁定 | 已就位 | 根 `Cargo.toml`：`[workspace] members = ["crates/*"]`、`resolver = "2"`、17 项 `[workspace.dependencies]`（`tokio 1.53`、`reqwest 0.13`、`serde 1.0`、`thiserror 2.0`、`clap 4.6`、`ratatui 0.30`、`crossterm 0.29` 等；其中 `tracing-subscriber` / `dotenvy` / `toml` 目前无 crate 引用）；`Cargo.lock` 已跟踪入库（`git ls-files Cargo.lock` 命中） |
+| 1 | workspace 与依赖锁定 | 已就位 | 根 `Cargo.toml`：`[workspace] members = ["crates/*"]`、`resolver = "2"`、20 项 `[workspace.dependencies]`（3 条内部 path 依赖 `jh-core` / `jh-jev` / `jh-openai`，17 项外部版本：`tokio 1.53`、`reqwest 0.13`、`serde 1.0`、`thiserror 2.0`、`clap 4.6`、`ratatui 0.30`、`crossterm 0.29` 等；其中 `tracing-subscriber` / `dotenvy` / `toml` 目前无 crate 引用）；`Cargo.lock` 已跟踪入库（`git ls-files Cargo.lock` 命中） |
 | 2 | Jev 客户端（jh-jev） | 已完成，离线验证；**真实调用记录 0** | `crates/jh-jev/src/question.rs:119` `Question::{Choice,Score,Noul}`；`answer.rs:62` `Answer::{Choice,Score,Noul,Unknown}`；`answer.rs:147` `NoulAnswer`（无 `confidence` 字段，类型层面拦住误用）；`client.rs:108` `Client::system_one`（`POST {base_url}/v1/systemone`）；`error.rs:124` `Error`（401/422/429/529 各自变体，`:180` `request_id`、`:193` `retry_after`）；`fixtures/` 8 份官方示例请求/响应，**是官方文档抄件、不是真实录包**（`tests/fixtures.rs` 自述）；真调 smoke 在 `tests/smoke.rs` 标 `#[ignore]`，从未真跑 |
 | 3 | OpenAI 客户端（jh-openai） | 已完成，离线验证；**真实调用记录 0** | `crates/jh-openai/src/client.rs:48` `Client::builder`、`:65` `create`、`:84` `stream`、`:218` `ResponseStream::next_event`；`sse.rs:18` `SseDecoder`（`:35` `push`，手写 SSE，含跨块多字节与 CRLF 处理）；`types.rs:497` `Event`（文档 59 个流事件中解码 20 个，其余落入 `Event::Other`）；`fixtures/` 7 份手工构造的离线样本（非录包）；`tests/live_smoke.rs` 3 个用例标 `#[ignore]`，从未真跑 |
 | 4 | TUI 组件库（jh-tui） | **组件库已落地，1.0 不接线（留待 1.x 接线）** | `crates/jh-tui/src/components/mod.rs:11-14` 导出回滚区 / 提示框 / 状态行与快捷键栏 / 审批卡；`app.rs:55` `App`、`actions.rs:22` `ActionId`、`render.rs:65` `RenderGate`、`terminal.rs:81` `TerminalGuard`、`blocks.rs:93` `BlockOutput`（块模型）；快照测试是 `TestBackend` 缓冲区上的内联多行断言（`tests/snapshots.rs` + `tests/common/mod.rs`），不是 insta、无 `.snap` 文件。注意 `RenderGate` 是**重绘闸门**，与旧版路线图的 Gate 决策点同名不同义 |
-| 5 | 组装层与 CLI（jh-app） | 空壳，且**尚未接线** | `crates/jh-app/src/main.rs:17` `enum Command`（`chat` / `ask` / `run` / `exp`）；`:29-32` 四个分支一律打印「未实现」并返回 `ExitCode::from(2)`；`crates/jh-app/Cargo.toml` 目前只依赖 `clap`，不依赖 `jh-jev` / `jh-openai` / `jh-tui`（四个 crate 彼此未接线） |
-| 6 | 运行时对象与实验设施 | **不存在** | 事件日志与证据、判断记录、依赖图、失效传播、问题版本、观测器契约、实验环境与真值、指标统计在 `crates/` 下无任何对应模块或符号；`crates/jh-core` 尚不存在（决定 3 的新增项）；`var/` 目录与实验脚本（`scripts/`、`.py` / `.sh`）均未创建（`.gitignore` 已列 `var/`） |
-| 7 | 测试基线 | 全绿 | `cargo test --workspace`：175 passed / 0 failed / 4 ignored（4 个 ignored 均为真调 smoke） |
-| 8 | crate 内部模块划分 | 未定 | [AGENTS.md](../AGENTS.md)：「各 crate 内部的模块划分仍待定，需要时在改动中一并明确」 |
+| 5 | 组装层与 CLI（jh-app） | **M0 已接线**（`exp`）；`chat` / `ask` / `run` 仍为空壳 | `crates/jh-app/src/main.rs:47-65` `ExpArgs`（`--judge` 可重复 / `--calls` / `--replay` / `--out`）、`:78` `run_exp`；`chat` / `ask` / `run` 仍打印「未实现」并返回 `ExitCode::from(2)`（`:70-73`）；实验层模块 `judge/`（五种适配器，`src/judge/{jev,llm,rule,replay,simulated}.rs`）、`tasks`、`calls`、`metrics`、`report`、`exp` 已落地；依赖 `jh-core` / `jh-jev` / `jh-openai` / `tokio` 等（`crates/jh-app/Cargo.toml`） |
+| 6 | 运行时对象与实验设施 | **M0 部分落地** | **已有**：判断记录（`crates/jh-core/src/record.rs`）、问题定义与版本（`crates/jh-core/src/question.rs`）、初始任务集与隐藏真值（`crates/jh-app/src/tasks.rs` + `crates/jh-app/tasks/initial_tasks.json`）、调用记录落盘（`crates/jh-app/src/calls.rs`）、指标统计与 JSON 报告（`crates/jh-app/src/metrics.rs`、`crates/jh-app/src/report.rs`）；**仍未建**：事件日志与证据、依赖图、失效传播、行动前提复核、观测器契约（M1–M3 的对象）；`var/` 由运行时创建、不入库（`.gitignore` 已列；无实验脚本，命令行 `jev exp` 承担） |
+| 7 | 测试基线 | 全绿（2026-09-22 复核） | `cargo test --workspace`：253 passed / 0 failed / 6 ignored（6 个 ignored = jh-jev 1 + jh-openai 3 + jh-app 2，**全部是真调 smoke**） |
+| 8 | crate 内部模块划分 | jh-core / jh-app **已定并回写**（§3.4）；通道 crate 冻结不动 | [AGENTS.md](../AGENTS.md) 的「各 crate 内部的模块划分仍待定」现只适用于未动的通道 crate；jh-core 与 jh-app 的实际模块与类型见 §3.4 |
 
 ### 1.4 与「研究目标」的差距
 
-现有四个 crate 只完成了**外部边界**：两条模型通道（Jev / OpenAI）与一个 UI 组件套件。研究目标 §5–§8 要求的**运行时对象一个都不存在**，§9–§10 要求的**实验设施（任务环境、真值、隐藏验收、指标统计）全部为空白**。1.0 的工程量主要落在两处：新建 `crates/jh-core`（对象模型）与在 `crates/jh-app` 内建成实验层（判断器适配 + 任务环境 + 报告）。
+通道侧四个 crate 只提供了**外部边界**：两条模型通道（Jev / OpenAI）与一个 UI 组件套件；M0（M9 / M10）补上了 `crates/jh-core` 的判断器抽象与判断记录、`crates/jh-app` 的五种判断器适配、初始任务集与 `jev exp` 基线报告（落地状态见 §5 M0）。研究目标 §5–§8 要求的**运行时对象大部分仍不存在**（事件日志与证据、依赖图、失效传播、行动前提复核、观测器契约），§9–§10 要求的**实验设施**只落了最小的一层（固定问题集、隐藏真值、指标统计与 JSON 报告；快照与扰动、独立验收、计价工具动作还没有）。1.0 的剩余工程量主要落在：`jh-core` 的依赖图与失效传播（M1）、问题集合精化（M2）、观测能力建设（M3）与 `jh-app` 实验层的对照编排。
 
 ## 2. 研究命题与 1.0 野心
 
@@ -89,8 +90,8 @@
 
 | crate | 1.0 职责 | 状态 |
 | --- | --- | --- |
-| `jh-core` | 运行时对象模型：事件与证据、问题定义与版本、判断记录、依赖图与失效传播；判断器抽象；调度与行动前提复核的规则 | **新增** |
-| `jh-app` | 组装层与 CLI：`chat` / `ask` / `run` / `exp`；判断器适配（Jev / LLM / 规则 / 录制 / 模拟真值）；实验层（任务集、快照与扰动、隐藏真值、指标统计、JSON 报告） | 扩展（现为空壳） |
+| `jh-core` | 运行时对象模型：事件与证据、问题定义与版本、判断记录、依赖图与失效传播；判断器抽象；调度与行动前提复核的规则 | **新增**；M0 已落地判断器抽象与判断记录（merge `20386b4`，模块与类型见 §3.4） |
+| `jh-app` | 组装层与 CLI：`chat` / `ask` / `run` / `exp`；判断器适配（Jev / LLM / 规则 / 录制 / 模拟真值）；实验层（任务集、快照与扰动、隐藏真值、指标统计、JSON 报告） | 扩展；M0 已落地五种判断器适配、初始任务集与 `jev exp` 基线报告（merge `22da7bb`，复核尖端 `c3e5583`）；`chat` / `ask` / `run` 仍未接线 |
 | `jh-jev` | Jev 通道：既有客户端原样使用 | 冻结（公共 API 不动） |
 | `jh-openai` | OpenAI Responses 通道：生成模型与 LLM 结构化判断 | 冻结（公共 API 不动） |
 | `jh-tui` | TUI 组件库：已落地，1.0 不接线（留待 1.x 接线）；1.0 不引入其依赖与运行时集成 | 冻结（公共 API 不动） |
@@ -101,19 +102,19 @@
 jev-harness/
 ├── Cargo.toml                # workspace 与统一依赖清单（现状，见 §1.3 #1）
 ├── crates/
-│   ├── jh-core/              # 新增：运行时对象模型与判断器抽象
-│   ├── jh-app/               # 组装层、CLI、判断器适配、实验层与报告
+│   ├── jh-core/              # M0 已落地：判断器抽象与判断记录（模块见 §3.4）
+│   ├── jh-app/               # M0 已落地：判断器适配、初始任务集、调用记录、`jev exp` 与报告
 │   ├── jh-jev/               # 冻结
 │   ├── jh-openai/            # 冻结
 │   └── jh-tui/               # 冻结（1.x 接研究视图）
 ├── docs/                     # 本路线图、研究目标、实验报告（文件名未定，见 §12）
-└── var/                      # 运行产物：事件日志与实验原始数据（.gitignore 已列，尚未创建）
+└── var/                      # 运行产物：调用记录与实验报告（`var/calls.jsonl`、`var/exp/<run>.json`；.gitignore 已列，运行时创建）
 ```
 
 ### 3.2 判断器抽象
 
-- **接口面**：`state + 类型化 questions → 类型化 answers + 概率/置信度 + usage 与显式错误`（[Jev 调研报告](jev-research.md) §13.3.1）；具体 trait 名与签名在实现时确定（§12 未确定项 1）。
-- **实现与归属**：Jev → `jh-app` 调 `jh_jev::Client::system_one`；LLM 结构化判断 → `jh-app` 调 `jh_openai`；规则 / 录制回放 / 模拟器真值 → `jh-app`（研究目标 §8.3）。
+- **接口面（已定，M9 回写）**：`state + 类型化 questions → 类型化 answers + 概率/置信度 + usage 与显式错误`（[Jev 调研报告](jev-research.md) §13.3.1）；Rust 侧即 `jh_core::Judge`（`crates/jh-core/src/judge.rs`）：`JudgeRequest { snapshot, state, questions }` → `JudgeResponse { source, version, answers, usage, request_id }`，接口返回装箱 future 以便放进 `Box<dyn Judge>`（crate 不引入异步运行时）；一次请求放 1 个还是 N 个问题由调用方决定（`Questions` 即 `QuestionId → QuestionSpec` 的映射）；错误只有 `Unavailable` / `CallFailed` / `InvalidResponse` 三档，不重试、不降级、不兜底。
+- **实现与归属（M10 落地）**：五种适配器同住 `crates/jh-app/src/judge/`——Jev → `jev.rs`（调 `jh_jev::Client::system_one`，`version` 取响应的 `model`、`request_id` 取 `x-typesafe-request-id`）、LLM 结构化判断 → `llm.rs`（调 `jh_openai` 的 `Client::create`，自带 JSON 输出契约）、规则 → `rule.rs`、录制回放 → `replay.rs`、模拟真值 → `simulated.rs`；`JudgeName` + `build()` 按名字构造，构造失败只标「未验证」，不在实现内部换后端（研究目标 §8.3）。
 - **复用条件**：结果只在输入快照、问题含义、模型版本与适用范围全部匹配时可复用（研究目标 §8.4）。
 - **发起方式**：同一快照上的兼容问题可批量发送，有依赖的阶段按顺序执行；1.0 必须能同时表达「一次多问」与「逐问」，因为批处理是否会改变判定尚未解决（[Jev 调研报告](jev-research.md) §3.6 与 §8.4 冲突未解，实测见其 §14.3 E3；研究目标 §8.4）。
 
@@ -125,7 +126,12 @@ jev-harness/
 
 ### 3.4 模块划分
 
-crate 内部模块划分仍待定（[AGENTS.md](../AGENTS.md)）；`jh-core` 的对象划分以研究目标 §8.1 的一等对象清单为准，Rust 侧的类型与模块命名在实现时随改动确定并在此文件回写（§12 未确定项 1）。
+**已回写（2026-09-22，M9 / M10 落地）**：
+
+- `crates/jh-core/src/`：`answer`（`Answer::{Choice,Score,Noul}`、`Usage`）、`error`（`Error::{Unavailable,CallFailed,InvalidResponse}`）、`judge`（`Judge`、`JudgeRequest`、`JudgeResponse` 与 `validate`）、`question`（`QuestionId`、`QuestionVersion(u32)`、`QuestionSpec`、`Questions`、`Question::{Choice,Score,Noul}`）、`record`（`JudgmentRecord`、`Judgment`、`JudgeSource::{RealApi,Llm,Rule,Replay,SimulatedTruth}`）、`state`（`State`、`StateEntry`、`SnapshotId`）。
+- `crates/jh-app/src/`：`judge/`（`mod.rs` 的 `JudgeName` / `build()` 与 `jev` / `llm` / `rule` / `replay` / `simulated` 五种适配器）、`tasks`（任务集、隐藏真值与校验）、`calls`（JSONL 调用记录与回放索引）、`metrics`（一致读法 / Brier / 对数损失 / 分位数）、`report`（报告结构与口径声明）、`exp`（运行编排）、`error`。
+- 冻结的 `jh-jev` / `jh-openai` / `jh-tui` 模块划分不动；[AGENTS.md](../AGENTS.md) 的「各 crate 内部的模块划分仍待定」现只适用于这些通道 crate。
+- `jh-core` 的对象划分仍以研究目标 §8.1 的一等对象清单为准：M0 只落了判断器抽象与判断记录，其余一等对象随 M1–M3 逐批回写（§12 未确定项 1 已定）。
 
 ## 4. 运行时规格
 
@@ -161,8 +167,16 @@ crate 内部模块划分仍待定（[AGENTS.md](../AGENTS.md)）；`jh-core` 的
 - **退出证据**：得到本环境的质量、延迟、成本基线，能区分真实 API 与模拟运行（研究目标 §12）。
 - **未达标处理**：无 Jev 访问时继续核心模拟，但 Jev 相关结论保持未验证（研究目标 §12）。
 - **模块归属**：`jh-core`（判断器抽象）、`jh-app`（适配器、调用记录、初始任务集）、`jh-jev`（复用，不改）。
-- **前置约束**：所选 provider 的 `/responses` 端点未验证；无 API key 时 Jev 相关结论一律保持未验证，不得用模拟结果代替。
-- **开放项**：初始任务集的材料来源与规模（本文 §12 未确定项 8）；所选 provider 的 `/responses` 是否可用（§1.2）。
+- **前置约束**：所选 provider 的 `/responses` 端点：**文档层面确认提供、运行层面未验证**（§1.2）；无 API key 时 Jev / LLM 相关结论一律保持未验证，不得用模拟或回放结果代替。
+- **开放项**：初始任务集的材料来源与规模（本文 §12 未确定项 8；M0 已用 4 样本最小合成集落地，任务族 A/B/C 的规模仍待先导实验）；所选 provider 的 `/responses` 是否可用（§1.2；文档确认提供，实测待 key）。
+- **落地状态（2026-09-22 回写，M9 / M10 已合并）**：
+  - **已交付**：判断器接口与判断记录（`jh-core`，merge `20386b4`）；五种判断器适配、初始任务集（4 个中文合成样本 × 3 个问题）、调用记录落盘、`jev exp` 与 JSON 基线报告（`jh-app`，merge `22da7bb`，复核尖端 `c3e5583`）。
+  - **已取得**：离线读数——`cargo run -p jh-app -- exp`（默认 rule + simulated-truth）跑完 4 样本 × 3 题；`--judge replay` 在记录文件已存在时复用成功（首次运行前无记录，该判断器显式标「未验证」，符合预期）。这些读数只是对照与上限估计，**不是本环境的真实基线**。
+  - **未验证（本环境无 API key）**：Jev / LLM 的质量、延迟、usage 读数。两个真调 smoke 保持 `#[ignore]`；`jev exp --judge jev` / `--judge llm` 的 `verification` 为 `not_verified`，命令以非零码退出（报告仍写出）。**相关结论一律标「未验证」，不得用模拟或回放结果替代。**
+  - **解锁命令**（提供 key 后无需改代码；逐条见 `crates/jh-app/tests/live_smoke.rs` 头部）：
+    - Jev：`TYPESAFE_API_KEY=… cargo test -p jh-app --test live_smoke -- --ignored --nocapture`（模型 pin `jev-1.13.0`）
+    - LLM：`OPENAI_API_KEY=… OPENAI_MODEL=deepseek-flash OPENAI_BASE_URL=https://api.deepseek.com cargo test -p jh-app --test live_smoke -- --ignored --nocapture`
+    - 基线报告：`cargo run -p jh-app -- exp --judge jev --judge llm`（报告落 `var/exp/<run>.json`，调用记录追加进 `var/calls.jsonl`）
 
 ### M1 固定问题运行时（对应研究目标 §12 第 2 行）
 
@@ -270,18 +284,18 @@ crate 内部模块划分仍待定（[AGENTS.md](../AGENTS.md)）；`jh-core` 的
 | 1 | 研究目标文档及版本变更记录 | 已存在（`docs/RESEARCH_GOALS.md`），由后续版本维护，不在本路线图范围 |
 | 2 | 核心对象、状态迁移、问题发布、观测器发布与行动复核的架构说明 | 本文件 §3–§4 为 1.0 版；实现落地后按实际回写 |
 | 3 | 可批量运行的 Rust 实验核心及其 TUI | **核心在 1.0；TUI 推迟到 1.x**（决定 4） |
-| 4 | 五种判断器的适配接口 | M0/M1（`jh-app`，见 §3.2） |
-| 5 | 可快照、可扰动的任务环境、开发/验证/测试划分与隐藏验收 | M0–M3（`jh-app` 实验层） |
+| 4 | 五种判断器的适配接口 | **M0 已交付**（`crates/jh-app/src/judge/`，见 §3.2） |
+| 5 | 可快照、可扰动的任务环境、开发/验证/测试划分与隐藏验收 | M0 已交付最小一层（固定问题集、隐藏真值与校验、指标统计与 JSON 报告，见 §5 M0 落地状态）；快照与扰动、开发/验证/测试划分、隐藏验收在 M0–M3 补齐 |
 | 6 | 主要对照、关键消融、统计分析与复现脚本 | M4 |
 | 7 | 按版本保存的问题库、观测器库及其验证记录 | M2/M3；保存形态未定（§12） |
-| 8 | 实验报告（效果、成本、适用边界、反例、失败原因、结论等级） | M4；写回 `docs/`（文件名未定，§12） |
+| 8 | 实验报告（效果、成本、适用边界、反例、失败原因、结论等级） | M4；写回 `docs/`（文件名未定，§12）。M0 的基线读数落在 `var/exp/<run>.json`（运行产物，不入库） |
 | 9 | 一个完整演示：反例出现后新增区分维度或观测能力，并在未见任务上展示效果或失败 | M2 与 M3 联合，M4 呈现 |
 
 ### 7.2 完成定义
 
 - **研究侧**：研究目标 §14.2 的六个问题在 1.0 已实现的机制范围内都有可核查答案，或明确标注为「证据不足」（研究目标 §10.4）；研究目标 §12 的 M5 外部有效性问题除外。负向结果与正向结果同为完成（研究目标 §3.2、§10.4）。
 - **工程侧**：`cargo fmt` / `cargo clippy` / `cargo test` 全绿（[AGENTS.md](../AGENTS.md)）；`jev exp` 能跑完至少一个任务族并产出 JSON 报告；报告含原始数据位置与复现命令。
-- **文档侧**：本文件的架构与运行时规格按实际实现回写；结论与未确定项同步到[项目笔记](project-notes.md)或研究目标的新版本（具体归属待人工确认，见 §13）。
+- **文档侧**：本文件的架构与运行时规格按实际实现回写；结论与未确定项同步到[项目笔记](project-notes.md)或研究目标的新版本（具体归属待人工确认，见 §13）。**M0 已经完成一轮回写（2026-09-22）**：§3.1 / §3.2 / §3.4 的命名与模块、§1.2 的 provider 与配置口径、§1.3 的现状表、§5 M0 的落地状态与解锁命令、§12 未确定项 1 / 2 / 7 已由 M9 / M10 决定并写入，未确定项 10 升级为「文档确认提供、实测未完成」（变更逐条见 §11）；M1 起每阶段合并在同一位置继续回写。
 
 ## 8. 明确不做（1.0 non-goals）
 
@@ -309,11 +323,15 @@ crate 内部模块划分仍待定（[AGENTS.md](../AGENTS.md)）；`jh-core` 的
 | 无 SLA、单一供应商、限流动态 | 同报告 §5.5、§11.2、§13.4 #6 | [项目笔记](project-notes.md) 决策 2：接受风险，1.0 **不实现**降级与容灾；失败必须显式可观测 |
 | API key 泄漏 | 同报告 §11.3 | 只经环境变量（`TYPESAFE_API_KEY` / `OPENAI_API_KEY`），不入库、不进文档与日志 |
 | 批处理可能改变判定（公开证据冲突） | 同报告 §3.6 vs §8.4 | 判断器抽象同时支持「一次多问」与「逐问」（同报告 §14.3 E3），按实测决定高代价判定是否禁用批处理 |
-| 实验设施是最大工程量（任务环境/真值/隐藏验收全缺） | 研究目标 §12 M0–M3；本文 §1.3 #6 | M0 第一交付就是「能区分真实 API 与模拟运行」的判断层 + 初始任务集；无 Jev 访问时按研究目标 §12 的 M0 退路继续模拟 |
+| 实验设施是最大工程量（任务环境 / 真值 / 隐藏验收大部仍缺） | 研究目标 §12 M0–M3；本文 §1.3 #6 | M0 已交付最小一层（固定问题集、隐藏真值与校验、指标统计与 JSON 报告，见 §5 M0 落地状态）；快照与扰动、开发/验证/测试划分、独立验收与计价工具动作在 M0–M3 补齐；无 Jev 访问时按研究目标 §12 的 M0 退路继续模拟 |
 | 完成声明被自证 / 原目标被改写成代理目标 | 研究目标 §7.3、§13.2 失败模式表 | 验收由独立隐藏检查固定（研究目标 §7.3、§9.3）；Agent 完成声明不构成证据（研究目标 §10.1）；精化不得改目标或放宽验收（研究目标 §6.4） |
 | 真值 / 评分标签泄漏进正常输入 | 研究目标 §13.2 | 隐藏真值与正常输入隔离；外部内容只作证据，不作权限来源 |
 | 长 state 容量与 context rot | [Jev 调研报告](jev-research.md) §4.3、§13.4 #10 | 1.0 优先小规模受控任务；state 规模上限由实测曲线决定（未定，§12） |
 | 范围蔓延 | 决定 1/4 + 本文 §8 | §8 为硬边界；新增内容进 1.x 待办 |
+| backlog：`jh-openai` 端点拼接的尾斜杠（M11 finding，**复核后不成立**） | 本批复核 2026-09-22；`crates/jh-openai/src/client.rs:109`（拼接点）、`:169`（`ClientBuilder::build` 裁剪点） | 发现「不裁尾斜杠」与现状不符：`build` 早已 `trim_end_matches('/')`（自首个提交 `807e53b` 起存在，M11 的 HEAD `20d20ea` 也在），调用点看不到尾斜杠，`https://api.deepseek.com/` 与不带斜杠等价。**残余项降为「无单测覆盖」**：可补一条带尾斜杠的单测（与 `jh-jev` 的 `systemone_url` 单测同口径）。登记为 backlog，本批不改代码 |
+| backlog：`jh-jev` 未建模 403 | M11 真实探测 2026-09-22；`crates/jh-jev/src/error.rs:4`、`:166-177` | 实测：完全缺 `Authorization` 头时服务端返 403，无效 key 才 401；403 现落入 `UnexpectedStatus`，报错丢失「鉴权」语义（正常路径总带 header，仅在代理 / 网关改写时出现）。登记为 backlog：修法是把 403 并入鉴权类错误并同步模块注释；本批不改代码 |
+
+上表两条 backlog 来自 M11 探测（2026-09-22）与本批代码复核，只登记不在本批修；第 1 条经复核不成立，只保留「补单测」的建议。
 
 ## 10. 与既有文档的关系
 
@@ -340,23 +358,33 @@ crate 内部模块划分仍待定（[AGENTS.md](../AGENTS.md)）；`jh-core` 的
 - **冻结**：`jh-tui` 组件套件（决定 4）；1.0 交付批处理实验 + CLI/JSON 报告，研究视图推迟 1.x。
 - **保留**：workspace 与依赖清单现状、`Cargo.lock` 已入库、Jev key 并收紧为仅环境变量（旧版为「环境变量 / 本地 `.env`」）、pin `jev-1.13.0`、阈值来自自测、报告需含原始数据与复现命令；旧版 non-goals 的可复用条目并入 §8。
 
+**2026-09-22 — M0 实现回写（M9 / M10 落地，M11 探测）**
+
+- **回写实现命名**：§3.1 / §3.2 / §3.4 写入 `jh-core` 的实际模块与类型（M9，merge `20386b4`：`trait Judge`、`JudgeRequest` / `JudgeResponse`、`QuestionSpec`、`JudgmentRecord`、`JudgeSource` 等）与 `jh-app` 的五种判断器适配、实验层模块（M10，merge `22da7bb`，复核尖端 `c3e5583`）。
+- **定下未确定项**：§12 #1（`jh-core` 模块与类型名）、#2（调用记录落盘形态：`var/calls.jsonl`，JSONL、`kind=judgment|failure`）、#7（`exp` 参数与报告字段）；另记 #5 的版本号规则现状（`QuestionVersion(u32)` 单调递增，问题库保存格式仍未定）。
+- **升级未确定项**：§12 #10 与 §1.2 从「是否提供 `/responses` 未验证」改为「文档确认提供、实测未完成（无 key）」，并登记 LLM 侧配置口径（`OPENAI_BASE_URL` 必填、写法不带尾斜杠、模型 `deepseek-flash`、Responses 无状态）。
+- **记录 M0 落地状态**：§5 M0 增加落地状态与解锁命令；§7.1 / §7.2 记录已交付的交付物与文档回写轮次。判断器接口、五种判断器、4 样本初始任务集、`jev exp` 基线报告均已交付；Jev / LLM 真调读数未取得，一律标「未验证」。
+- **登记 backlog**：§9 新增两条——`jh-openai` 尾斜杠（复核后不成立，只保留「补单测」建议）与 `jh-jev` 未建模 403。
+- **更新现状**：§1.3 #5–#8、§1.4 按 M9 / M10 的实际改动与当前测试基线（253 passed / 0 failed / 6 ignored，本批复核）更新。
+- **为何**：§7.2「文档侧：本文件的架构与运行时规格按实际实现回写」；§3.4 上一版写明「Rust 侧的类型与模块命名在实现时随改动确定并在此文件回写」（§12 未确定项 1）。
+
 ## 12. 未确定项
 
-本版明确标注、不在实现前擅自决定的事项：
+本版明确标注的事项：已由实现决定的条目写明决定与落点（2026-09-22 M0 批次回写，逐条见 §11）；仍未定的一并列出。
 
-1. `jh-core` 的模块划分、类型名与 trait 签名（[AGENTS.md](../AGENTS.md)：模块划分待定）。
-2. 事件日志与判断记录的持久化格式与落盘粒度（`var/` 下的组织方式）。
-3. 「认识状态」是否作为独立字段（§4 第 9 行；研究目标 §5.3 只建议区分三维度）。
-4. 一等对象中 `Hypothesis` 与 `Capability` 在 1.0 是否落地（研究目标 §8.1 全表 vs 1.0 只做 §4 已列的运行时对象）。
-5. 问题库与观测器库的保存格式与版本号规则（研究目标 §14.1 #7）。
-6. 实验报告的文件名与放置位置（`docs/` 下）。
-7. `exp` 子命令的参数形态与 JSON 报告字段。
-8. 任务族 A/B/C 的材料来源与规模（先导实验后定，研究目标 §10.3）。
-9. `jh-core` 是否引入 `tokio`，以及调度的具体实现形态（§3.3）。
-10. 所选 LLM provider 是否提供 `/responses`（M0 真实调用确认，§1.2）。
-11. 中文输入的处理策略（原文 / 英译 / 英文 instructions）——由 M0 基线结论决定。
-12. 批处理与逐问在关键判定上的取舍——由实测决定（本文 §3.2；实验口径见 [Jev 调研报告](jev-research.md) §14.3 E3）。
-13. E4 注入诊断是否在 M4 安排；若不安排，须在实验报告中写明理由（见 §6.9）。
+1. **已定（M9，2026-09-22）**：`jh-core` 的模块划分、类型名与 trait 签名——模块 `answer` / `error` / `judge` / `question` / `record` / `state`；trait `Judge`（返回装箱 future 以便 `Box<dyn Judge>`，不引入异步运行时）；请求 / 响应 `JudgeRequest` / `JudgeResponse`（后者带 `validate()`）；问题侧 `QuestionId` / `QuestionVersion` / `QuestionSpec` / `Questions` / `Question::{Choice,Score,Noul}`；答案侧 `Answer::{Choice,Score,Noul}` 与 `Usage`；记录 `JudgmentRecord` / `Judgment` / `JudgeSource`；错误 `Error::{Unavailable,CallFailed,InvalidResponse}`。逐项见 §3.4。
+2. **已定（M10，2026-09-22）**：判断记录的持久化格式与落盘粒度——判断调用逐行追加进 `var/calls.jsonl`（JSONL，一行一次调用；`kind=judgment` 行内嵌完整 `JudgmentRecord`，`kind=failure` 行只有 run / case / source / latency_ms / error，不写空答案）；文件与 `var/` 由运行时创建、不入库（`.gitignore` 已列 `var/`）；基线报告单独落 `var/exp/<run>.json`（pretty JSON）。实现见 `crates/jh-app/src/calls.rs`、`src/main.rs:52-65`、`:108-114`。**事件日志仍属未定**（M1 对象，本次决定不覆盖）。
+3. 「认识状态」是否作为独立字段（§4 第 9 行；研究目标 §5.3 只建议区分三维度）。**仍未定。**
+4. 一等对象中 `Hypothesis` 与 `Capability` 在 1.0 是否落地（研究目标 §8.1 全表 vs 1.0 只做 §4 已列的运行时对象）。**仍未定。**
+5. 问题库与观测器库的保存格式与版本号规则（研究目标 §14.1 #7）。**部分已定**：问题版本号在 1.0 取 `QuestionVersion(u32)` 单调递增（`crates/jh-core/src/question.rs:40-53`）；问题库 / 观测器库的保存格式仍未定。
+6. 实验报告的文件名与放置位置（`docs/` 下）。**仍未定**；M0 的基线读数是运行产物 `var/exp/<run>.json`，不占 `docs/` 位置。
+7. **已定（M10，2026-09-22）**：`exp` 子命令的参数形态与 JSON 报告字段——参数 `--judge <NAME>`（可重复；缺省 `rule` + `simulated-truth`）、`--calls <FILE>`（默认 `var/calls.jsonl`）、`--replay <FILE>`（默认 `var/calls.jsonl`）、`--out <FILE>`（缺省 `var/exp/<run>.json`）；报告**顶层字段**固定为 `run` / `generated_at_unix_ms` / `command` / `task_set` / `metric_definitions`（口径声明）/ `judges[]` / `calls_log`（绝对路径）/ `notes`，嵌套读数列**主要字段（非穷举）**：`task_set{name,source,cases,questions}`、`judges[].judge / source / live / versions`、`judges[].verification{status,detail}`、`judges[].calls{attempted,succeeded,failed,errors}`、`judges[].latency_ms{samples,min,p50,p95,max}`、`judges[].usage{calls_with_usage,input_tokens,output_tokens}`、`judges[].quality{judgments,agreements,agreement_rate,unscored,boundary_readings,brier_mean,log_loss_mean,log_loss_undefined,score_mae,score_mae_samples,per_question[]}`；完整字段定义以 `crates/jh-app/src/report.rs` 为准。报告不含价格折算（仓库无权威价格表）。实现见 `crates/jh-app/src/{exp,report,metrics}.rs`。
+8. 任务族 A/B/C 的材料来源与规模（先导实验后定，研究目标 §10.3）。**仍未定**；M0 已用 4 样本最小合成集落地（`crates/jh-app/tasks/initial_tasks.json`）。
+9. `jh-core` 是否引入 `tokio`，以及调度的具体实现形态（§3.3）。**仍未定**；M0 的 `jh-core` 只依赖 `serde` / `serde_json` / `thiserror`，无异步运行时。
+10. **升级（M11 探测，2026-09-22）**：所选 LLM provider 是否提供 `/responses`——文档层面确认提供，运行层面实测未完成（本环境无 key）。证据：DeepSeek 官方[《Using the Responses API》](https://api-docs.deepseek.com/guides/responses_api/)、Codex 集成页的 `wire_api = "responses"`、定价页的 `Responses API ✓`；仍需真调确认端点的实际状态码、SSE 事件吻合度与响应体反序列化。配置口径见 §1.2。
+11. 中文输入的处理策略（原文 / 英译 / 英文 instructions）——由 M0 基线结论决定。**仍未定**：M0 真调基线未取得（无 key，见 §5 M0 落地状态），没有可依据的结论。
+12. 批处理与逐问在关键判定上的取舍——由实测决定（本文 §3.2；实验口径见 [Jev 调研报告](jev-research.md) §14.3 E3）。**仍未定**；接口层已同时支持两种表达（`Questions` 放 1 或 N 个问题）。
+13. E4 注入诊断是否在 M4 安排；若不安排，须在实验报告中写明理由（见 §6.9）。**仍未定。**
 
 ## 13. 待人工裁决的交叉文档一致性项（只列出，本版不修改这些文件）
 
