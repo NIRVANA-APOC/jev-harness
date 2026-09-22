@@ -53,7 +53,10 @@ pub const DELIVERABLE_QUESTION: &str = "deliverable_ready";
 /// 选择类问题 ID：首要原因。
 pub const CAUSE_QUESTION: &str = "cause_primary";
 
-/// 是非类问题 ID：补救动作的前提是否仍成立。
+/// 是非类问题 ID：材料是否已经确认失败原因（前提诊断）。
+///
+/// 本题不参与行动前提门——真实模型在「原因是否已被确认」这一档上答得不好（见批次的真调读数），
+/// 前提门只用 [`CAUSE_QUESTION`]；本题照常判定与判分，作为材料确认度的诊断读数报告。
 pub const PREMISE_QUESTION: &str = "premise_holds";
 
 /// 是非类问题 ID：运行时指标是否仍在基线范围内。
