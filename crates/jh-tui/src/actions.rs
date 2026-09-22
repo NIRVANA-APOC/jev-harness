@@ -6,7 +6,7 @@
 //! `input/key.rs:60-62` 的 Release 事件不匹配）。信号源与终端恢复护栏见 [`crate::terminal`]。
 //!
 //! 与上游的差异：
-//! - 上游 `ActionId` 76 个变体、`When` 7 个值、70 条注册；这里分别是 21 / 4 / 21 条。
+//! - 上游 `ActionId` 76 个变体、`When` 7 个值、70 条注册；这里分别是 20 / 4 / 20 条。
 //! - **键位可覆盖**：上游明确「cannot currently be remapped」
 //!   （`docs/user-guide/03-keyboard-shortcuts.md:3`），本项目反其道而行，理由是规模——
 //!   可以 [`Keymap::with_overrides`] 传入配置里的键位（设计 §7.2 第 6 条）。

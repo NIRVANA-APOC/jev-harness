@@ -56,8 +56,8 @@
 //! assert!(screen.iter().any(|line| line.contains("你好")));
 //! ```
 //!
-//! 真实终端里的进入/退出与信号恢复见 [`terminal::TerminalGuard`] 与
-//! `examples/demo.rs`。
+//! 真实终端里的进入/退出、模式开关（raw mode / 备用屏 / bracketed paste）、
+//! 信号恢复与 panic hook 见 [`terminal::TerminalGuard`] 与 `examples/demo.rs`。
 
 pub mod actions;
 pub mod app;

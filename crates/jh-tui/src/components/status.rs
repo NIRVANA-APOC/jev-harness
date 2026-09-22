@@ -132,22 +132,24 @@ impl StatusModel {
         }
 
         // 概率上屏：本轮判定轨迹的首选概率、差距与置信度。
+        // 分隔符走字形表，与快捷键栏、块内摘要保持同一个符号。
+        let separator = ctx.glyphs.resolve(glyphs::separator());
         if let Some(trace) = ctx.decision {
             let style = if trace.uncertainty().is_uncertain() {
                 ctx.theme.accent(ctx.theme.accent_warning)
             } else {
                 ctx.theme.accent(ctx.theme.accent_plan)
             };
-            spans.push(Span::styled(" · 判定 ", ctx.theme.dim()));
-            spans.push(Span::styled(trace.summary(), style));
+            spans.push(Span::styled(format!(" {separator} 判定 "), ctx.theme.dim()));
+            spans.push(Span::styled(trace.summary(separator), style));
         }
 
         if let Some(model) = &self.model {
-            spans.push(Span::styled(" · ", ctx.theme.dim()));
+            spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
             spans.push(Span::styled(model.clone(), ctx.theme.dim()));
         }
         if let Some((used, limit)) = self.tokens {
-            spans.push(Span::styled(" · ", ctx.theme.dim()));
+            spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
             spans.push(Span::styled(
                 format!("{} 上下文", format_tokens(used, limit)),
                 ctx.theme.dim(),
@@ -212,24 +214,27 @@ fn hint_spans(
     ctx: &BlockCtx,
     budget: usize,
 ) -> (Vec<Span<'static>>, usize) {
+    let separator = ctx.glyphs.resolve(glyphs::separator());
+    // 提示之间是「空格 + 分隔符 + 空格」，宽度跟着字形表走。
+    let separator_width = width::display_width(separator) + 2;
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     let mut placed = 0usize;
     for (chord, label) in hints {
-        let separator_width = if placed == 0 { 0 } else { 3 };
         let piece_width = width::display_width(&chord.display()) + 1 + width::display_width(label);
-        if used + separator_width + piece_width > budget {
+        let joined_width = used + if placed == 0 { 0 } else { separator_width } + piece_width;
+        if joined_width > budget {
             break;
         }
         if placed > 0 {
-            spans.push(Span::styled(" · ", ctx.theme.dim()));
+            spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
         }
         spans.push(Span::styled(
             chord.display(),
             ctx.theme.accent(ctx.theme.accent_system),
         ));
         spans.push(Span::styled(format!(" {label}"), ctx.theme.dim()));
-        used += separator_width + piece_width;
+        used = joined_width;
         placed += 1;
     }
     (spans, placed)

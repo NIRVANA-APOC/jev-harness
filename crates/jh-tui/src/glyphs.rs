@@ -8,7 +8,13 @@
 //! - 上游切换回退字形的开关是「legacy Windows ConHost」（`glyphs.rs:377-424`，非 Windows
 //!   直接短路为 false，可被 `GROK_FORCE_LEGACY_CONSOLE` 覆盖）；本项目把它简化成
 //!   [`Glyphs`] 集合这一能力位，由 `Capabilities` 决定，业务代码不读环境变量。
-//! - 未在上游找到回退形态的字形（`…`、`▾`、`›` 等），回退取本项目自定的同宽 ASCII，
+//! - 上游有 34 个 `pub fn`；本表**只保留真正被消费的字形**（9 个），未接功能的字形
+//!   （折叠条、列表圆点、细选中条、收起三角等）不预先立起来，等有消费者再加——避免
+//!   「如无必要，勿增实体」的账目里多出零消费者条目。
+//! - 转轮与进度条是**序列**而不是「一对形态」，因此不在这张表里：转轮见
+//!   [`SPINNER_FRAMES`] / [`SPINNER_FRAMES_FALLBACK`]（两者帧数不同），进度条见
+//!   [`PROGRESS_LEVELS`]（每一级的 fallback 是阴影块）。
+//! - 未在上游找到回退形态的字形（`…`、分隔符），回退取本项目自定的同宽 ASCII，
 //!   逐条在函数文档里标注。
 
 /// 一个字形：花体形态与其回退形态，两者宽度必须相同。
@@ -74,30 +80,27 @@ macro_rules! glyphs {
 glyphs! {
     /// 提示行首与用户回显：`❯ ` → `> `（两列）。上游 `glyphs.rs:16-25`。
     prompt: "❯ " / "> ",
-    /// 列表圆点：`• `；回退 `- `（本项目自定，上游只在 markdown 解析期把 `- ` 换成 `• `）。
-    bullet: "• " / "- ",
     /// 卡片左侧强调轨：`┃` → `│`。上游 `glyphs.rs:175-181`。
     accent_bar: "┃" / "│",
-    /// 细选中条：`▏` → `│`。上游 `glyphs.rs:248-254`。
-    thin_bar: "▏" / "│",
-    /// 折叠标记：`❙`；回退 `|`（本项目自定）。上游 `glyphs.rs:39-45`。
-    collapse_bar: "❙" / "|",
-    /// 实心菱形（句柄 / 用户块标记）：`◆` → `♦`。上游 `glyphs.rs:111-135`。
+    /// 实心菱形（助手块标记）：`◆` → `♦`。上游 `glyphs.rs:111-135`。
     diamond: "◆" / "♦",
-    /// 空心菱形（判定 / 计划标记）：`◇` → `○`。上游 `glyphs.rs:111-135`。
+    /// 空心菱形（判定块标记）：`◇` → `○`。上游 `glyphs.rs:111-135`。
     diamond_open: "◇" / "○",
-    /// 小圆点：`●` → `= `? 见上游 `glyphs.rs:237-243`；回退取本项目自定的 `*`。
+    /// 小圆点（空闲态标记）：`●`；回退取本项目自定的 `*`。上游 `glyphs.rs:237-243`。
     dot: "●" / "*",
     /// 成功标记：`✓` → `√`（上游 `to_legacy_glyphs` 的 `✓→√`，`glyphs.rs:364-373`）。
     success: "✓" / "√",
     /// 失败标记：`✗` → `x`（上游 `to_legacy_glyphs`，`glyphs.rs:364-373`）。
     failure: "✗" / "x",
-    /// 展开三角：`▸` → `>`（回退本项目自定）。上游 `glyphs.rs:288-303`。
+    /// 右向三角（工具块与「被采纳」行标记）：`▸`；回退取本项目自定的 `>`。
+    /// 上游 `glyphs.rs:288-303`。
     triangle_right: "▸" / ">",
-    /// 收起三角：`▾` → `v`（回退本项目自定）。上游 `glyphs.rs:288-303`。
-    triangle_down: "▾" / "v",
-    /// 省略号：`…`；上游只记录 `truncate_to_width` 会补 `…`，**未见回退形态**，回退取本项目自定的 `.`。
+    /// 省略号：`…`；上游只记录 `truncate_to_width` 会补 `…`，**未见回退形态**，
+    /// 回退取本项目自定的 `.`。
     ellipsis: "…" / ".",
+    /// 行内分隔符：`·`；上游用它分隔状态行与快捷键栏的各段，**未见回退形态**，
+    /// 回退取本项目自定的 `|`。
+    separator: "·" / "|",
 }
 
 /// 进度 / 概率条 9 级填充：花体用半格块，回退用阴影块。
@@ -118,24 +121,18 @@ pub const PROGRESS_LEVELS: [Glyph; 9] = [
 ];
 
 /// 花体（盲文）转轮帧，8 帧，每帧 1 列。上游 `glyphs.rs:148-159`。
-pub const SPINNER_FRAMES: [Glyph; 8] = [
-    Glyph::new("⠋", "|"),
-    Glyph::new("⠙", "-"),
-    Glyph::new("⠹", "|"),
-    Glyph::new("⠸", "-"),
-    Glyph::new("⠼", "|"),
-    Glyph::new("⠴", "-"),
-    Glyph::new("⠦", "|"),
-    Glyph::new("⠧", "-"),
-];
+pub const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// 回退转轮帧，4 帧（上游同为 4 帧：`| / - \`）。
+///
+/// 它是**独立的一张表**而不是花体帧的 fallback 列：两边的帧数不同（8 vs 4），
+/// 硬凑成「一对形态」只会造出读不到的列。两表共同的约束是「每一帧都同宽」。
 pub const SPINNER_FRAMES_FALLBACK: [&str; 4] = ["|", "/", "-", "\\"];
 
 /// 按帧号取转轮字形：花体 8 帧、回退 4 帧，各自取模。
 pub fn spinner_frame(glyphs: Glyphs, frame: usize) -> &'static str {
     if glyphs.fancy {
-        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()].fancy
+        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
     } else {
         SPINNER_FRAMES_FALLBACK[frame % SPINNER_FRAMES_FALLBACK.len()]
     }
@@ -168,7 +165,7 @@ mod tests {
 
     #[test]
     fn glyph_table_is_not_empty_and_names_are_unique() {
-        assert!(ALL.len() >= 10, "字形表太小：{}", ALL.len());
+        assert!(ALL.len() >= 8, "字形表太小：{}", ALL.len());
         let mut names: Vec<&str> = ALL.iter().map(|(name, _)| *name).collect();
         names.sort_unstable();
         let before = names.len();
@@ -199,15 +196,18 @@ mod tests {
 
     #[test]
     fn spinner_frames_are_one_column() {
-        for (idx, glyph) in SPINNER_FRAMES.iter().enumerate() {
-            assert_eq!(display_width(glyph.fancy), 1, "花体第 {idx} 帧不是 1 列");
-            assert_eq!(display_width(glyph.fallback), 1, "回退第 {idx} 帧不是 1 列");
+        for (idx, frame) in SPINNER_FRAMES.iter().enumerate() {
+            assert_eq!(display_width(frame), 1, "花体第 {idx} 帧不是 1 列");
         }
-        for frame in SPINNER_FRAMES_FALLBACK {
-            assert_eq!(display_width(frame), 1);
+        for (idx, frame) in SPINNER_FRAMES_FALLBACK.iter().enumerate() {
+            assert_eq!(display_width(frame), 1, "回退第 {idx} 帧不是 1 列");
         }
         // 两套帧数不同（8 / 4），各自取模，越界不 panic。
+        assert_eq!(spinner_frame(Glyphs::FANCY, 0), "⠋");
+        assert_eq!(spinner_frame(Glyphs::FANCY, 8), "⠋");
         assert_eq!(spinner_frame(Glyphs::FANCY, 9), "⠙");
+        assert_eq!(spinner_frame(Glyphs::FALLBACK, 0), "|");
+        assert_eq!(spinner_frame(Glyphs::FALLBACK, 4), "|");
         assert_eq!(spinner_frame(Glyphs::FALLBACK, 5), "/");
     }
 
@@ -216,6 +216,8 @@ mod tests {
         assert_eq!(Glyphs::FANCY.resolve(prompt()), "❯ ");
         assert_eq!(Glyphs::FALLBACK.resolve(prompt()), "> ");
         assert_eq!(Glyphs::FALLBACK.resolve(success()), "√");
+        assert_eq!(Glyphs::FANCY.resolve(separator()), "·");
+        assert_eq!(Glyphs::FALLBACK.resolve(separator()), "|");
         assert_eq!(Glyphs::default(), Glyphs::FANCY, "默认花体，回退是逃生口");
     }
 }

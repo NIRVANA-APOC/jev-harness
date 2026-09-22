@@ -328,7 +328,32 @@ y 允许一次 · Ctrl+c 退出 · Esc 取消 · a 总是允许 · n 拒绝",
 fn full_screen_snapshot_degrades_without_color_and_with_fallback_glyphs() {
     let mut app = App::new(&capabilities_plain());
     seed_app(&mut app, true);
-    let screen = render_app(76, 16, &mut app);
+    let (screen, buffer) = common::render_app_cells(76, 16, &mut app);
+
+    // 「无色」半边也断言在缓冲区上：整屏零 RGB / 索引色，前景退回终端默认。
+    assert_eq!(
+        buffer[(0, 0)].fg,
+        ratatui::style::Color::Reset,
+        "无色档下提示标记不该带色"
+    );
+    for cell in buffer.content() {
+        assert!(
+            !matches!(
+                cell.fg,
+                ratatui::style::Color::Rgb(..) | ratatui::style::Color::Indexed(_)
+            ),
+            "无色档仍有前景色：{:?}",
+            cell.fg
+        );
+        assert!(
+            !matches!(
+                cell.bg,
+                ratatui::style::Color::Rgb(..) | ratatui::style::Color::Indexed(_)
+            ),
+            "无色档仍有底色：{:?}",
+            cell.bg
+        );
+    }
     // NO_COLOR + legacy 控制台：字形全换成同宽 ASCII 回退形态，正文一个字符都不少。
     assert_screen(
         &screen,
@@ -341,13 +366,13 @@ fn full_screen_snapshot_degrades_without_color_and_with_fallback_glyphs() {
 ○ shell_command_allowed
   是否允许执行 `git push --force`？
   > 0.71 █████▒   允许一次 (usr:allow)
-│  权限请求 · bash
+│  权限请求 | bash
 │  命令  git push --force origin main
 │  该命令会改写远端历史，且无法从本地恢复。
 │  y 允许一次   a 总是允许   n 拒绝
-| 等待授权 · 判定 usr:allow 0.71 · margin 0.49 · confidence 0.64 · 倾向 · d.
+| 等待授权 | 判定 usr:allow 0.71 | margin 0.49 | confidence 0.64 | 倾向 | d.
 > 顺便看一下 CI 配置
-y 允许一次 · Ctrl+c 退出 · Esc 取消 · a 总是允许 · n 拒绝",
+y 允许一次 | Ctrl+c 退出 | Esc 取消 | a 总是允许 | n 拒绝",
     );
 }
 

@@ -104,6 +104,7 @@ impl ApprovalCard {
     ) -> Vec<BlockLine> {
         let rail = ctx.glyphs.resolve(glyphs::accent_bar());
         let ellipsis = ctx.glyphs.resolve(glyphs::ellipsis());
+        let separator = ctx.glyphs.resolve(glyphs::separator());
         let accent = if focused {
             ctx.theme.accent(ctx.theme.accent_warning)
         } else {
@@ -117,7 +118,7 @@ impl ApprovalCard {
         let body_width = ctx.width.saturating_sub(CONTENT_X).max(1);
 
         let mut rows: Vec<(String, ratatui::style::Style)> = Vec::new();
-        rows.push((format!("权限请求 · {}", request.tool), accent));
+        rows.push((format!("权限请求 {separator} {}", request.tool), accent));
         rows.push((format!("命令  {}", request.command), body_style));
         if let Some(body) = &request.body {
             rows.push((body.clone(), ctx.theme.muted()));

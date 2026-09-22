@@ -6,17 +6,23 @@
 //!
 //! 与上游的差异：
 //! - 上游有 `pop_fence`（DA1 清退栅栏）与 Kitty 协议标志复位等一整套退出工序；本项目
-//!   只做最小集合：离备用屏、显示光标、关 raw mode。**恢复是幂等的**，因为信号处理器、
-//!   panic hook 与正常退出路径都会调它。
+//!   只做最小集合：离备用屏、显示光标、关 bracketed paste、关 raw mode。**恢复是幂等的**，
+//!   因为信号处理器、panic hook 与正常退出路径都会调它。
 //! - 上游状态泄漏防线覆盖鼠标捕获、子进程继承等；本项目不启用鼠标捕获，也不自我重启。
 //! - 本 crate 不引入信号库：`restore()` 是 `&self` 的幂等函数，宿主（或示例里的
 //!   tokio 信号任务）把信号接到它上面即可。
+//!
+//! 模式的开与关**都由本护栏负责**，宿主不需要自己发转义序列：
+//! `enter()` 开 raw mode / 备用屏 / 隐藏光标 / bracketed paste，
+//! `restore()` 逐项复位。bracketed paste 是 `Event::Paste`（[`crate::app::App::handle_event`]
+//! 的粘贴路径）能收到事件的前提——crossterm 只在应用显式开启该模式后才投递它。
 
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -77,7 +83,7 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// 进备用屏 + raw mode + 隐藏光标。
+    /// 进备用屏 + raw mode + 隐藏光标 + bracketed paste。
     pub fn enter() -> io::Result<Self> {
         TerminalGuard::enter_with_screen(true)
     }
@@ -92,7 +98,7 @@ impl TerminalGuard {
         if alternate_screen {
             execute!(stdout, EnterAlternateScreen)?;
         }
-        execute!(stdout, cursor::Hide)?;
+        execute!(stdout, cursor::Hide, EnableBracketedPaste)?;
         Ok(guard)
     }
 
@@ -108,9 +114,14 @@ impl TerminalGuard {
             return Ok(());
         }
         let mut stdout = io::stdout();
-        let screen = execute!(stdout, LeaveAlternateScreen, cursor::Show);
+        let modes = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            cursor::Show,
+            DisableBracketedPaste
+        );
         let raw = disable_raw_mode();
-        screen.and(raw)
+        modes.and(raw)
     }
 
     /// 装上 panic hook：panic 时先恢复终端再交给原 hook（否则 panic 信息会盖在备用屏里）。
@@ -170,8 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn restore_is_idempotent_and_never_touches_the_terminal_twice() {
-        // 已经是「已恢复」状态：`restore` 必须短路成功，不写任何转义序列。
+    fn restore_short_circuits_when_already_restored() {
+        // 只覆盖「已恢复」分支：`restored == false` 的分支会真的写转义序列并关 raw mode，
+        // 那条路径只能由宿主在真实 TTY 上验证（见 review 的残留风险记录）。
         let guard = guard(true);
         assert!(!guard.is_active());
         assert!(guard.restore().is_ok());

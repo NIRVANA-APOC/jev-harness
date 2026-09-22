@@ -93,6 +93,17 @@ pub fn render_app(width: u16, height: u16, app: &mut App) -> Screen {
     capture(&mut terminal)
 }
 
+/// 整屏渲染，同时把缓冲区交回来做单元格级样式断言（无色档、失焦降饱和）。
+pub fn render_app_cells(width: u16, height: u16, app: &mut App) -> (Screen, Buffer) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend 可用");
+    terminal
+        .draw(|frame| render::draw(frame, app))
+        .expect("绘制不失败");
+    let screen = capture(&mut terminal);
+    (screen, terminal.backend().buffer().clone())
+}
+
 /// 整屏渲染并同时取回终端光标位置（提示框光标断言用）。
 pub fn render_app_with_cursor(width: u16, height: u16, app: &mut App) -> (Screen, (u16, u16)) {
     let backend = TestBackend::new(width, height);

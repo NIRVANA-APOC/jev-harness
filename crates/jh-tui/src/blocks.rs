@@ -129,8 +129,9 @@ pub struct BlockCtx<'a> {
     pub glyphs: Glyphs,
     /// 动画帧号（= tick / [`crate::render::SPINNER_DIVISOR`]）。
     pub frame: usize,
-    /// 当前轮次的 Jev 判定轨迹：概率与置信度的**一等数据**，
-    /// 决策块用它渲染概率条，状态行用它显示「不确定」（设计 §7 P2：不新增可视化组件）。
+    /// 当前轮次的 Jev 判定轨迹：概率与置信度的**一等数据**。
+    /// 状态行用它把本轮概率上屏（设计 §7 P2：不新增可视化组件）；
+    /// 历史里的决策块**不吃这一份**，而是渲染自身载荷（块载荷管历史，ctx 只管本轮）。
     pub decision: Option<&'a DecisionTrace>,
 }
 
@@ -262,21 +263,22 @@ impl DecisionTrace {
     }
 
     /// 一行摘要（状态行与决策块共用），例：`usr:allow 0.71 · margin 0.49 · 不确定`。
-    pub fn summary(&self) -> String {
+    /// 分隔符由调用方传入（取自字形表），免得排版符号在数据层里另起一份硬编码。
+    pub fn summary(&self, separator: &str) -> String {
         let top = match self.top() {
             Some(top) => top,
             None => return "无选项".to_owned(),
         };
         let margin = match self.margin() {
-            Some(margin) => format!(" · margin {margin:.2}"),
+            Some(margin) => format!(" {separator} margin {margin:.2}"),
             None => String::new(),
         };
         let confidence = match self.confidence {
-            Some(confidence) => format!(" · confidence {confidence:.2}"),
+            Some(confidence) => format!(" {separator} confidence {confidence:.2}"),
             None => String::new(),
         };
         format!(
-            "{} {:.2}{margin}{confidence} · {}",
+            "{} {:.2}{margin}{confidence} {separator} {}",
             top.id,
             top.probability,
             self.uncertainty().label()
@@ -513,6 +515,7 @@ fn decision_lines(ctx: &BlockCtx, trace: &DecisionTrace) -> BlockOutput {
     } else {
         ctx.theme.accent_plan
     };
+    let separator = ctx.glyphs.resolve(glyphs::separator());
 
     let mut output = BlockOutput::default();
     let mut header = vec![
@@ -520,7 +523,10 @@ fn decision_lines(ctx: &BlockCtx, trace: &DecisionTrace) -> BlockOutput {
         Span::styled(trace.question.clone(), ctx.theme.fg()),
     ];
     if trace.confidence.is_none() && !trace.choices.is_empty() {
-        header.push(Span::styled(" · 无置信度", ctx.theme.dim()));
+        header.push(Span::styled(
+            format!(" {separator} 无置信度"),
+            ctx.theme.dim(),
+        ));
     }
     output.push(BlockLine::new(
         Line::from(header),
@@ -572,8 +578,12 @@ fn decision_lines(ctx: &BlockCtx, trace: &DecisionTrace) -> BlockOutput {
     }
 
     let verdict = match trace.chosen.and_then(|index| trace.choices.get(index)) {
-        Some(choice) => format!("采纳 {} · {}", choice.label, trace.summary()),
-        None => trace.summary(),
+        Some(choice) => format!(
+            "采纳 {} {separator} {}",
+            choice.label,
+            trace.summary(separator)
+        ),
+        None => trace.summary(separator),
     };
     let verdict_style = if uncertainty.is_uncertain() {
         ctx.theme.accent(ctx.theme.accent_warning)
@@ -662,8 +672,16 @@ mod tests {
             !trace.uncertainty().is_uncertain(),
             "0.71 对 0.22 属于「倾向」"
         );
-        assert!(trace.summary().contains("0.71"));
-        assert!(trace.summary().contains("倾向"));
+        assert!(
+            trace
+                .summary(Glyphs::FANCY.resolve(glyphs::separator()))
+                .contains("0.71")
+        );
+        assert!(
+            trace
+                .summary(Glyphs::FANCY.resolve(glyphs::separator()))
+                .contains("倾向")
+        );
         // 概率没有被归一化成名次：原始值必须原样可读。
         assert_eq!(trace.choices[2].probability, 0.07);
     }
