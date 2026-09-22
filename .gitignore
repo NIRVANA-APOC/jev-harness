@@ -4,7 +4,7 @@
 
 # Rust 构建产物与本地运行环境
 target/
-# Cargo.lock 暂不入库：并行分支的 lockfile 改动会互相冲突，1.0 批次末尾统一锁定提交
+# Cargo.lock 已由批次末尾的 370f884 锁定入库；本忽略条目保留，但已跟踪文件的改动不受 ignore 规则影响，更新 lockfile 需显式 git add
 Cargo.lock
 .env
 var/
