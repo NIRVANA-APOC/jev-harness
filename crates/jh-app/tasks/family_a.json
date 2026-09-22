@@ -1,0 +1,891 @@
+{
+  "name": "family-a",
+  "source": "crates/jh-app/tasks/family_a.json",
+  "notes": "任务族 A：会变化的故障环境（研究目标 §9.3）。6 个先导任务共用一个固定问题集（M1 版），环境对象与问题读取范围都是协议的一部分；隐藏真值只进独立验收与判分侧，不进判断请求。",
+  "questions": [
+    {
+      "id": "cause_primary",
+      "version": 1,
+      "reads": ["app.log"],
+      "question": {
+        "type": "choice",
+        "instructions": "这次失败的首要原因是哪一类？只按 app.log 的日志行归因。",
+        "criteria": {
+          "write_after_cancel": "取消确认之后仍有同一任务的缓存写入，且写入已生效",
+          "config_drift": "配置在故障窗口内被替换，运行中的进程读到的仍是旧配置",
+          "resource_exhaustion": "资源耗尽（连接池、内存或线程）导致的超时与失败",
+          "other": "未列入候选集的原因：证据不足以归入以上任何一类"
+        }
+      }
+    },
+    {
+      "id": "cause_primary",
+      "version": 2,
+      "reads": ["app.log", "config"],
+      "question": {
+        "type": "choice",
+        "instructions": "这次失败的首要原因是哪一类？证据里没有能归入候选集的类别时选 other。",
+        "criteria": {
+          "write_after_cancel": "取消确认之后仍有同一任务的缓存写入，且写入已生效",
+          "config_drift": "配置在故障窗口内被替换，运行中的进程读到的仍是旧配置",
+          "resource_exhaustion": "资源耗尽（连接池、内存或线程）导致的超时与失败",
+          "other": "未列入候选集的原因：证据不足以归入以上任何一类"
+        }
+      }
+    },
+    {
+      "id": "premise_holds",
+      "version": 1,
+      "reads": ["app.log", "config"],
+      "question": {
+        "type": "noul",
+        "instructions": "只看这些材料：是否已经确认了这次失败的原因，并且没有任何材料推翻这个结论？",
+        "criteria": {
+          "true": "材料确认了失败原因，且没有被任何材料推翻",
+          "false": "材料没有确认失败原因，或已有材料推翻了原结论"
+        }
+      }
+    },
+    {
+      "id": "metrics_within_baseline",
+      "version": 1,
+      "reads": ["runtime.metrics", "config"],
+      "question": {
+        "type": "noul",
+        "instructions": "运行时指标是否仍在基线范围内（局部变化没有扩散成全局故障）？",
+        "criteria": {
+          "true": "指标仍在基线范围内",
+          "false": "指标已越出基线（局部抖动或全局故障）"
+        }
+      }
+    },
+    {
+      "id": "deliverable_ready",
+      "version": 1,
+      "reads": ["fix-report.md", "app.log"],
+      "question": {
+        "type": "noul",
+        "instructions": "证据里能看到已产出的交付物 fix-report.md 的内容吗？只有当前版本的交付物算数。",
+        "criteria": {
+          "true": "能看到当前版本的交付物内容",
+          "false": "看不到交付物，或只看到已被取代的旧版本"
+        }
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "id": "A1",
+      "notes": "注入推翻前提的新证据：初始日志只看到失败、无法归因（other）；r1 注入一条确认「取消后仍写入且已生效」的记录，补救动作由此获得前提，而关闭臂还停在 r0 的答案上。无关变化落在 unrelated-notes.md。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700000000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "lines": [
+              "09:00:05 任务 A 中止：下游返回了无法归因的失败",
+              "09:00:06 排查记录：故障窗口内配置未变化、资源水位正常、取消流程未见异常；失败原因仍未归因"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_config",
+          "at_unix_ms": 1700000000100,
+          "object": "config",
+          "version": 1,
+          "content": {
+            "cache": "on",
+            "ttl_s": 300,
+            "replicas": 2,
+            "note": "配置自服务启动以来没有变化"
+          }
+        },
+        {
+          "source": "tool:read_metrics",
+          "at_unix_ms": 1700000000200,
+          "object": "runtime.metrics",
+          "version": 1,
+          "content": {
+            "p99_ms": 118,
+            "saturation": 0.31,
+            "note": "指标正常"
+          }
+        },
+        {
+          "source": "tool:read_notes",
+          "at_unix_ms": 1700000000300,
+          "object": "unrelated-notes.md",
+          "version": 1,
+          "content": { "note": "与本次故障无关的排期记录：下周容量评审" }
+        }
+      ],
+      "tracked": [
+        { "question": "cause_primary", "due_round": 0 },
+        { "question": "premise_holds", "due_round": 0 },
+        { "question": "deliverable_ready", "due_round": 2 }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "注入推翻前提的新证据：确认取消后仍有写入且写入已生效",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_log",
+            "at_unix_ms": 1700000300000,
+            "object": "app.log",
+            "version": 2,
+            "content": {
+              "lines": [
+                "09:00:05 任务 A 中止：下游返回了无法归因的失败",
+                "09:00:06 排查记录：故障窗口内配置未变化、资源水位正常、取消流程未见异常；失败原因仍未归因",
+                "09:05:00 日志补齐：09:00:01 取消确认落库（此前未记录）",
+                "09:05:03 复核确认：任务 A 的缓存写入发生在取消确认之后，且该次写入未被回滚"
+              ]
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "无关变化：只改了排期文档，没人读它",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_notes",
+            "at_unix_ms": 1700000600000,
+            "object": "unrelated-notes.md",
+            "version": 2,
+            "content": {
+              "note": "与本次故障无关的排期记录：下周容量评审；顺手更新了文档链接"
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "交付物产出（实际交付版本 v1）",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000600100,
+            "object": "fix-report.md",
+            "version": 1,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "cause": "write_after_cancel",
+              "action": "rollback-cache"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "rollback-cache",
+          "cost_units": 3.0,
+          "requires": [{ "question": "cause_primary", "equals": "write_after_cancel" }]
+        },
+        {
+          "id": "restart-service",
+          "cost_units": 5.0,
+          "requires": [{ "question": "cause_primary", "equals": "resource_exhaustion" }]
+        }
+      ],
+      "phases": [
+        {
+          "cause": "other",
+          "premise_holds": false,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": []
+        },
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": ["rollback-cache"]
+        }
+      ],
+      "acceptance": { "bind_deliverable": true }
+    },
+    {
+      "id": "A2",
+      "notes": "局部变化：r1 只更新了 runtime.metrics（p99 抖动，未扩散），与 cause/premise 的输入无关；另一条候选动作 throttle-writes 由指标问题把关，所以只有它需要重查。extra_dependencies 登记一条「模型建议的额外依赖」：premise_holds 也被认为读了 runtime.metrics（研究目标 §5.3 的语义关联），用来测误失效的代价。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700000000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "lines": [
+              "09:00:01 服务启动：读取配置 config v1",
+              "09:00:06 任务 B 失败：上游返回 500，重试无效"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_config",
+          "at_unix_ms": 1700000000100,
+          "object": "config",
+          "version": 1,
+          "content": {
+            "cache": "on",
+            "ttl_s": 300,
+            "replicas": 2,
+            "note": "配置在故障窗口内被替换：进程仍使用 v1 的内容"
+          }
+        },
+        {
+          "source": "tool:read_metrics",
+          "at_unix_ms": 1700000000200,
+          "object": "runtime.metrics",
+          "version": 1,
+          "content": {
+            "p99_ms": 118,
+            "saturation": 0.31,
+            "note": "指标正常"
+          }
+        },
+        {
+          "source": "tool:read_notes",
+          "at_unix_ms": 1700000000300,
+          "object": "unrelated-notes.md",
+          "version": 1,
+          "content": { "note": "与本次故障无关的排期记录：下周容量评审" }
+        }
+      ],
+      "tracked": [
+        { "question": "cause_primary", "due_round": 0 },
+        { "question": "premise_holds", "due_round": 0 },
+        { "question": "metrics_within_baseline", "due_round": 0 },
+        { "question": "deliverable_ready", "due_round": 2 }
+      ],
+      "extra_dependencies": [{ "question": "premise_holds", "object": "runtime.metrics" }],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "局部变化：p99 抖动，未扩散成全局故障",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_metrics",
+            "at_unix_ms": 1700000300000,
+            "object": "runtime.metrics",
+            "version": 2,
+            "content": {
+              "p99_ms": 4200,
+              "saturation": 0.97,
+              "note": "p99 超阈值：局部抖动，未扩散到全局"
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "交付物产出",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000600000,
+            "object": "fix-report.md",
+            "version": 1,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "cause": "config_drift",
+              "action": "reload-config"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "reload-config",
+          "cost_units": 2.0,
+          "requires": [{ "question": "cause_primary", "equals": "config_drift" }]
+        },
+        {
+          "id": "throttle-writes",
+          "cost_units": 2.0,
+          "requires": [{ "question": "metrics_within_baseline", "at_most": 0.4 }]
+        }
+      ],
+      "phases": [
+        {
+          "cause": "config_drift",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["reload-config"]
+        },
+        {
+          "cause": "config_drift",
+          "premise_holds": true,
+          "metrics_within_baseline": false,
+          "deliverable_ready": false,
+          "required": ["reload-config", "throttle-writes"]
+        },
+        {
+          "cause": "config_drift",
+          "premise_holds": true,
+          "metrics_within_baseline": false,
+          "deliverable_ready": true,
+          "required": ["reload-config", "throttle-writes"]
+        }
+      ],
+      "acceptance": { "bind_deliverable": true }
+    },
+    {
+      "id": "A3",
+      "notes": "未列入候选集的原因：r0 的表面证据指向「连接池耗尽」；r1 的复核记录推翻了它（峰值只到 87%），真实原因在候选集之外——补救动作要从 restart-service 换成 escalate-manual-review。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700000000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "lines": [
+              "09:00:01 连接池耗尽：等待队列长度 512",
+              "09:00:02 任务 C 超时中止"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_config",
+          "at_unix_ms": 1700000000100,
+          "object": "config",
+          "version": 1,
+          "content": {
+            "cache": "on",
+            "ttl_s": 300,
+            "replicas": 2,
+            "note": "配置自服务启动以来没有变化"
+          }
+        },
+        {
+          "source": "tool:read_metrics",
+          "at_unix_ms": 1700000000200,
+          "object": "runtime.metrics",
+          "version": 1,
+          "content": {
+            "p99_ms": 118,
+            "saturation": 0.31,
+            "note": "指标正常"
+          }
+        },
+        {
+          "source": "tool:read_notes",
+          "at_unix_ms": 1700000000300,
+          "object": "unrelated-notes.md",
+          "version": 1,
+          "content": { "note": "与本次故障无关的排期记录：下周容量评审" }
+        }
+      ],
+      "tracked": [
+        { "question": "cause_primary", "due_round": 0 },
+        { "question": "deliverable_ready", "due_round": 2 }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "复核推翻了表面归因：真实原因在候选集之外",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_log",
+            "at_unix_ms": 1700000300000,
+            "object": "app.log",
+            "version": 2,
+            "content": {
+              "lines": [
+                "09:00:01 连接池耗尽：等待队列长度 512",
+                "09:00:02 任务 C 超时中止",
+                "09:03:10 复核：连接池峰值只到 87%，未耗尽；也不是配置漂移。真实原因在候选集之外：任务队列自旋导致的重试风暴"
+              ]
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "交付物产出",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000600000,
+            "object": "fix-report.md",
+            "version": 1,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "cause": "other",
+              "action": "escalate-manual-review"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "restart-service",
+          "cost_units": 5.0,
+          "requires": [{ "question": "cause_primary", "equals": "resource_exhaustion" }]
+        },
+        {
+          "id": "escalate-manual-review",
+          "cost_units": 1.0,
+          "requires": [{ "question": "cause_primary", "equals": "other" }]
+        }
+      ],
+      "phases": [
+        {
+          "cause": "resource_exhaustion",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["restart-service"]
+        },
+        {
+          "cause": "other",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["escalate-manual-review"]
+        },
+        {
+          "cause": "other",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": ["escalate-manual-review"]
+        }
+      ],
+      "acceptance": { "bind_deliverable": true }
+    },
+    {
+      "id": "A4",
+      "notes": "过期结果：r0 的判定请求发出之后、记录落盘之前输入已经变化——app.log 出了 v2，复核记录推翻了写入确认（该次写入已被回滚）。迟到结果保留作审计、直接落成待重查；关闭失效传播的臂不看这个标记，于是拿这条过期答案发出了补救动作。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700000000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "lines": [
+              "09:00:01 取消确认落库",
+              "09:00:07 复核确认：任务 A 的缓存写入发生在取消确认之后，且该次写入未被回滚"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_config",
+          "at_unix_ms": 1700000000100,
+          "object": "config",
+          "version": 1,
+          "content": {
+            "cache": "on",
+            "ttl_s": 300,
+            "replicas": 2,
+            "note": "配置自服务启动以来没有变化"
+          }
+        },
+        {
+          "source": "tool:read_metrics",
+          "at_unix_ms": 1700000000200,
+          "object": "runtime.metrics",
+          "version": 1,
+          "content": {
+            "p99_ms": 118,
+            "saturation": 0.31,
+            "note": "指标正常"
+          }
+        },
+        {
+          "source": "tool:read_notes",
+          "at_unix_ms": 1700000000300,
+          "object": "unrelated-notes.md",
+          "version": 1,
+          "content": { "note": "与本次故障无关的排期记录：下周容量评审" }
+        }
+      ],
+      "tracked": [
+        { "question": "cause_primary", "due_round": 0 },
+        { "question": "premise_holds", "due_round": 0 },
+        { "question": "deliverable_ready", "due_round": 2 }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 0,
+          "when": "after_ask",
+          "note": "请求在途时输入变化：写入确认被复核推翻",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_log",
+            "at_unix_ms": 1700000100000,
+            "object": "app.log",
+            "version": 2,
+            "content": {
+              "lines": [
+                "09:00:01 取消确认落库",
+                "09:00:07 缓存写入确认：取消确认之后仍有写入，且写入未被回滚",
+                "09:03:40 复核：写入确认来自错误的采样窗口；该次写入已被回滚，不需要补救"
+              ]
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "交付物产出（结论：不需要补救）",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000600000,
+            "object": "fix-report.md",
+            "version": 1,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "cause": "other",
+              "action": "none"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "rollback-cache",
+          "cost_units": 3.0,
+          "requires": [{ "question": "cause_primary", "equals": "write_after_cancel" }]
+        },
+        {
+          "id": "restart-service",
+          "cost_units": 5.0,
+          "requires": [{ "question": "cause_primary", "equals": "resource_exhaustion" }]
+        }
+      ],
+      "phases": [
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "other",
+          "premise_holds": false,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": []
+        },
+        {
+          "cause": "other",
+          "premise_holds": false,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": []
+        }
+      ],
+      "acceptance": { "bind_deliverable": true }
+    },
+    {
+      "id": "A5",
+      "notes": "撤回一条证据（研究目标 §5.4 受控演示）：r1 记完判断、撤回 app.log v1——运行时应当标记读了它的判断、阻断以它们为前提的行动、保留无关结果（指标一问不受影响），并给出完整传播路径。补偿动作 restore-cache 在 r2 才能发出。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700000000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "lines": [
+              "09:00:01 取消确认落库",
+              "09:00:07 复核确认：任务 A 的缓存写入发生在取消确认之后，且该次写入未被回滚"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_config",
+          "at_unix_ms": 1700000000100,
+          "object": "config",
+          "version": 1,
+          "content": {
+            "cache": "on",
+            "ttl_s": 300,
+            "replicas": 2,
+            "note": "配置自服务启动以来没有变化"
+          }
+        },
+        {
+          "source": "tool:read_metrics",
+          "at_unix_ms": 1700000000200,
+          "object": "runtime.metrics",
+          "version": 1,
+          "content": {
+            "p99_ms": 118,
+            "saturation": 0.31,
+            "note": "指标正常"
+          }
+        },
+        {
+          "source": "tool:read_notes",
+          "at_unix_ms": 1700000000300,
+          "object": "unrelated-notes.md",
+          "version": 1,
+          "content": { "note": "与本次故障无关的排期记录：下周容量评审" }
+        }
+      ],
+      "tracked": [
+        { "question": "cause_primary", "due_round": 0 },
+        { "question": "premise_holds", "due_round": 0 },
+        { "question": "metrics_within_baseline", "due_round": 0 },
+        { "question": "deliverable_ready", "due_round": 2 }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "after_ask",
+          "note": "撤回支撑前提的原始记录（app.log v1）",
+          "change": { "kind": "retract", "object": "app.log", "version": 1 }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "交付物产出（补偿后的报告）",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000600000,
+            "object": "fix-report.md",
+            "version": 1,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "cause": "other",
+              "action": "restore-cache"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "rollback-cache",
+          "cost_units": 3.0,
+          "requires": [{ "question": "cause_primary", "equals": "write_after_cancel" }]
+        },
+        {
+          "id": "restore-cache",
+          "cost_units": 2.0,
+          "requires": [{ "question": "cause_primary", "equals": "other" }]
+        },
+        {
+          "id": "restart-service",
+          "cost_units": 5.0,
+          "requires": [{ "question": "cause_primary", "equals": "resource_exhaustion" }]
+        }
+      ],
+      "phases": [
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "other",
+          "premise_holds": false,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["restore-cache"]
+        },
+        {
+          "cause": "other",
+          "premise_holds": false,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": ["restore-cache"]
+        }
+      ],
+      "acceptance": { "bind_deliverable": true }
+    },
+    {
+      "id": "A6",
+      "notes": "交付物版本绑定（研究目标 §5.2 末条）：r1 产出交付物初稿 v1、r2 被终稿 v2 取代；完成声明必须绑定实际交付物版本的证据——只按 v1 判定过交付物的运行，在验收时对不上当前版本。无关变化落在 unrelated-notes.md。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700000000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "lines": [
+              "09:00:01 取消确认落库",
+              "09:00:05 复核确认：任务 A 的缓存写入发生在取消确认之后，且该次写入未被回滚"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_config",
+          "at_unix_ms": 1700000000100,
+          "object": "config",
+          "version": 1,
+          "content": {
+            "cache": "on",
+            "ttl_s": 300,
+            "replicas": 2,
+            "note": "配置自服务启动以来没有变化"
+          }
+        },
+        {
+          "source": "tool:read_metrics",
+          "at_unix_ms": 1700000000200,
+          "object": "runtime.metrics",
+          "version": 1,
+          "content": {
+            "p99_ms": 118,
+            "saturation": 0.31,
+            "note": "指标正常"
+          }
+        },
+        {
+          "source": "tool:read_notes",
+          "at_unix_ms": 1700000000300,
+          "object": "unrelated-notes.md",
+          "version": 1,
+          "content": { "note": "与本次故障无关的排期记录：下周容量评审" }
+        }
+      ],
+      "tracked": [
+        { "question": "cause_primary", "due_round": 0 },
+        { "question": "premise_holds", "due_round": 0 },
+        { "question": "deliverable_ready", "due_round": 1 }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "交付物初稿 v1 产出",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000300000,
+            "object": "fix-report.md",
+            "version": 1,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "version_note": "初稿：依据 v1 日志"
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "交付物被终稿 v2 取代",
+          "change": {
+            "kind": "append",
+            "source": "tool:write_report",
+            "at_unix_ms": 1700000600000,
+            "object": "fix-report.md",
+            "version": 2,
+            "content": {
+              "title": "补救报告",
+              "status": "交付物已产出",
+              "version_note": "终稿：依据复核后的日志，初稿已被取代"
+            }
+          }
+        },
+        {
+          "round": 2,
+          "when": "before_ask",
+          "note": "无关变化：排期文档",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_notes",
+            "at_unix_ms": 1700000600100,
+            "object": "unrelated-notes.md",
+            "version": 2,
+            "content": {
+              "note": "与本次故障无关的排期记录：下周容量评审；顺手更新了文档链接"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "rollback-cache",
+          "cost_units": 3.0,
+          "requires": [{ "question": "cause_primary", "equals": "write_after_cancel" }]
+        },
+        {
+          "id": "restart-service",
+          "cost_units": 5.0,
+          "requires": [{ "question": "cause_primary", "equals": "resource_exhaustion" }]
+        }
+      ],
+      "phases": [
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": false,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": ["rollback-cache"]
+        },
+        {
+          "cause": "write_after_cancel",
+          "premise_holds": true,
+          "metrics_within_baseline": true,
+          "deliverable_ready": true,
+          "required": ["rollback-cache"]
+        }
+      ],
+      "acceptance": { "bind_deliverable": true }
+    }
+  ]
+}
