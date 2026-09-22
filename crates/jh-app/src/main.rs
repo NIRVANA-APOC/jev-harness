@@ -102,6 +102,9 @@ struct CompareArgs {
     /// 报告输出路径；缺省 var/compare/<run>.json
     #[arg(long = "out", value_name = "FILE")]
     out: Option<PathBuf>,
+    /// 不跑判定器，直接从 --out-dir 下已有的轨迹重建报告（口径与 notes 取当前代码）
+    #[arg(long = "regenerate")]
+    regenerate: bool,
 }
 
 #[derive(Args)]
@@ -342,23 +345,55 @@ async fn run_compare(args: CompareArgs) -> ExitCode {
     let run = compare::new_run_id();
     let out_dir = args
         .out_dir
+        .clone()
         .unwrap_or_else(|| PathBuf::from(format!("var/compare/{run}")));
-    let options = CompareOptions {
-        judges,
-        arms,
-        run: run.clone(),
-        calls_path: args.calls,
-        replay_path: args.replay,
-        out_dir,
-        command: std::env::args().collect::<Vec<_>>().join(" "),
-        max_tasks: args.max_tasks,
+    // 重建时沿用产物目录名当运行标识：报告里的 run 与轨迹、调用记录里的 run 必须对得上。
+    let run = if args.regenerate {
+        out_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or(run)
+    } else {
+        run
     };
+    let command = compare::reproduction_command(&std::env::args().collect::<Vec<_>>(), &judges);
 
-    let outcome = match compare::run(&family, &options).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(2);
+    let outcome = if args.regenerate {
+        // 重建：不跑判定器，从 --out-dir 下的轨迹重新汇出报告（口径与 notes 取当前代码）。
+        let options = compare::RegenerateOptions {
+            judges: judges.clone(),
+            arms: arms.clone(),
+            run: run.clone(),
+            out_dir: out_dir.clone(),
+            calls_path: args.calls.clone(),
+            command,
+            max_tasks: args.max_tasks,
+        };
+        match compare::regenerate(&family, &options) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        let options = CompareOptions {
+            judges,
+            arms,
+            run: run.clone(),
+            calls_path: args.calls,
+            replay_path: args.replay,
+            out_dir,
+            command,
+            max_tasks: args.max_tasks,
+        };
+        match compare::run(&family, &options).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
         }
     };
 

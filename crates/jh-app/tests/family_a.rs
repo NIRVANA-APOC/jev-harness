@@ -1,18 +1,37 @@
-//! 任务族 A 的端到端测试：四组臂的读数方向、§5.4 受控演示、报告与原始数据位置、回放复现。
+//! 任务族 A 的端到端测试：四组臂的读数方向、§5.4 受控演示、报告与原始数据位置、回放复现、
+//! 失败路径与迟到结果的落记录时机。
 //!
-//! 全部用离线判定器（`rule` / `replay`）——真实通道的读数在 `var/compare/` 的报告里，测试不联网。
+//! 全部用离线判定器（`rule` / `replay`）或测试内的桩判定器——真实通道的读数在 `var/compare/`
+//! 的报告里，测试不联网。
 
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
+use jh_app::calls::{CallLog, read_entries};
 use jh_app::compare::{self, CompareOptions};
 use jh_app::family::{FamilyA, StepWhen};
 use jh_app::judge::JudgeName;
-use jh_app::matching::Arm;
+use jh_app::matching::{Arm, DecisionOutcome, LoopContext, run_task};
 use jh_app::report::VerificationStatus;
+use jh_core::{Error as CoreError, Judge, JudgeRequest, JudgeResponse};
 
 mod common;
 
 use common::TempDir;
+
+/// 只会失败的桩判定器：用来驱动判定失败路径。
+struct AlwaysFails;
+
+impl Judge for AlwaysFails {
+    fn judge<'a>(
+        &'a self,
+        _request: &'a JudgeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<JudgeResponse, CoreError>> + Send + 'a>> {
+        Box::pin(async move { Err(CoreError::Unavailable("桩判定器：通道不可用".to_owned())) })
+    }
+}
 
 /// 跑一次四组臂的对照（离线规则判断器）。
 async fn run_rule_arms(family: &FamilyA, dir: &TempDir, run: &str) -> compare::CompareReport {
@@ -311,4 +330,121 @@ async fn the_simulator_truth_judge_is_refused_for_the_family() {
     assert_eq!(arm.calls.attempted, 0);
     assert_eq!(arm.decisions.executions, 0);
     assert_eq!(arm.acceptance.passed, 0);
+}
+
+/// 判定失败路径：失败如实落进调用记录与节点评估状态，不重试、不换后端、不当成「答了否」。
+#[tokio::test]
+async fn a_failing_judge_lands_in_the_call_log_and_the_node_evaluation() {
+    let family = FamilyA::load().expect("内嵌任务族 A 应自洽");
+    let task = family.task("A1").expect("A1 在任务族里");
+    let dir = TempDir::new("family-a-failure");
+    let judge = AlwaysFails;
+    let mut calls = CallLog::open(dir.join("calls.jsonl")).expect("调用记录可写");
+
+    let trace = {
+        let mut context = LoopContext {
+            family: &family,
+            judge: &judge,
+            channel: JudgeName::Jev,
+            arm: Arm::ALL[0],
+            run: "run-failure".to_owned(),
+            calls: &mut calls,
+        };
+        run_task(&mut context, task, &dir.join("evidence.jsonl"))
+            .await
+            .expect("判定失败不该让循环崩掉（失败本身就是结果）")
+    };
+
+    // 轨迹里每次请求都带失败原文；没有任何判断记录。
+    assert!(!trace.asks.is_empty());
+    assert!(trace.asks.iter().all(|ask| ask.outcome != "成功"));
+    assert!(trace.judgments.is_empty());
+    assert!(
+        trace
+            .asks
+            .iter()
+            .all(|ask| ask.outcome.contains("桩判定器：通道不可用")),
+        "失败原文要原样留下"
+    );
+
+    // 决策：手上没有答案 → 弃权，不是「前提不成立」。
+    assert!(
+        trace
+            .decisions
+            .iter()
+            .all(|decision| decision.outcome == DecisionOutcome::Unresolved),
+        "{:?}",
+        trace.decisions
+    );
+    assert!(trace.executions().is_empty());
+
+    // 独立验收不通过，且缺的是必需动作。
+    let acceptance = trace.acceptance.clone().expect("跑完必然带验收结果");
+    assert!(!acceptance.passed);
+    assert!(
+        acceptance
+            .checks
+            .iter()
+            .any(|check| check.name == "required_actions_executed" && !check.passed)
+    );
+
+    // 调用记录：每一次请求都有一行 failure，没有 judgment 行。
+    let entries = read_entries(&dir.join("calls.jsonl")).expect("调用记录可读");
+    let failures = entries
+        .iter()
+        .filter(|entry| matches!(entry, jh_app::calls::CallEntry::Failure { .. }))
+        .count();
+    assert_eq!(failures, trace.asks.len());
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !matches!(entry, jh_app::calls::CallEntry::Judgment { .. }))
+    );
+}
+
+/// 迟到结果的落记录时机：一轮里的每条判断看到的是同一份输入快照，提问后扰动一起把它们标成过期。
+#[tokio::test]
+async fn a_late_perturbation_marks_every_judgment_of_the_round() {
+    let family = FamilyA::load().expect("内嵌任务族 A 应自洽");
+    let task = family.task("A4").expect("A4 是过期结果那条");
+    let dir = TempDir::new("family-a-late");
+
+    let trace = compare::run_single(
+        &family,
+        task,
+        JudgeName::Rule,
+        Arm::ALL[0],
+        "run-late",
+        &dir.join("calls.jsonl"),
+        dir.path(),
+    )
+    .await
+    .expect("离线单任务运行应能跑完");
+
+    // A4 第 0 轮的提问后扰动：这一轮问过的问题都要带上过期标记。
+    let drift = trace
+        .steps
+        .iter()
+        .find(|step| step.when == StepWhen::AfterAsk)
+        .expect("A4 有提问后扰动");
+    let round_zero: Vec<&jh_app::matching::JudgmentTrace> = trace
+        .judgments
+        .iter()
+        .filter(|judgment| judgment.round == drift.round)
+        .collect();
+    assert!(!round_zero.is_empty());
+    assert!(
+        round_zero.iter().all(|judgment| judgment.drift),
+        "同一轮的迟到结果应当一起落成待重查：{:?}",
+        round_zero
+            .iter()
+            .map(|judgment| (&judgment.question, judgment.drift))
+            .collect::<BTreeMap<_, _>>()
+    );
+    // 提问相位早于扰动相位：判断看到的是变化前的材料。
+    assert!(
+        round_zero
+            .iter()
+            .all(|judgment| judgment.phase < drift.phase)
+    );
 }

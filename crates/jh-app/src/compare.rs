@@ -26,6 +26,16 @@
 //! - **依赖漏失效 / 误失效**：逐条扰动对照「问题声明的读取范围」与运行时实际标记；
 //! - **重算节点数 / 输入量 / 缓存复用率**：判断节点数、state 序列化字节与 token 用量、复用次数；
 //! - **真实与模拟来源分开**：`source` / `live` / `verification` 三个字段与 M0 基线同口径。
+//!
+//! # 结论按配对读
+//!
+//! 报告里的 [`PairingReading`] 把同一个口径内的两条臂并排：`h1` 配对固定 H2 口径、只让依赖失效传播
+//! 变，`h2` 配对固定 H1 开关、只让重算口径变。跨配对比会把交互作用当成主效应——本项目的读数里，
+//! 关闭失效传播的恢复损失只在增量配对成立（全量重算补得回来），而「拿过期依据发动作」两个配对都
+//! 补不回来。`notes` 里写明这条口径，摘要逐条打印配对读数。
+//!
+//! 报告可以「只重建、不重跑」：`compare --regenerate` 从 `traces_dir` 里的轨迹重新汇出报告（判定器
+//! 一次都不调用），口径与 notes 取当前代码，读数与那次运行的轨迹一一对应。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -38,7 +48,9 @@ use crate::error::Error;
 use crate::exp::unix_ms;
 use crate::family::{FamilyA, FamilyTask};
 use crate::judge::JudgeName;
-use crate::matching::{ASK_SUCCEEDED, Arm, DecisionOutcome, LoopContext, TaskTrace, run_task};
+use crate::matching::{
+    ASK_SUCCEEDED, Arm, DecisionOutcome, LoopContext, Recompute, TaskTrace, run_task,
+};
 use crate::report::{
     CallStats, LatencyStats, QualityStats, QuestionQuality, UsageStats, Verification,
     VerificationStatus,
@@ -89,6 +101,10 @@ pub struct CompareReport {
     pub metric_definitions: CompareMetricDefinitions,
     /// 判定器 × 臂的报告。
     pub arms: Vec<ArmReport>,
+    /// 臂配对读数（每条只在同一口径内比较）。
+    pub pairings: Vec<PairingReading>,
+    /// 本次运行相关的非保密环境（模型与端点；key 只记「是否设置」）。
+    pub judge_environment: JudgeEnvironment,
     /// 轨迹目录（绝对路径）。
     pub traces_dir: String,
     /// 证据日志目录（绝对路径）。
@@ -97,6 +113,26 @@ pub struct CompareReport {
     pub calls_log: String,
     /// 口径与限制说明。
     pub notes: Vec<String>,
+}
+
+/// 本次运行相关的非保密环境。
+///
+/// 只记模型标识与端点（复现时要用的那两样），以及 **key 是否设置**——key 的值任何情况下都不写进
+/// 报告、日志或轨迹（`docs/roadmap-1.0.md` §9 风险表：key 只经环境变量）。
+#[derive(Debug, Clone, Serialize)]
+pub struct JudgeEnvironment {
+    /// `OPENAI_MODEL`（LLM 判定器的模型、必填）。
+    pub openai_model: Option<String>,
+    /// `OPENAI_BASE_URL`（LLM 端点、必填）。
+    pub openai_base_url: Option<String>,
+    /// `OPENAI_API_KEY` 是否设置。
+    pub openai_api_key_set: bool,
+    /// `TYPESAFE_API_KEY` 是否设置。
+    pub typesafe_api_key_set: bool,
+    /// `TYPESAFE_BASE_URL`（Jev 端点覆盖，可选）。
+    pub typesafe_base_url: Option<String>,
+    /// Jev 客户端 pin 的模型。
+    pub jev_model: String,
 }
 
 /// 任务族摘要。
@@ -112,6 +148,50 @@ pub struct FamilySummary {
     pub rounds: BTreeMap<String, usize>,
     /// 问题版本历史（含当前标记）。
     pub questions: Vec<crate::family::QuestionVersionEntry>,
+}
+
+/// 一条臂在配对读数里的摘要。
+#[derive(Debug, Clone, Serialize)]
+pub struct ArmReading {
+    /// 臂标识。
+    pub arm: String,
+    /// 独立验收通过与任务总数（`通过/总数`）。
+    pub acceptance: String,
+    /// 恢复的必需动作与总数（`恢复/总数`）。
+    pub recovered: String,
+    /// 基于失效前提发出的动作次数。
+    pub stale_basis_commitments: u32,
+    /// 不该发出的动作次数。
+    pub wrong_actions: u32,
+    /// 判断请求次数。
+    pub calls: u32,
+    /// 重算节点数。
+    pub judged_nodes: u32,
+    /// 输入字节合计。
+    pub input_bytes: u64,
+    /// 缓存复用率。
+    pub cache_reuse_rate: Option<f64>,
+}
+
+/// 一组配对读数：**同一口径内**的两条臂并排。
+///
+/// 结论必须按配对读：`h1` 配对固定 H2 口径、只让依赖失效传播变，`h2` 配对固定 H1 开关、只让重算口径
+/// 变。跨配对比会把交互作用当成主效应——本项目的读数里 H1 的灾难性表现在增量配对成立、在全量配对
+/// 消失，H2 的成本优势在 H1 开启的配对成立、在关闭的配对质量反转。
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingReading {
+    /// 对照维度：`h1` 或 `h2`。
+    pub dimension: String,
+    /// 固定住的那一侧（`h2=incremental` / `h2=full` / `h1=on` / `h1=off`）。
+    pub fixed: String,
+    /// 判定器。
+    pub judge: String,
+    /// 左侧臂：`h1` 配对里是「传播开」，`h2` 配对里是「增量」。
+    pub left: ArmReading,
+    /// 右侧臂：`h1` 配对里是「传播关」，`h2` 配对里是「全量」。
+    pub right: ArmReading,
+    /// 这组配对怎么读。
+    pub note: String,
 }
 
 /// 指标口径声明：报告里的每个读数怎么算，写在这里。
@@ -154,7 +234,7 @@ impl CompareMetricDefinitions {
                 "基于失效前提作出的承诺次数 ÷ 关键决策机会数；同时报告绝对错误动作数、弃权次数与未恢复任务。"
                     .to_owned(),
             recovery_latency:
-                "从「某动作首次被要求」那一轮的破坏性事件起算，到该动作被发出的轮数差、其间的判断调用数与墙钟毫秒。"
+                "从「某动作首次被要求」那一轮的破坏性事件起算，到该动作被发出的轮数差、其间的判断调用数与墙钟毫秒；起点取该轮决策相位之前最后一条扰动，若这个要求从初始快照就成立（没有可起算的破坏性事件），起点回落到本次任务运行的开始时刻。"
                     .to_owned(),
             missed_invalidation:
                 "逐条扰动对照：问题声明的读取范围包含被改动对象、但运行时没有把它的判断标成待重查（漏失效）。"
@@ -414,6 +494,8 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
         }
     }
 
+    let pairings = pairings(&reports);
+
     Ok(CompareOutcome {
         report: CompareReport {
             run: options.run.clone(),
@@ -431,6 +513,8 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
             },
             metric_definitions: CompareMetricDefinitions::declared(),
             arms: reports,
+            pairings,
+            judge_environment: judge_environment(),
             traces_dir: absolute(&traces_dir),
             evidence_dir: absolute(&evidence_dir),
             calls_log: absolute(&options.calls_path),
@@ -438,6 +522,116 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
         },
         clean,
     })
+}
+
+/// 本次运行相关的非保密环境。
+pub fn judge_environment() -> JudgeEnvironment {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let value = |name: &str| std::env::var(name).ok().filter(|text| !text.is_empty());
+    JudgeEnvironment {
+        openai_model: value("OPENAI_MODEL"),
+        openai_base_url: value("OPENAI_BASE_URL"),
+        openai_api_key_set: set("OPENAI_API_KEY"),
+        typesafe_api_key_set: set("TYPESAFE_API_KEY"),
+        typesafe_base_url: value("TYPESAFE_BASE_URL"),
+        jev_model: jh_jev::DEFAULT_MODEL.to_owned(),
+    }
+}
+
+/// 复现命令：把本次运行**用到**的非保密环境写在 argv 前面（key 只写变量名，绝不写值）。
+///
+/// 只带上与所选判定器相关的变量：跑 `rule` / `replay` 时不该出现模型或端点，免得把命令写成
+/// 「看起来要联网」。
+pub fn reproduction_command(argv: &[String], judges: &[JudgeName]) -> String {
+    let environment = judge_environment();
+    let mut prefix: Vec<String> = Vec::new();
+    let mut push = |name: &str, shown: &str| prefix.push(format!("{name}={shown}"));
+
+    if judges.contains(&JudgeName::Llm) {
+        if let Some(model) = environment.openai_model {
+            push("OPENAI_MODEL", &model);
+        }
+        if let Some(base_url) = environment.openai_base_url {
+            push("OPENAI_BASE_URL", &base_url);
+        }
+        if environment.openai_api_key_set {
+            push("OPENAI_API_KEY", "$OPENAI_API_KEY");
+        }
+    }
+    if judges.contains(&JudgeName::Jev) {
+        if environment.typesafe_api_key_set {
+            push("TYPESAFE_API_KEY", "$TYPESAFE_API_KEY");
+        }
+        if let Some(base_url) = environment.typesafe_base_url {
+            push("TYPESAFE_BASE_URL", &base_url);
+        }
+    }
+
+    format!("{} {}", prefix.join(" "), argv.join(" "))
+        .trim()
+        .to_owned()
+}
+
+/// 由已完成的臂报告生成配对读数：每条只在同一口径内比较。
+fn pairings(arms: &[ArmReport]) -> Vec<PairingReading> {
+    let reading = |arm: &ArmReport| ArmReading {
+        arm: arm.arm.clone(),
+        acceptance: format!("{}/{}", arm.acceptance.passed, arm.acceptance.tasks),
+        recovered: format!(
+            "{}/{}",
+            arm.recovery.recovered, arm.recovery.required_actions
+        ),
+        stale_basis_commitments: arm.decisions.stale_basis_commitments,
+        wrong_actions: arm.decisions.wrong_actions,
+        calls: arm.calls.attempted,
+        judged_nodes: arm.recompute.judged_nodes,
+        input_bytes: arm.recompute.input_bytes,
+        cache_reuse_rate: arm.recompute.cache_reuse_rate,
+    };
+    let judges: BTreeSet<&String> = arms.iter().map(|arm| &arm.judge).collect();
+    let mut pairings = Vec::new();
+
+    for judge in judges {
+        let find = |propagation: bool, recompute: Recompute| {
+            arms.iter().find(|arm| {
+                arm.judge == *judge
+                    && arm.h1_propagation == propagation
+                    && arm.h2_recompute == recompute.label()
+            })
+        };
+        for recompute in [Recompute::Incremental, Recompute::Full] {
+            let (Some(left), Some(right)) = (find(true, recompute), find(false, recompute)) else {
+                continue;
+            };
+            pairings.push(PairingReading {
+                dimension: "h1".to_owned(),
+                fixed: format!("h2={}", recompute.label()),
+                judge: judge.clone(),
+                left: reading(left),
+                right: reading(right),
+                note: "同一 H2 口径内比较依赖失效传播：差异只能归因于「是否使用失效传播」，跨配对的差异是交互作用，不能当主效应读。"
+                    .to_owned(),
+            });
+        }
+        for propagation in [true, false] {
+            let (Some(left), Some(right)) = (
+                find(propagation, Recompute::Incremental),
+                find(propagation, Recompute::Full),
+            ) else {
+                continue;
+            };
+            pairings.push(PairingReading {
+                dimension: "h2".to_owned(),
+                fixed: format!("h1={}", if propagation { "on" } else { "off" }),
+                judge: judge.clone(),
+                left: reading(left),
+                right: reading(right),
+                note: "同一 H1 开关内比较重算口径：两边用同一条输入投影规则，差异只能归因于「要不要复算」；质量读数由判定器决定，成本读数由调度决定。"
+                    .to_owned(),
+            });
+        }
+    }
+    pairings
 }
 
 /// 报告的固定说明。
@@ -451,7 +645,9 @@ fn declared_notes() -> Vec<String> {
             .to_owned(),
         "判断失败如实计入失败数并写进调用记录（不丢弃、不静默重试）；失败的问题是「没答上来的问题」，下一轮按同一调度规则再请求。"
             .to_owned(),
-        "轨迹与证据日志逐任务落盘，报告里的 traces_dir / evidence_dir / calls_log 是绝对路径；复现命令见 command 字段。"
+        "轨迹与证据日志逐任务落盘，报告里的 traces_dir / evidence_dir / calls_log 是绝对路径；command 字段带本次运行的非保密环境前缀，judge_environment 记模型与端点（key 只记是否设置）。"
+            .to_owned(),
+        "结论按 `pairings` 里的配对读：h1 配对固定 H2 口径、h2 配对固定 H1 开关。跨配对读会把交互作用当成主效应——例如「关掉失效传播就恢复不了」只可能在某个重算口径下成立，换口径要重新看那一组配对。"
             .to_owned(),
         "本批每臂独立发起真实调用：同一提示词在四组臂里各调用一次，读数含判定器的抽样波动，不做跨臂的结果共享。"
             .to_owned(),
@@ -867,10 +1063,7 @@ impl Accumulator {
             arm: self.arm.label().to_owned(),
             arm_description: self.arm.description().to_owned(),
             h1_propagation: self.arm.uses_propagation(),
-            h2_recompute: match self.arm.recompute() {
-                crate::matching::Recompute::Incremental => "incremental".to_owned(),
-                crate::matching::Recompute::Full => "full".to_owned(),
-            },
+            h2_recompute: self.arm.recompute().label().to_owned(),
             verification: self.verification(),
             versions: self.versions.iter().cloned().collect(),
             calls: CallStats {
@@ -1021,14 +1214,19 @@ fn count_asks(trace: &TaskTrace, first: usize, recovered: usize) -> u32 {
 }
 
 /// 恢复所需墙钟毫秒：从「破坏前提的事件」到动作发出的时间。
+///
+/// 起点取「该动作首次被要求那一轮的决策相位之前最后一条扰动」；若这个要求从初始快照就成立
+/// （脚本里没有可起算的破坏性事件），起点回落到本次任务运行的开始时刻——记 0 会被读成
+/// 「恢复没花时间」，与事实不符。
 fn recovery_wall_ms(task: &FamilyTask, trace: &TaskTrace, first: usize, recovered: usize) -> u64 {
     let decision_phase = task.decision_phase(first);
-    let breaking = trace
+    let from = trace
         .steps
         .iter()
         .filter(|step| step.phase <= decision_phase)
         .max_by_key(|step| step.phase)
-        .map(|step| step.at_unix_ms);
+        .map(|step| step.at_unix_ms)
+        .unwrap_or_else(|| run_start(trace));
     let executed = trace
         .decisions
         .iter()
@@ -1036,10 +1234,23 @@ fn recovery_wall_ms(task: &FamilyTask, trace: &TaskTrace, first: usize, recovere
             decision.outcome == DecisionOutcome::Executed && decision.round == recovered
         })
         .map(|decision| decision.at_unix_ms);
-    match (breaking, executed) {
-        (Some(from), Some(to)) => to.saturating_sub(from),
-        _ => 0,
+    match executed {
+        Some(to) => to.saturating_sub(from),
+        None => 0,
     }
+}
+
+/// 本次任务运行的开始时刻：优先用轨迹自己记的；早期轨迹没有这个字段时用第一次请求的时刻兜底。
+fn run_start(trace: &TaskTrace) -> u64 {
+    if trace.started_at_unix_ms > 0 {
+        return trace.started_at_unix_ms;
+    }
+    trace
+        .asks
+        .iter()
+        .map(|ask| ask.at_unix_ms)
+        .min()
+        .unwrap_or(0)
 }
 
 /// 判断读数是否为边界读数（并列最大概率 / noul 恰好 0.5）。
@@ -1097,6 +1308,41 @@ impl CompareReport {
             ));
             lines.push(format!("   {}", arm.verification.detail));
         }
+        lines.push("配对读数（结论按配对读，跨配对是交互作用）：".to_owned());
+        for pairing in &self.pairings {
+            let fixed = format!("{}（固定）", pairing.fixed);
+            lines.push(format!(
+                "{}｜{}｜左 {}：验收 {}、恢复 {}、旧依据 {}、错动作 {}、调用 {}、节点 {}、输入 {} 字节、复用 {}｜右 {}：验收 {}、恢复 {}、旧依据 {}、错动作 {}、调用 {}、节点 {}、输入 {} 字节、复用 {}",
+                pairing.judge,
+                fixed,
+                pairing.left.arm,
+                pairing.left.acceptance,
+                pairing.left.recovered,
+                pairing.left.stale_basis_commitments,
+                pairing.left.wrong_actions,
+                pairing.left.calls,
+                pairing.left.judged_nodes,
+                pairing.left.input_bytes,
+                format_ratio(pairing.left.cache_reuse_rate),
+                pairing.right.arm,
+                pairing.right.acceptance,
+                pairing.right.recovered,
+                pairing.right.stale_basis_commitments,
+                pairing.right.wrong_actions,
+                pairing.right.calls,
+                pairing.right.judged_nodes,
+                pairing.right.input_bytes,
+                format_ratio(pairing.right.cache_reuse_rate),
+            ));
+        }
+        lines.push(format!(
+            "环境：OPENAI_MODEL={}｜OPENAI_BASE_URL={}｜OPENAI_API_KEY={}｜TYPESAFE_API_KEY={}｜Jev pin={}",
+            self.judge_environment.openai_model.as_deref().unwrap_or("—"),
+            self.judge_environment.openai_base_url.as_deref().unwrap_or("—"),
+            if self.judge_environment.openai_api_key_set { "已设置" } else { "未设置" },
+            if self.judge_environment.typesafe_api_key_set { "已设置" } else { "未设置" },
+            self.judge_environment.jev_model,
+        ));
         lines.push(format!("轨迹：{}", self.traces_dir));
         lines.push(format!("证据：{}", self.evidence_dir));
         lines.push(format!("调用记录：{}", self.calls_log));
@@ -1126,4 +1372,104 @@ pub fn logged_calls(path: &Path, run: &str) -> Result<usize, Error> {
         .filter(|entry| entry.run() == run)
         .collect();
     Ok(entries.len())
+}
+
+/// 从已有轨迹重建报告（`jev compare --regenerate`）。
+///
+/// 用途：报告口径与 notes 变了、但真调不该重跑时，用当前代码从**同一批轨迹与证据日志**重新汇出报告；
+/// 判定器一次都不调用，读数只来自 `traces_dir` 里的轨迹文件。缺哪个（判定器 × 臂 × 任务）的轨迹就
+/// 显式失败，不拿别的运行的产物顶替。
+pub fn regenerate(family: &FamilyA, options: &RegenerateOptions) -> Result<CompareOutcome, Error> {
+    let tasks: Vec<&FamilyTask> = match options.max_tasks {
+        Some(limit) => family.tasks.iter().take(limit).collect(),
+        None => family.tasks.iter().collect(),
+    };
+    let traces_dir = options.out_dir.join("traces");
+    let evidence_dir = options.out_dir.join("evidence");
+    let mut reports = Vec::new();
+    let mut clean = true;
+
+    for name in &options.judges {
+        for arm in &options.arms {
+            let mut accumulator = Accumulator::new(*name, *arm);
+            for task in &tasks {
+                let stem = format!("{}-{}-{}", name.cli_name(), arm.label(), task.id);
+                let trace_path = traces_dir.join(format!("{stem}.json"));
+                let text = std::fs::read_to_string(&trace_path).map_err(|error| {
+                    Error::TaskSet(format!(
+                        "重建报告需要轨迹文件 {}（{error}）：请确认 --out-dir 指向该次运行的目录",
+                        trace_path.display()
+                    ))
+                })?;
+                let trace: TaskTrace = serde_json::from_str(&text).map_err(|error| {
+                    Error::TaskSet(format!("轨迹 {} 无法解析：{error}", trace_path.display()))
+                })?;
+                if trace.asks.iter().any(|ask| ask.outcome != ASK_SUCCEEDED) {
+                    clean = false;
+                }
+                accumulator.absorb(
+                    task,
+                    &trace,
+                    &absolute(&trace_path),
+                    &absolute(&evidence_dir.join(format!("{stem}.jsonl"))),
+                    family,
+                );
+            }
+            reports.push(accumulator.finish());
+        }
+    }
+
+    let pairings = pairings(&reports);
+    Ok(CompareOutcome {
+        report: CompareReport {
+            run: options.run.clone(),
+            generated_at_unix_ms: unix_ms(),
+            command: options.command.clone(),
+            family: FamilySummary {
+                name: family.name.clone(),
+                source: family.source.clone(),
+                tasks: tasks.len(),
+                rounds: tasks
+                    .iter()
+                    .map(|task| (task.id.clone(), task.rounds))
+                    .collect(),
+                questions: family.history().to_vec(),
+            },
+            metric_definitions: CompareMetricDefinitions::declared(),
+            arms: reports,
+            pairings,
+            judge_environment: judge_environment(),
+            traces_dir: absolute(&traces_dir),
+            evidence_dir: absolute(&evidence_dir),
+            calls_log: absolute(&options.calls_path),
+            notes: {
+                let mut notes = declared_notes();
+                notes.push(format!(
+                    "本报告由 `compare --regenerate` 从 {} 里的轨迹重建（判定器一次都没调用）：读数与那次运行的调用记录一一对应，notes 与字段取当前代码。",
+                    absolute(&traces_dir)
+                ));
+                notes
+            },
+        },
+        clean,
+    })
+}
+
+/// 重建报告的参数。
+#[derive(Debug, Clone)]
+pub struct RegenerateOptions {
+    /// 要重建的判定器。
+    pub judges: Vec<JudgeName>,
+    /// 要重建的臂。
+    pub arms: Vec<Arm>,
+    /// 运行标识（写进报告）。
+    pub run: String,
+    /// 该次运行的产物目录（轨迹与证据日志都从它下面读）。
+    pub out_dir: PathBuf,
+    /// 调用记录路径（只写进报告，不读）。
+    pub calls_path: PathBuf,
+    /// 复现命令。
+    pub command: String,
+    /// 只重建前 N 个任务。
+    pub max_tasks: Option<usize>,
 }

@@ -6,10 +6,12 @@
 //! 每一轮的顺序是固定的，四组对照臂共用同一份控制策略与同一套事件记录：
 //!
 //! 1. **注入提问前的扰动**：环境脚本里的变化落进证据日志，[`SemanticState`] 就地做失效传播；
-//! 2. **重查**：按本臂的调度决定这一轮要问哪些问题，装配 state、发起判断、逐题落判断记录；
-//! 3. **注入提问后的扰动**：请求在途时输入变化 → 刚才那条记录带上过期标记（研究目标 §5.2
-//!    「延迟返回结果的快照校验」）；
-//! 4. **决定行动**：按候选动作的前提门取「手上最新的答案」，再按本臂的纪律决定能不能发出。
+//! 2. **发请求**：按本臂的调度决定这一轮要问哪些问题，装配 state、按读取范围分组、逐组调用判定器
+//!    （结果先攒着不落记录）；
+//! 3. **注入提问后的扰动**：本轮**全部**请求都发完之后才注入，因此这一轮的每条判断看到的是同一份
+//!    输入快照；落记录时快照校验把迟到结果一起标成过期（研究目标 §5.2「延迟返回结果的快照校验」）；
+//! 4. **落记录**：成功写判断记录、失败把节点的评估状态写成失败原文（不重试、不换后端）；
+//! 5. **决定行动**：按候选动作的前提门取「手上最新的答案」，再按本臂的纪律决定能不能发出。
 //!
 //! 轮末再写一条**完成声明**：它进轨迹、进计数，但不进验收（[`crate::family::accept`] 只读证据
 //! 日志与隐藏真值）。
@@ -72,6 +74,16 @@ pub enum Recompute {
     Incremental,
     /// 全量：每轮把本任务跟踪的全部问题重算一遍。
     Full,
+}
+
+impl Recompute {
+    /// 报告里用的标签（配对读数按它配对，只有这一处拼字符串）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Incremental => "incremental",
+            Self::Full => "full",
+        }
+    }
 }
 
 /// 一组对照臂：H1（依赖失效传播开/关）× H2（增量/全量）。
@@ -289,6 +301,11 @@ pub struct TaskTrace {
     pub task: String,
     /// 轮数。
     pub rounds: usize,
+    /// 本次任务运行的开始时刻，Unix 毫秒（恢复延迟在「没有可起算的破坏性事件」时的起点）。
+    ///
+    /// 早期轨迹没有这个字段：按 0 读，[`crate::compare`] 的恢复延迟会用本次运行第一次请求的时刻兜底。
+    #[serde(default)]
+    pub started_at_unix_ms: u64,
     /// 判断请求。
     pub asks: Vec<AskTrace>,
     /// 判断记录。
@@ -368,6 +385,7 @@ pub async fn run_task(
         arm: context.arm.label().to_owned(),
         task: task.id.clone(),
         rounds: task.rounds,
+        started_at_unix_ms: unix_ms(),
         asks: Vec::new(),
         judgments: Vec::new(),
         reuses: Vec::new(),
@@ -383,28 +401,26 @@ pub async fn run_task(
             .steps
             .extend(environment.apply_round(round, StepWhen::BeforeAsk, &mut state)?);
 
-        // 2. 重查：按臂的调度决定问什么。请求在途时的扰动由 `ask_once` 在返回后、落记录前注入。
-        let (asks, reuses) = schedule(context.arm, task, round, &state);
+        // 2. 发请求：按臂的调度决定问什么、按读取范围分组；本步只发不收。
+        let (asks, reuses) = schedule(context.arm, context.family, task, round, &state)?;
         trace.reuses.extend(reuses);
+        let mut sent = Vec::with_capacity(asks.len());
         for ask in asks {
-            ask_once(
-                context,
-                task,
-                round,
-                &mut environment,
-                &mut state,
-                &mut trace,
-                &ask,
-            )
-            .await?;
+            sent.push(send_ask(context, task, round, environment.phase(), &mut state, &ask).await?);
         }
 
-        // 3. 提问后的扰动：请求在途时输入变化（有提问时已由 `ask_once` 注入，这里是没提问的轮次的兜底）。
+        // 3. 提问后的扰动：**本轮全部请求都发完之后**才注入，因此这一轮的每条迟到结果看到的是同一份
+        //    变化，落记录时一起被快照校验标成过期（研究目标 §5.2）。分组不影响谁看到什么材料。
         trace
             .steps
             .extend(environment.apply_round(round, StepWhen::AfterAsk, &mut state)?);
 
-        // 4. 决定行动。
+        // 4. 收结果：落判断记录（漂移在这里被判定）或把失败如实写进节点与调用记录。
+        for pending in sent {
+            record_ask(task, &mut state, &mut trace, pending)?;
+        }
+
+        // 5. 决定行动。
         decide(context, task, round, &mut state, &mut trace)?;
     }
 
@@ -447,10 +463,11 @@ struct Ask {
 /// **H1 开关的唯一分叉点之一**：关闭臂只问「从没答上来的问题」，不看失效标记。
 fn schedule(
     arm: Arm,
+    family: &FamilyA,
     task: &FamilyTask,
     round: usize,
     state: &SemanticState,
-) -> (Vec<Ask>, Vec<ReuseTrace>) {
+) -> Result<(Vec<Ask>, Vec<ReuseTrace>), Error> {
     let mut needed: Vec<QuestionId> = Vec::new();
     let mut reuses: Vec<ReuseTrace> = Vec::new();
 
@@ -490,40 +507,27 @@ fn schedule(
         });
     }
 
-    (group_by_scope(needed), reuses)
+    Ok((group_by_scope(family, needed)?, reuses))
 }
 
 /// 按读取范围分组：范围相同的问题共享一次请求（研究目标 §5.3 的保守依赖口径）。
-fn group_by_scope(questions: Vec<QuestionId>) -> Vec<Ask> {
+///
+/// 读取范围只有一个真身：问题集声明的那份（[`FamilyA::scope`]，来自任务 JSON 的 `reads`）。
+/// 这里不保留副本——否则改问题集时投影与「漏失效 / 误失效」读数会一起漂，守卫就被自己破坏了。
+fn group_by_scope(family: &FamilyA, questions: Vec<QuestionId>) -> Result<Vec<Ask>, Error> {
     let mut groups: BTreeMap<Vec<ObjectId>, Vec<QuestionId>> = BTreeMap::new();
     for question in questions {
-        let scope = scope_of(&question);
-        groups.entry(scope).or_default().push(question);
+        let scope = family.scope(&question).ok_or_else(|| {
+            Error::TaskSet(format!(
+                "问题 `{question}` 没有声明读取范围：它不在当前固定问题集里"
+            ))
+        })?;
+        groups.entry(scope.to_vec()).or_default().push(question);
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(scope, questions)| Ask { scope, questions })
-        .collect()
-}
-
-/// 问题当前版本的读取范围。
-///
-/// 循环只与固定问题集打交道，因此这里按问题集里的四个问题查表；查不到时给空范围（该问题不依赖
-/// 证据），不会静默换成别的范围。
-fn scope_of(question: &QuestionId) -> Vec<ObjectId> {
-    match question.as_str() {
-        crate::family::CAUSE_QUESTION => vec![ObjectId::from("app.log"), ObjectId::from("config")],
-        crate::family::PREMISE_QUESTION => {
-            vec![ObjectId::from("app.log"), ObjectId::from("config")]
-        }
-        crate::family::METRICS_QUESTION => {
-            vec![ObjectId::from("runtime.metrics"), ObjectId::from("config")]
-        }
-        crate::family::DELIVERABLE_QUESTION => {
-            vec![ObjectId::from("fix-report.md"), ObjectId::from("app.log")]
-        }
-        _ => Vec::new(),
-    }
+        .collect())
 }
 
 /// 某个问题上手上最新的判断节点（按节点标识取最大者）。
@@ -580,18 +584,28 @@ fn assemble(state: &SemanticState, scope: &[ObjectId]) -> (State, InputProjectio
     (State::Object(sections), InputProjection::covering(reads))
 }
 
-/// 发起一次判断请求，落记录与轨迹；失败原样记进调用记录与轨迹，不重试、不换后端。
-#[allow(clippy::too_many_arguments)]
-async fn ask_once(
+/// 已经发出、还没落记录的请求。
+///
+/// 结果先攒在这里，等本轮「提问后」的扰动注入之后再一起落记录：这样一轮里的每条判断看到的是同一份
+/// 输入快照，迟到结果也一起被判成过期，不会出现「同一轮里先发的看到旧材料、后发的看到新材料」。
+struct PendingAsk {
+    trace: AskTrace,
+    phase: usize,
+    nodes: BTreeMap<QuestionId, NodeId>,
+    outcome: Result<JudgmentRecord, String>,
+}
+
+/// 发一次判断请求：装配 state、声明节点、调判定器、落调用记录；不写判断记录。
+///
+/// 失败原样记进调用记录，不重试、不换后端（落节点的失败状态在 [`record_ask`] 里做）。
+async fn send_ask(
     context: &mut LoopContext<'_>,
     task: &FamilyTask,
     round: usize,
-    environment: &mut Environment<'_>,
+    phase: usize,
     state: &mut SemanticState,
-    trace: &mut TaskTrace,
     ask: &Ask,
-) -> Result<(), Error> {
-    let phase = environment.phase();
+) -> Result<PendingAsk, Error> {
     let (material, projection) = assemble(state, &ask.scope);
     let input_bytes = serde_json::to_string(&material)?.len();
     let scope_key = ask
@@ -651,13 +665,7 @@ async fn ask_once(
     let latency = started.elapsed();
     let latency_ms = latency.as_millis() as u64;
 
-    // 请求在途时注入的扰动：在落记录之前注入，快照校验就会把这条迟到结果标成过期
-    // （记录留作审计、依据有效性落成待重查——研究目标 §5.2）。
-    trace
-        .steps
-        .extend(environment.apply_round(round, StepWhen::AfterAsk, state)?);
-
-    let mut ask_trace = AskTrace {
+    let mut trace = AskTrace {
         round,
         phase,
         scope: ask.scope.clone(),
@@ -673,25 +681,24 @@ async fn ask_once(
         output_tokens: None,
     };
 
-    let record = match outcome {
+    let result = match outcome {
         Ok(response) => match JudgmentRecord::from_response(&request, &response, latency) {
             Ok(record) => {
-                ask_trace.outcome = ASK_SUCCEEDED.to_owned();
-                ask_trace.version = Some(record.version.clone());
-                ask_trace.request_id = record.request_id.clone();
-                ask_trace.input_tokens = record.usage.as_ref().and_then(|usage| usage.input_tokens);
-                ask_trace.output_tokens =
-                    record.usage.as_ref().and_then(|usage| usage.output_tokens);
+                trace.outcome = ASK_SUCCEEDED.to_owned();
+                trace.version = Some(record.version.clone());
+                trace.request_id = record.request_id.clone();
+                trace.input_tokens = record.usage.as_ref().and_then(|usage| usage.input_tokens);
+                trace.output_tokens = record.usage.as_ref().and_then(|usage| usage.output_tokens);
                 context.calls.append(&CallEntry::Judgment {
                     run: context.run.clone(),
                     case: format!("{}-r{round}-{scope_key}", task.id),
                     record: Box::new(record.clone()),
                 })?;
-                record
+                Ok(record)
             }
             Err(error) => {
                 let text = error.to_string();
-                ask_trace.outcome = text.clone();
+                trace.outcome = text.clone();
                 context.calls.append(&CallEntry::Failure {
                     run: context.run.clone(),
                     case: format!("{}-r{round}-{scope_key}", task.id),
@@ -699,14 +706,12 @@ async fn ask_once(
                     latency_ms,
                     error: text.clone(),
                 })?;
-                fail_nodes(state, &nodes, &text)?;
-                trace.asks.push(ask_trace);
-                return Ok(());
+                Err(text)
             }
         },
         Err(error) => {
             let text = error.to_string();
-            ask_trace.outcome = text.clone();
+            trace.outcome = text.clone();
             context.calls.append(&CallEntry::Failure {
                 run: context.run.clone(),
                 case: format!("{}-r{round}-{scope_key}", task.id),
@@ -714,12 +719,44 @@ async fn ask_once(
                 latency_ms,
                 error: text.clone(),
             })?;
+            Err(text)
+        }
+    };
+
+    Ok(PendingAsk {
+        trace,
+        phase,
+        nodes,
+        outcome: result,
+    })
+}
+
+/// 落一条已经回来的请求：成功写判断记录与轨迹，失败把节点的评估状态写成失败原文。
+///
+/// 快照校验在这里发生，所以「请求在途时输入变化」的迟到结果会带上过期标记（研究目标 §5.2）。
+fn record_ask(
+    task: &FamilyTask,
+    state: &mut SemanticState,
+    trace: &mut TaskTrace,
+    pending: PendingAsk,
+) -> Result<(), Error> {
+    let PendingAsk {
+        trace: ask_trace,
+        phase,
+        nodes,
+        outcome,
+    } = pending;
+
+    let record = match outcome {
+        Ok(record) => record,
+        Err(text) => {
             fail_nodes(state, &nodes, &text)?;
             trace.asks.push(ask_trace);
             return Ok(());
         }
     };
 
+    let round = ask_trace.round;
     trace.asks.push(ask_trace);
     for (question, node) in &nodes {
         state.record_judgment(*node, record.clone())?;
