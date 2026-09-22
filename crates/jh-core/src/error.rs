@@ -5,14 +5,16 @@
 //! 留在各通道 crate，由 `jh-app` 的适配层折进这里的三个判断器类别。
 //!
 //! 变体分两组：前三类描述**判断调用**的失败（[`Judge`](crate::Judge) 的契约），后几类描述
-//! **运行时对象**的失败——证据日志读写不了、引用了不存在的证据 / 节点 / 行动、问题版本冲突。
-//! 两组都是显式失败：没有哪一类会被悄悄吞掉、跳过或折成默认值。
+//! **运行时对象**的失败——证据日志读写不了、引用了不存在的证据 / 节点 / 行动、往已撤回的节点写结果、
+//! 问题版本冲突、问题版本不存在、候选问题没有消费者、生命周期迁移不合法。两组都是显式失败：
+//! 没有哪一类会被悄悄吞掉、跳过或折成默认值。
 
 use thiserror::Error;
 
 use crate::evidence::EvidenceId;
 use crate::graph::{ActionId, NodeId};
-use crate::question::QuestionId;
+use crate::library::Lifecycle;
+use crate::question::{QuestionId, QuestionVersion};
 
 /// 调用判断器或使用运行时对象时可能显式失败的情况。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -54,6 +56,26 @@ pub enum Error {
     /// 旧版本不可被覆盖。
     #[error("问题版本冲突：{0}")]
     QuestionVersionConflict(QuestionId),
+    /// 引用了不存在的问题版本。
+    #[error("问题版本不存在：{0} v{1}")]
+    UnknownQuestionVersion(QuestionId, QuestionVersion),
+    /// 候选问题没有声明下游消费者（研究目标 §6.3「没有消费者的问题不默认常驻」）。
+    ///
+    /// 库不记这条候选、也不给它分配版本号：先补上消费者，或别提。
+    #[error("候选问题没有下游消费者：{0}")]
+    QuestionWithoutConsumer(QuestionId),
+    /// 问题库的生命周期迁移不合法：该版本当前的状态不允许这个操作。
+    ///
+    /// 允许的迁移见 [`QuestionLibrary`](crate::QuestionLibrary) 的迁移表。
+    #[error("问题 `{question}` v{version} 当前的生命周期是「{lifecycle}」，不允许这次迁移")]
+    InvalidLifecycle {
+        /// 问题标识。
+        question: QuestionId,
+        /// 版本。
+        version: QuestionVersion,
+        /// 该版本当前的状态。
+        lifecycle: Lifecycle,
+    },
 }
 
 #[cfg(test)]
@@ -97,5 +119,28 @@ mod tests {
                 .to_string()
                 .contains("cache_disabled")
         );
+    }
+
+    #[test]
+    fn question_library_failures_name_the_version_or_the_missing_consumer() {
+        let question = QuestionId::from("cause_b_pair");
+        assert!(
+            Error::UnknownQuestionVersion(question.clone(), QuestionVersion(9))
+                .to_string()
+                .contains("cause_b_pair v9")
+        );
+        assert!(
+            Error::QuestionWithoutConsumer(question.clone())
+                .to_string()
+                .contains("cause_b_pair")
+        );
+        let invalid = Error::InvalidLifecycle {
+            question,
+            version: QuestionVersion(2),
+            lifecycle: Lifecycle::Retired,
+        };
+        assert!(invalid.to_string().contains("cause_b_pair"), "{invalid}");
+        assert!(invalid.to_string().contains("v2"), "{invalid}");
+        assert!(invalid.to_string().contains("停用"), "{invalid}");
     }
 }

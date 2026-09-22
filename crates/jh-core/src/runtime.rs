@@ -7,8 +7,9 @@
 //!   可改写——重新判断会得到新节点，旧节点留着当审计与回退；
 //! - **两个维度分开管**（§5.3）：[`EvaluationStatus`] 记「有没有拿到一次有效响应」，
 //!   [`Validity`] 记「还能不能作为依据」；答案内容本身留在 [`JudgmentRecord`] 里，三者互不覆盖；
-//! - **失效传播**：撤回一条证据、撤销一个判断，或追加一条新证据，都从依赖图往下游传播，
-//!   把受影响的判断标成待重查、把以它们为前提的行动标成不能发出，无关结果原样保留；
+//! - **失效传播**：撤回一条证据、撤销一个判断、追加一条新证据，或问题库里换了某个问题的当前定义
+//!   （发布 / 回退 / 停用），都从依赖图往下游传播，把受影响的判断标成待重查、把以它们为前提的行动
+//!   标成不能发出，无关结果原样保留；
 //! - **行动前提复核**（§5.2）：行动发出前调 [`SemanticState::check_action`]；撤销只改变使用资格，
 //!   已经发生的外部副作用需要独立的补偿动作，本 crate 不自动回滚。
 //!
@@ -24,6 +25,7 @@
 //! | 追加了一条属于对象 `O` 的证据 | 所有读过 `O` 的判断——它们没看到这条新记录 |
 //! | 撤回了一条属于对象 `O` 的证据 | 所有读过 `O` 的判断——被撤回的记录可能就在它们的材料里 |
 //! | 撤销判断 | 由它支持的下游判断、以它为前提的行动 |
+//! | 问题换了定义（发布 / 回退 / 停用） | 回答过该问题任一版本的判断，以及沿依赖边到它们下游的判断与行动 |
 //! | 全量重查 | 所有当前有效的判断与行动（保守出口，不沿路径） |
 //!
 //! 冲突候选是对称关系，两种情形都不传播（见 [`DependencyGraph::cycles`](crate::DependencyGraph)）。
@@ -227,14 +229,23 @@ pub enum InvalidationCause {
     EvidenceRetracted(EvidenceId),
     /// 撤销了一个判断。
     JudgmentRetracted(NodeId),
+    /// 问题库对这个问题的当前定义变了：发布新版本、回退到旧版本，或停用当前版本
+    /// （研究目标 §6.2 第 8 步）。
+    QuestionVersionChanged {
+        /// 问题。
+        question: QuestionId,
+        /// 变更后的当前版本（发布 / 回退的目标）；停用时是退出使用的那个版本。
+        version: QuestionVersion,
+    },
     /// 保守全量重查：不沿传播路径，把所有当前有效的判断与行动一并标为待重查。
     FullRecheck,
 }
 
 /// 一次失效传播的结果。
 ///
-/// `paths` 只给**这次新标记**的每个目标一条最短路径，与 `stale`、`blocked` 一一对应
-/// （先判断节点、后行动，都按标识排序），用来展示完整传播路径（研究目标 §5.4）。
+/// `paths` 只给**这次新标记**的每个目标一条路径（先标记它的那条——同一目标被多个起因波及时，
+/// 只留先到的一条），与 `stale`、`blocked` 一一对应（先判断节点、后行动，都按标识排序），
+/// 用来展示完整传播路径（研究目标 §5.4）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Invalidation {
     /// 起因。
@@ -480,6 +491,84 @@ impl SemanticState {
             NodeRef::Judgment(id),
             affected,
         ))
+    }
+
+    /// 问题库对这个问题的当前定义变了（发布新版本、回退到旧版本，或停用当前版本）：把回答过这个
+    /// 问题的判断全部标成待重查，沿依赖图传播，以它们为前提的行动一并失效；无关结果原样保留。
+    ///
+    /// 失效范围按**问题**取，不按版本区分——判断记录绑定「问题 ID + 版本」，定义一换，任一版本上的
+    /// 旧答案都不能继续当依据（研究目标 §6.2 第 8 步「使受影响的判断、缓存和能力契约失效」）。
+    /// 新版本自己的判断也一并作废：影子评估期的读数是在「不参与控制」的前提下取得的，不能直接当
+    /// 启用后的依据。与证据传播「按对象保守判定」同一个口径：宁可误失效，不留漏失效。
+    ///
+    /// 它由 [`QuestionLibrary::publish`](crate::QuestionLibrary::publish) /
+    /// [`retire`](crate::QuestionLibrary::retire) 直接调用，也可以单独使用（例如入库的问题库被
+    /// 外部改写后重放失效）。
+    ///
+    /// `version` 只进[起因](InvalidationCause::QuestionVersionChanged)作审计。直接命中的判断节点
+    /// 自己就是起因，路径为 0 跳；某个节点若同时被另一个命中点波及，只留下先到的那条路径
+    /// （每个目标一条）。[`Invalidation::paths`] 与 `stale`、`blocked` 仍然一一对应。
+    pub fn invalidate_question(
+        &mut self,
+        question: &QuestionId,
+        version: QuestionVersion,
+    ) -> Invalidation {
+        let cause = InvalidationCause::QuestionVersionChanged {
+            question: question.clone(),
+            version,
+        };
+        let hits: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|node| node.question == *question && node.validity == Validity::Current)
+            .map(|node| node.id)
+            .collect();
+
+        let mut stale = Vec::new();
+        let mut blocked = Vec::new();
+        let mut paths: BTreeMap<NodeRef, PropagationPath> = BTreeMap::new();
+        for id in hits {
+            let origin = NodeRef::Judgment(id);
+            if self.mark_node_stale(id) {
+                stale.push(id);
+                paths.insert(
+                    origin.clone(),
+                    PropagationPath {
+                        target: origin.clone(),
+                        hops: Vec::new(),
+                    },
+                );
+            }
+            let first = self.graph.successors(&origin);
+            let downstream = self.propagate(cause.clone(), origin, first);
+            stale.extend(downstream.stale);
+            blocked.extend(downstream.blocked);
+            for path in downstream.paths {
+                paths.insert(path.target.clone(), path);
+            }
+        }
+
+        // 与其它传播出口同口径：paths 先判断节点、后行动，各按标识排序。
+        stale.sort();
+        blocked.sort();
+        let mut ordered = Vec::with_capacity(stale.len() + blocked.len());
+        for id in &stale {
+            if let Some(path) = paths.remove(&NodeRef::Judgment(*id)) {
+                ordered.push(path);
+            }
+        }
+        for id in &blocked {
+            if let Some(path) = paths.remove(&NodeRef::Action(id.clone())) {
+                ordered.push(path);
+            }
+        }
+
+        Invalidation {
+            cause,
+            stale,
+            blocked,
+            paths: ordered,
+        }
     }
 
     /// 保守全量重查出口：把所有当前有效的判断与行动一并标为待重查。
@@ -1224,5 +1313,91 @@ mod tests {
         state.declare_action(action.clone(), [fresh]).unwrap();
         assert_eq!(state.check_action(&action).unwrap(), PremiseCheck::Cleared);
         assert_eq!(state.node(node).unwrap().validity, Validity::Retracted);
+    }
+
+    #[test]
+    fn a_question_version_change_invalidates_every_version_of_that_question() {
+        let mut state = SemanticState::in_memory();
+        observe(&mut state, "cache.conf", 1);
+        observe(&mut state, "app.log", 1);
+
+        // 同一个问题的两个版本各答过一次，下游还有一层支持关系与两个行动。
+        let v1 = declare(&mut state, "cause_b_pair", &[("app.log", 1)]);
+        let v2 = declare(&mut state, "cause_b_pair", &[("app.log", 1)]);
+        let downstream = declare(&mut state, "restart_safe", &[("app.log", 1)]);
+        let unrelated = declare(&mut state, "cache_disabled", &[("cache.conf", 1)]);
+        state
+            .link(v2, downstream, EdgeKind::Support, EdgeOrigin::Proposed)
+            .unwrap();
+        let from_v1 = ActionId::from("fix-clock");
+        let from_v2 = ActionId::from("renew-cert");
+        let from_unrelated = ActionId::from("restart-cache");
+        state.declare_action(from_v1.clone(), [v1]).unwrap();
+        state.declare_action(from_v2.clone(), [v2]).unwrap();
+        state
+            .declare_action(from_unrelated.clone(), [unrelated])
+            .unwrap();
+        for node in [v1, v2, downstream, unrelated] {
+            judge(&mut state, node, 1.0);
+        }
+
+        let invalidation =
+            state.invalidate_question(&QuestionId::from("cause_b_pair"), QuestionVersion(3));
+
+        assert_eq!(
+            invalidation.cause,
+            InvalidationCause::QuestionVersionChanged {
+                question: QuestionId::from("cause_b_pair"),
+                version: QuestionVersion(3),
+            }
+        );
+        // 两个版本的判断都待重查，沿支持边到下游判断与两个行动。
+        assert_eq!(invalidation.stale, vec![v1, v2, downstream]);
+        assert_eq!(invalidation.blocked, vec![from_v1.clone(), from_v2.clone()]);
+        assert_eq!(state.recheck_set(), vec![v1, v2, downstream]);
+        // 无关结果保留。
+        assert_eq!(state.node(unrelated).unwrap().validity, Validity::Current);
+        assert_eq!(
+            state.check_action(&from_unrelated).unwrap(),
+            PremiseCheck::Cleared
+        );
+        // paths 与 stale、blocked 一一对应；直接命中的判断节点自己就是起因，路径 0 跳。
+        assert_eq!(
+            invalidation.paths.len(),
+            invalidation.stale.len() + invalidation.blocked.len()
+        );
+        assert_eq!(
+            invalidation
+                .paths
+                .iter()
+                .find(|path| path.target == NodeRef::Judgment(v2))
+                .expect("直接命中的判断也在结果里")
+                .hops
+                .len(),
+            0
+        );
+        assert_eq!(
+            invalidation
+                .paths
+                .iter()
+                .find(|path| path.target == NodeRef::Action(from_v2.clone()))
+                .expect("行动在结果里")
+                .hops
+                .iter()
+                .map(|hop| hop.kind)
+                .collect::<Vec<_>>(),
+            vec![EdgeKind::Premise]
+        );
+
+        // 已经失效过的不重复标记：再发布一次同一版本不会产生新结果。
+        assert!(
+            state
+                .invalidate_question(&QuestionId::from("cause_b_pair"), QuestionVersion(3))
+                .is_empty()
+        );
+
+        // 已撤回的节点不在失效范围里，也不该被重算。
+        state.retract_judgment(v1).unwrap();
+        assert!(!state.recheck_set().contains(&v1));
     }
 }
