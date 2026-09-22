@@ -73,7 +73,7 @@ jev-harness/
 
 | # | 里程碑 | 交付物 | 验收标准 |
 | --- | --- | --- | --- |
-| **M0** | 骨架与契约（半天） | workspace 三 crate + bin `jev`；领域类型、`Decider` / `Tool` trait；配置（`jev.toml` + 环境变量 + `.env`）；官方示例的 Jev fixture；`.gitignore` 更新（`.env`、`var/`、`target/`） | `cargo test` 全绿；`jev --version` 可运行；**无任何网络调用** |
+| **M0** | 工作区骨架（半天） | workspace 根配置（`members = ["crates/*"]`、`resolver = "2"`、统一 `[workspace.dependencies]` 清单）+ bin `jev`（`--version` 与 chat / ask / run / exp 四个子命令壳，均未实现）+ `.gitignore`（`target/`、`Cargo.lock`、`.env`、`var/`，Cargo.lock 暂不入库）+ 路线图同步；四个 crate（jh-app / jh-jev / jh-openai / jh-tui）的实现由 M1–M3 补齐，领域类型 / `Decider` / `Tool` trait / 配置（`jev.toml`）/ Jev fixture 随之延后 | `cargo test` 全绿；`jev --version` 可运行；`git status` 无残留未跟踪文件；**无任何网络调用** |
 | **M1** | LLM 通道（1 天） | OpenAI 兼容客户端（流式）+ `jev chat` 纯 CLI 对话 | 与 DeepSeek 真实对话跑通；401/429 显式报错、不吞 |
 | **M2** | Jev 通道（1 天） | Jev HTTP 客户端 + `jev ask --noul/--choice/--score`；pin 版本；录制真实响应为 fixture | 真实调用成功并打印答案 / 概率 / 延迟 / request_id；fixture 离线回放可复现 |
 | **M2.5** | **E1 中文基线（提前跑）** | 30–50 条中文样本 × 三种 prompt 条件的最小对照 | 得出「中文是否可用」的初步结论，避免后程返工 |
