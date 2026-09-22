@@ -1422,6 +1422,19 @@ pub fn logged_calls(path: &Path, run: &str) -> Result<usize, Error> {
     Ok(entries.len())
 }
 
+/// 调用记录里「本运行」的行数：run 标识等于 `run`，或以 `{run}-` 开头的那些。
+///
+/// 与 [`logged_calls`] 的精确匹配不同：`jev h3` 的运行标识带阶段后缀（`-dev` / `-validation` /
+/// `-fixed` / …），用精确匹配去核对会得到 0，读起来像「一条调用记录都没有」。报告的复现核对用它。
+pub fn logged_calls_of_run(path: &Path, run: &str) -> Result<usize, Error> {
+    let prefix = format!("{run}-");
+    let entries = crate::calls::read_entries(path)?;
+    Ok(entries
+        .iter()
+        .filter(|entry| entry.run() == run || entry.run().starts_with(&prefix))
+        .count())
+}
+
 /// 从已有轨迹重建报告（`jev compare --regenerate`）。
 ///
 /// 用途：报告口径与 notes 变了、但真调不该重跑时，用当前代码从**同一批轨迹与证据日志**重新汇出报告；

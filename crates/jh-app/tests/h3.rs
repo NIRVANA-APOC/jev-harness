@@ -318,6 +318,73 @@ async fn the_refined_version_gets_its_answers_from_the_observation_action_in_b2(
 }
 
 #[tokio::test]
+async fn a_candidate_that_reads_the_key_evidence_but_answers_wrong_is_rejected_pipeline_wide() {
+    // 管线级的行为型拒绝：把 P1 一个正例的期望读法翻到另一侧（材料说着「证书窗口已过期」，
+    // 期望却是 clock_skew）。候选读得到关键证据（契约、证据对象、消费者都合规），但它按材料读出
+    // expired_credential，与期望相左——判据「正例一致率」必须把它拒掉，而不是让它带着错读数晋升。
+    let mut family = FamilyB::load().expect("内嵌任务族 B 应自洽");
+    let flipped = jh_app::tasks::Truth::Choice {
+        label: "clock_skew".to_owned(),
+    };
+    family
+        .validation
+        .iter_mut()
+        .find(|case| case.id == "P1-positive-a")
+        .expect("P1 的正例存在")
+        .expected = flipped;
+
+    let dir = TempDir::new("wrong-side-pipeline");
+    let report = run_offline(&family, &dir).await;
+
+    let p1 = report
+        .promotion
+        .decisions
+        .iter()
+        .find(|decision| decision.pair == "P1")
+        .expect("P1 有晋升决定");
+    assert!(!p1.promoted, "读得到关键证据却答错侧的候选不能晋升");
+    let failed: Vec<&str> = p1
+        .criteria
+        .iter()
+        .filter(|criterion| !criterion.passed)
+        .map(|criterion| criterion.id.as_str())
+        .collect();
+    assert!(failed.contains(&"positive_cases"), "{failed:?}");
+    // 形状是好的：契约、协议与权限三条仍然通过——拒绝的理由是读数，不是形状。
+    for id in [
+        "contract_complete",
+        "consumption_protocol",
+        "evidence_within_permissions",
+    ] {
+        assert!(
+            p1.criteria
+                .iter()
+                .any(|criterion| criterion.id == id && criterion.passed),
+            "{id} 应当通过：{failed:?}"
+        );
+    }
+    // 这一对停在固定版本；另外两对不受影响。
+    let p1_library = report
+        .promotion
+        .library
+        .iter()
+        .find(|entry| entry.question == "b_pair_cause_p1")
+        .expect("P1 有库状态");
+    assert_eq!(p1_library.enabled, Some(1));
+    assert_eq!(p1_library.versions.len(), 2, "候选仍留在库里，只是没启用");
+    assert_eq!(
+        report
+            .promotion
+            .decisions
+            .iter()
+            .filter(|decision| decision.promoted)
+            .count(),
+        2,
+        "只有 P1 被拒"
+    );
+}
+
+#[tokio::test]
 async fn a_candidate_that_does_not_pass_the_declared_criteria_is_not_promoted() {
     // 把候选改成读不到关键证据（只读 app.log）：契约核对与判据都会不过，问题集保持固定版本。
     let family = FamilyB::load().expect("内嵌任务族 B 应自洽");

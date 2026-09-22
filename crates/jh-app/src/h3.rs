@@ -42,8 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::calls::{CallEntry, CallLog};
 use crate::compare::{
-    ReportEnvironment, absolute, build_judge, endpoint_for, logged_calls, report_environment,
-    write_json,
+    ReportEnvironment, absolute, build_judge, endpoint_for, report_environment, write_json,
 };
 use crate::error::Error;
 use crate::exp::unix_ms;
@@ -217,8 +216,10 @@ pub struct GenerationSection {
 pub struct GenerationReuse {
     /// 产物里记着的生成调用数（每个候选一次）。
     pub calls: u32,
-    /// 实时生成它们的运行标识（候选产物里的 `call` 属于哪一次生成）。
-    pub source_run: String,
+    /// 候选产物文件路径。
+    pub source_file: String,
+    /// 当初那次生成的运行标识（从调用记录里按候选的 request_id 找回；找不到时为 `None`）。
+    pub source_run_id: Option<String>,
     /// 输入 token 合计（通道上报；缺报时为 `None`）。
     pub input_tokens: Option<u64>,
     /// 输出 token 合计。
@@ -734,7 +735,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             })?;
             // 复用候选产物：生成这一次没发生，但当初生成它们的调用读数在产物里——
             // 归成 `generation_reused` 进成本账（§6.5 要求收益扣除生成成本），不重复落调用记录。
-            let reuse = generation_reuse(&parsed, &absolute(path));
+            let reuse = generation_reuse(&parsed, &absolute(path), &calls_path);
             (parsed, "file".to_owned(), Some(reuse))
         }
     };
@@ -1392,12 +1393,21 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
 }
 
 /// 复用候选产物时的生成读数（从产物里读回，不重复落调用记录）。
-fn generation_reuse(parsed: &[GeneratedCandidate], path: &str) -> GenerationReuse {
+///
+/// `source_run_id` 从调用记录里按候选的 `request_id` 找回：当年那次生成的 `ModelCall` 就在同一个
+/// 调用记录文件里，只是挂着另一条 run 标识（`{run}-generation`）——报告要把这条找出来，
+/// 不能让复用的成本挂在「无源」上。
+fn generation_reuse(
+    parsed: &[GeneratedCandidate],
+    path: &str,
+    calls_path: &Path,
+) -> GenerationReuse {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut usage_seen = false;
     let mut latencies = Vec::new();
     let mut versions = Vec::new();
+    let mut request_ids = Vec::new();
     for entry in parsed {
         if let Some(usage) = &entry.call.usage {
             usage_seen = true;
@@ -1412,11 +1422,32 @@ fn generation_reuse(parsed: &[GeneratedCandidate], path: &str) -> GenerationReus
                 .clone()
                 .unwrap_or_else(|| "未记录".to_owned()),
         );
+        if let Some(request_id) = &entry.call.request_id {
+            request_ids.push(request_id.clone());
+        }
     }
     latencies.sort_unstable();
+
+    let source_run_id = crate::calls::read_entries(calls_path)
+        .ok()
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| match entry {
+                CallEntry::ModelCall {
+                    run,
+                    purpose,
+                    request_id: Some(request_id),
+                    ..
+                } if purpose == "generation" && request_ids.contains(request_id) => {
+                    Some(run.clone())
+                }
+                _ => None,
+            })
+        });
+
     GenerationReuse {
         calls: parsed.len() as u32,
-        source_run: path.to_owned(),
+        source_file: path.to_owned(),
+        source_run_id,
         input_tokens: usage_seen.then_some(input_tokens),
         output_tokens: usage_seen.then_some(output_tokens),
         latencies_ms: latencies,
@@ -2291,6 +2322,7 @@ fn cost_section(
 
     // 复用候选产物时，生成这一次没发生：把产物里记着的调用读数归成 `generation_reused`
     // （不重复落调用记录，但成本账与收益扣减都要算上它——§6.5）。
+    let reused_calls = generation_reuse.map(|reuse| reuse.calls).unwrap_or(0);
     if let Some(reuse) = generation_reuse {
         let stats = PurposeCost {
             purpose: "generation_reused".to_owned(),
@@ -2327,22 +2359,39 @@ fn cost_section(
     } else {
         None
     };
+    // 合计里含复用那一笔：拆开写清楚，别让「合计 60」与「本运行 57」两个数打架。
+    total.reused = reused_calls > 0;
 
-    let logged = logged_calls(calls_path, run)?;
+    let logged = crate::compare::logged_calls_of_run(calls_path, run)?;
     let generation_note = match generation_reuse {
         Some(reuse) => format!(
-            "本次运行没有重新生成候选：候选产物 {} 里记着当初 {} 次生成调用（模型 {}），这一笔按原值归成 generation_reused 计入成本与收益扣减，不重复落调用记录",
-            reuse.source_run,
+            "本次运行没有重新生成候选：候选产物 {} 里记着当初 {} 次生成调用（模型 {}；当年那次运行的 run 标识 {}），这一笔按原值归成 generation_reused 计入成本与收益扣减，不重复落调用记录",
+            reuse.source_file,
             reuse.calls,
-            reuse.versions.join("、")
+            reuse.versions.join("、"),
+            reuse
+                .source_run_id
+                .clone()
+                .unwrap_or_else(|| "未在调用记录里找到".to_owned())
         ),
         None => "生成调用按本次运行的调用记录统计（purpose=generation）".to_owned(),
+    };
+    let total_note = if reused_calls > 0 {
+        format!(
+            "合计 {} 次 = 本运行 {logged} 次（调用记录里 run 标识以 `{run}-` 开头的那些）+ 复用 {reused_calls} 次",
+            total.calls
+        )
+    } else {
+        format!(
+            "合计 {} 次 = 本运行 {logged} 次（调用记录里 run 标识以 `{run}-` 开头的那些）",
+            total.calls
+        )
     };
     Ok(CostSection {
         by_purpose,
         total,
         note: format!(
-            "成本只记可核的量：调用次数、token（通道上报）、延迟中位数；本项目不虚构货币价格。{generation_note}；本运行标识（{run}）下共记 {logged} 条调用记录；观察动作的计价成本按任务族自定单位单独记在动作成本里。"
+            "成本只记可核的量：调用次数、token（通道上报）、延迟中位数；本项目不虚构货币价格。{generation_note}；{total_note}；观察动作的计价成本按任务族自定单位单独记在动作成本里。"
         ),
     })
 }
