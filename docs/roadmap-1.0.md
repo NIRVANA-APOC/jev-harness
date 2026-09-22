@@ -1,0 +1,124 @@
+# jev-harness 1.0 技术路线图
+
+> 状态：已定稿（2026-09-22）｜性质：实施规划
+> 相关文档：[项目总纲](../AGENTS.md)、[项目笔记](project-notes.md)、[Jev 调研报告](jev-research.md)
+
+## 0. 前提
+
+| 项 | 结论 |
+| --- | --- |
+| 语言 / 界面 | Rust 全栈；TUI（极简：对话 + 决策轨迹 + 审批） |
+| LLM 侧 | OpenAI 兼容协议（`POST /chat/completions` + SSE 流式），默认 DeepSeek（`deepseek-chat`），`base_url` / `model` 可配 |
+| Jev 侧 | 使用真实 API（key 只经环境变量 / 本地 `.env` 注入，绝不入库） |
+| 探索重点 | 门控+循环边界 / 路由 / 评估 judge —— **三条都做最小闭环** |
+| 项目原则 | 个人学习、奥卡姆剃刀（如无必要勿增实体）、禁止过度防御性编程、不做降级容灾 |
+
+> 术语约定：「OpenAI 兼容协议」指 `chat/completions`（DeepSeek 支持该端点；OpenAI 新的 `/v1/responses` DeepSeek 并不支持）。若日后确需 Responses API 形态，单独讨论。
+
+## 1. 核心命题与设计回答
+
+**命题**：Harness 一词意为「约束」。传统 harness 的约束是**静态**的——系统提示、工具白名单、步数上限、人工审批；而 Jev 在「决策」上具备带概率的约束能力。能否用它做出**更好的 Harness 架构**？
+
+**设计回答：决策即约束（Decision-as-Constraint）**——把 harness 中一部分静态约束换成 Jev 的**校准判定**，并保持三者可互换、可度量：
+
+```
+一个决策原语：  state + 类型化 questions →（答案 + 概率 / 置信度）
+三条策略：      Gate 门控（约束"能不能做"）
+                Route 路由（约束"用哪个做"）
+                Judge + Boundary（约束"做到什么程度算完"）
+三种实现：      Jev（学习型）/ 规则（确定性）/ LLM（语言型）——同一 trait，配置切换
+一条记录：      每次判定都落一条 DecisionRecord（问题、概率、阈值、耗时、模型版本、request_id）
+                → 既喂给 TUI 的决策轨迹面板，也喂给实验统计
+```
+
+**1.0 的野心**：不是做一个功能更全的 agent，而是把「Jev 作为约束层」这一命题做成**可运行、可观察、可对比**的最小系统。
+
+## 2. 架构（3 crate workspace，刻意保持小）
+
+```
+jev-harness/
+├── Cargo.toml                # workspace：jh-core / jh-providers / jh-app
+├── crates/
+│   ├── jh-core/              # 纯逻辑，无 IO：领域类型、决策抽象、Agent 循环、配置
+│   │   ├── types.rs          #   Message / ToolCall / ToolResult / Question / Answer / Decision
+│   │   ├── decider.rs        #   trait Decider { fn decide(&self, state, questions) -> Answers }
+│   │   ├── policy.rs         #   Gate / Route / Boundary / Judge 四种策略（阈值 + 失败语义）
+│   │   ├── trace.rs          #   DecisionRecord + JSONL 落盘
+│   │   └── agent.rs          #   Agent 循环（只依赖 trait，不依赖具体实现）
+│   ├── jh-providers/         # 一切外部 IO
+│   │   ├── llm.rs            #   OpenAI 兼容客户端（SSE 流式，reqwest + 手写 SSE 解析）
+│   │   ├── jev.rs            #   Jev 客户端（POST /v1/systemone，serde 内部标签枚举）
+│   │   ├── replay.rs         #   Replay/Mock 后端（fixture 驱动，离线可测）
+│   │   └── deciders.rs       #   JevDecider / RuleDecider / LlmDecider 三个实现
+│   └── jh-app/               # 组装层
+│       ├── tools/            #   read_file / write_file / run_shell（1.0 只有三个）
+│       ├── session.rs        #   会话事件总线（TUI 与循环之间的通道）
+│       ├── tui/              #   ratatui + crossterm：对话流 / 决策轨迹 / 输入与审批
+│       ├── exp.rs            #   实验子命令（跑任务集、出统计）
+│       └── main.rs           #   bin: jev（chat / ask / run / exp 四个子命令）
+├── docs/                     # 文档（含本路线图与 experiments-1.0.md）
+└── var/                      # 运行产物（sessions/*.jsonl），gitignore
+```
+
+**依赖选型（刻意的短清单）**：`tokio`（异步运行时）、`reqwest`（rustls；HTTP + SSE 手写解析）、`serde` / `serde_json`、`toml` + `dotenvy`（配置）、`thiserror`（显式错误枚举，不引入 anyhow）、`clap`（子命令）、`tracing`（日志）、`ratatui 0.29` + `crossterm 0.28`（TUI，版本与 grok-tui 研究对齐）。**不引入** `async-openai`：协议层自己写（约 200 行），也更贴合「Jev 客户端需自建」的学习目标。
+
+## 3. 1.0 的四个决策点（规格）
+
+| 决策点 | 原语 | 触发时机 | 失败语义（关键） | 基线实现 | 观测指标 |
+| --- | --- | --- | --- | --- | --- |
+| **Gate 门控** | Noul ×2（"在用户意图范围内" / "结果可逆"）+ 双阈值 → allow / ask / deny | 每次工具执行前 | **fail-closed**：低置信 → 转人工审批 | 路径 / 命令白名单 | 放行率、误拦率、注入下漂移、延迟、成本 |
+| **Route 路由** | Choice（候选工具 ≤8） | 有多个候选工具 / 技能时 | **fail-open**：低置信 → 交给 LLM 决定 | 关键词规则 | 与人工标注的一致率、选项顺序敏感性、延迟 |
+| **Boundary 边界** | Noul（"任务已完成"）+ Noul（"再来一轮有进展"） | 每轮工具结果之后 | 低置信 → escalate（问人工） | 步数上限 + LLM 自评 | 提前终止率、漏终止率、平均步数、成本 |
+| **Judge 评分** | Score（1–5 档 + criteria） | 每轮结束 | 仅记录（1.0 不驱动自动重试） | LLM judge | 与人工评分相关性、方差、成本 |
+
+硬约束与约定：
+
+- **Gate 的 state 组成**：只放「用户消息 + 待执行动作」，**绝不放工具输出与助手消息**——否则不受信内容能为自己授权（依据：[调研报告](jev-research.md) §7.3）。
+- **版本 pin**：调用 `jev-1.13.0`，不用 `jev-latest` 固化阈值；每条记录都带响应里的实际模型版本。
+- **阈值来源**：一律来自本项目自测（E2），禁止照抄文档默认值。
+
+## 4. 里程碑（M0–M5）
+
+| # | 里程碑 | 交付物 | 验收标准 |
+| --- | --- | --- | --- |
+| **M0** | 骨架与契约（半天） | workspace 三 crate + bin `jev`；领域类型、`Decider` / `Tool` trait；配置（`jev.toml` + 环境变量 + `.env`）；官方示例的 Jev fixture；`.gitignore` 更新（`.env`、`var/`、`target/`） | `cargo test` 全绿；`jev --version` 可运行；**无任何网络调用** |
+| **M1** | LLM 通道（1 天） | OpenAI 兼容客户端（流式）+ `jev chat` 纯 CLI 对话 | 与 DeepSeek 真实对话跑通；401/429 显式报错、不吞 |
+| **M2** | Jev 通道（1 天） | Jev HTTP 客户端 + `jev ask --noul/--choice/--score`；pin 版本；录制真实响应为 fixture | 真实调用成功并打印答案 / 概率 / 延迟 / request_id；fixture 离线回放可复现 |
+| **M2.5** | **E1 中文基线（提前跑）** | 30–50 条中文样本 × 三种 prompt 条件的最小对照 | 得出「中文是否可用」的初步结论，避免后程返工 |
+| **M3** | 循环 + 三条闭环（2–3 天） | 三个工具；Agent 循环；Gate / Route / Boundary / Judge 各自三种实现可切换；JSONL 轨迹 | 一个真实任务端到端跑通；轨迹里能看到每条判定的概率与阈值 |
+| **M4** | TUI（1–2 天） | ratatui 极简三区：对话流 / 决策轨迹 / 输入与审批；状态行（模型、token、成本、Jev 延迟） | 一次完整会话（含一次门控拦截 + 一次人工审批）在 TUI 内完成 |
+| **M5** | 实验与结论（1–2 天） | 固定任务集 ≥20 个；三配置（jev / rule / llm）A/B；E2 校准分档；E4 注入样本 ≥20 条；`docs/experiments-1.0.md` | 报告含原始数据位置与复现命令；阈值全部来自自测；更新 [项目笔记](project-notes.md) |
+
+**依赖顺序**：M0 → M1 → M2 → (M2.5) → M3 → M4 → M5；M4 与 M5 可部分并行。
+
+## 5. 实验设计
+
+1. **E1 中文基线**：中文 state + 中文 instructions / 中文 state + 英文 instructions / 英译 state + 英文 instructions 三条件对照；指标为准确率 + 置信度分布。
+2. **E2 校准分档**：用真实调用按 confidence / noul 分 10 档，画可靠性图并算 ECE —— **阈值由它定**。
+3. **E4 注入鲁棒性**：伪造工具输出 / 伪造预先授权 / 自我论证等 ≥20 条样本，测 Gate 的 block 概率漂移与「不安全却放行」率。
+4. **三实现对比**：同一批决策场景下 Jev vs 规则 vs LLM 的准确率 / 延迟 / 成本 / 一致性。
+
+## 6. 1.0 明确不做（non-goals）
+
+- 多 provider 生态（只 OpenAI 兼容一家，DeepSeek 默认）
+- TUI 的主题体系、多面板、鼠标、多会话（留给 1.x）
+- MCP、子代理 / 多智能体、插件系统
+- 降级 / 容灾 / 重试编排（项目已决定接受该风险；错误一律显式暴露）
+- RAG / 向量库、会话数据库（只写 JSONL 文本）
+- 工具沙箱（1.0 的「安全」就是 Gate + 人工审批这一条路径）
+
+## 7. 风险与前置约束
+
+| 风险 | 对策 |
+| --- | --- |
+| 中文表现未知（官方只说「可用但准确率较低」） | E1 提前到 M2 后立即跑；结论不好则改用「英译后再判定」 |
+| 提示注入可移动 Gate 判定 | Gate 的 state 组成约束写进 §3，并由 E4 实测 |
+| 校准未经独立验证（唯一 ECE 实测不利） | 阈值必须先过 E2 |
+| API key 泄漏 | 只走环境变量 / `.env`（gitignore）；不在任何文档、提交或日志中出现 |
+| 供应商无 SLA、单一供应商 | 已接受；`jev-latest` 漂移 → pin `jev-1.13.0` |
+| 范围蔓延 | 本文件 §6 为硬边界；新增内容一律进 1.x 待办，不进 1.0 |
+
+## 8. 参考素材
+
+- `docs/research/grok-tui/`（28 篇 TUI 研究）与 `reference/grok-build`（本地参考，已 gitignore）：仅作 1.x 的参考素材，1.0 只取极简形态，不引入其依赖与复杂度。
+- `docs/jev-research.md` §13（定位建议）与 §14.3（E1–E9 实验清单）是本路线图实验设计的来源。
