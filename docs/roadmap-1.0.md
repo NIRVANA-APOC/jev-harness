@@ -33,34 +33,26 @@
 
 **1.0 的野心**：不是做一个功能更全的 agent，而是把「Jev 作为约束层」这一命题做成**可运行、可观察、可对比**的最小系统。
 
-## 2. 架构（3 crate workspace，刻意保持小）
+## 2. 架构（4 crate workspace，刻意保持小）
 
 ```
 jev-harness/
-├── Cargo.toml                # workspace：jh-core / jh-providers / jh-app
+├── Cargo.toml                # workspace：members = ["crates/*"]，resolver = "2"，统一依赖清单
 ├── crates/
-│   ├── jh-core/              # 纯逻辑，无 IO：领域类型、决策抽象、Agent 循环、配置
-│   │   ├── types.rs          #   Message / ToolCall / ToolResult / Question / Answer / Decision
-│   │   ├── decider.rs        #   trait Decider { fn decide(&self, state, questions) -> Answers }
-│   │   ├── policy.rs         #   Gate / Route / Boundary / Judge 四种策略（阈值 + 失败语义）
-│   │   ├── trace.rs          #   DecisionRecord + JSONL 落盘
-│   │   └── agent.rs          #   Agent 循环（只依赖 trait，不依赖具体实现）
-│   ├── jh-providers/         # 一切外部 IO
-│   │   ├── llm.rs            #   OpenAI 兼容客户端（SSE 流式，reqwest + 手写 SSE 解析）
-│   │   ├── jev.rs            #   Jev 客户端（POST /v1/systemone，serde 内部标签枚举）
-│   │   ├── replay.rs         #   Replay/Mock 后端（fixture 驱动，离线可测）
-│   │   └── deciders.rs       #   JevDecider / RuleDecider / LlmDecider 三个实现
-│   └── jh-app/               # 组装层
-│       ├── tools/            #   read_file / write_file / run_shell（1.0 只有三个）
-│       ├── session.rs        #   会话事件总线（TUI 与循环之间的通道）
-│       ├── tui/              #   ratatui + crossterm：对话流 / 决策轨迹 / 输入与审批
-│       ├── exp.rs            #   实验子命令（跑任务集、出统计）
-│       └── main.rs           #   bin: jev（chat / ask / run / exp 四个子命令）
+│   ├── jh-app/               # 组装层，bin: jev（chat / ask / run / exp 四个子命令）
+│   ├── jh-jev/               # Jev 客户端（POST /v1/systemone，serde 内部标签枚举）
+│   ├── jh-openai/            # OpenAI 兼容客户端（SSE 流式，reqwest + 手写 SSE 解析）
+│   └── jh-tui/               # ratatui + crossterm：对话流 / 决策轨迹 / 输入与审批
 ├── docs/                     # 文档（含本路线图与 experiments-1.0.md）
 └── var/                      # 运行产物（sessions/*.jsonl），gitignore
 ```
 
-**依赖选型（刻意的短清单）**：`tokio`（异步运行时）、`reqwest`（rustls；HTTP + SSE 手写解析）、`serde` / `serde_json`、`toml` + `dotenvy`（配置）、`thiserror`（显式错误枚举，不引入 anyhow）、`clap`（子命令）、`tracing`（日志）、`ratatui 0.29` + `crossterm 0.28`（TUI，版本与 grok-tui 研究对齐）。**不引入** `async-openai`：协议层自己写（约 200 行），也更贴合「Jev 客户端需自建」的学习目标。
+四个 crate 按「外部边界」切分：三个通道（Jev / OpenAI / TUI）各自独立，`jh-app` 负责把它们组装成 Agent 循环；crate 内部的模块划分（领域类型、决策策略、轨迹记录等）随各自实现落地。
+
+> **Cargo.lock 暂不入库**（`.gitignore` 已忽略）：并行开发阶段 lockfile 改动会互相冲突，且不在各任务 scope 内。
+> 1.0 批次末尾由专门任务统一 `cargo update` 并提交 `Cargo.lock`；此后按二进制项目惯例入库。
+
+**依赖选型（刻意的短清单，统一登记在根 `Cargo.toml` 的 `[workspace.dependencies]`，各 crate 一律 `workspace = true` 引用）**：`tokio`（异步运行时）、`reqwest`（rustls；HTTP + SSE 手写解析）、`serde` / `serde_json`、`toml` + `dotenvy`（配置）、`thiserror`（显式错误枚举，不引入 anyhow）、`clap`（子命令）、`tracing` + `tracing-subscriber`（日志）、`ratatui 0.30` + `crossterm 0.29`（TUI）、`unicode-width` / `unicode-segmentation` / `textwrap`（TUI 排版）、`futures` / `bytes`（流式与字节缓冲）。TUI 相关版本取 crates.io 当前稳定版，不再对齐 grok-tui 研究的 0.29 / 0.28。**不引入** `async-openai`：协议层自己写（约 200 行），也更贴合「Jev 客户端需自建」的学习目标。
 
 ## 3. 1.0 的四个决策点（规格）
 
@@ -81,7 +73,7 @@ jev-harness/
 
 | # | 里程碑 | 交付物 | 验收标准 |
 | --- | --- | --- | --- |
-| **M0** | 骨架与契约（半天） | workspace 三 crate + bin `jev`；领域类型、`Decider` / `Tool` trait；配置（`jev.toml` + 环境变量 + `.env`）；官方示例的 Jev fixture；`.gitignore` 更新（`.env`、`var/`、`target/`） | `cargo test` 全绿；`jev --version` 可运行；**无任何网络调用** |
+| **M0** | 工作区骨架（半天） | workspace 根配置（`members = ["crates/*"]`、`resolver = "2"`、统一 `[workspace.dependencies]` 清单）+ bin `jev`（`--version` 与 chat / ask / run / exp 四个子命令壳，均未实现）+ `.gitignore`（`target/`、`Cargo.lock`、`.env`、`var/`，Cargo.lock 暂不入库）+ 路线图同步；四个 crate（jh-app / jh-jev / jh-openai / jh-tui）的实现由 M1–M3 补齐，领域类型 / `Decider` / `Tool` trait / 配置（`jev.toml`）/ Jev fixture 随之延后 | `cargo test` 全绿；`jev --version` 可运行；`git status` 无残留未跟踪文件；**无任何网络调用** |
 | **M1** | LLM 通道（1 天） | OpenAI 兼容客户端（流式）+ `jev chat` 纯 CLI 对话 | 与 DeepSeek 真实对话跑通；401/429 显式报错、不吞 |
 | **M2** | Jev 通道（1 天） | Jev HTTP 客户端 + `jev ask --noul/--choice/--score`；pin 版本；录制真实响应为 fixture | 真实调用成功并打印答案 / 概率 / 延迟 / request_id；fixture 离线回放可复现 |
 | **M2.5** | **E1 中文基线（提前跑）** | 30–50 条中文样本 × 三种 prompt 条件的最小对照 | 得出「中文是否可用」的初步结论，避免后程返工 |

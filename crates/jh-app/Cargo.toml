@@ -1,0 +1,11 @@
+[package]
+name = "jh-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "jev"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
