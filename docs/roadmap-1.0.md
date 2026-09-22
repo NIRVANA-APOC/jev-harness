@@ -4,7 +4,7 @@
 > **本文不产生研究结论**，也不新增阈值、效应量、工期或性能数字：所有实验设计与指标口径以研究目标 §9–§10 为准，本文只给落点与章节引用。
 > **引用约定**：不带文档名的 `§x` 一律指本文件；引用其他文档时写明「研究目标 §x」或「[Jev 调研报告](jev-research.md) §x」。
 >
-> - 版本：1.0 研究路线（本版重写；2026-09-22 追加 M0 实现回写，见 §11）
+> - 版本：1.0 研究路线（本版重写；2026-09-22 追加 M0 实现回写与 M0 真调基线回写，见 §11）
 > - 日期：2026-09-22
 > - 上游文档：[研究目标](RESEARCH_GOALS.md)、[Jev 调研报告](jev-research.md)、[项目笔记](project-notes.md)、[Grok TUI 设计调研](grok-tui-design.md)、[项目总纲](../AGENTS.md)
 > - 代码基线：`crates/` 下现有五个 crate（`jh-core` 于 M0 落地），事实逐条见 §1.3
@@ -26,7 +26,10 @@
 - **语言与形态**：Rust 全栈（[AGENTS.md](../AGENTS.md) 技术栈要求）；1.0 的可执行形态是批处理实验 + CLI（决定 4）。
 - **LLM 通道**：OpenAI **Responses API** 为目标协议，实现见 `crates/jh-openai`（`crates/jh-openai/src/client.rs:65` `Client::create`、`:84` `Client::stream`）。模型必填、无内建默认（`:144` `ClientBuilder::model`）；key 来自环境变量 `OPENAI_API_KEY`（`:16`），base URL 可覆盖（`:139` `ClientBuilder::base_url`）。
   **provider 与配置口径（2026-09-22 回写）**：LLM 侧走 DeepSeek，模型 `deepseek-flash`；`OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` 三者都必填（缺 `OPENAI_BASE_URL` 显式失败，避免 key 被发往 crate 自带的官方缺省端点；`crates/jh-app/src/judge/llm.rs:57-81`），base URL 写法为 `https://api.deepseek.com`（不带尾斜杠；`ClientBuilder::build` 同时会裁剪尾斜杠，端点即 `{base_url}/responses`，`crates/jh-openai/src/client.rs:169`、`:109`）。
-  **`/responses`：文档确认提供、实测未完成**。DeepSeek 官方[《Using the Responses API》](https://api-docs.deepseek.com/guides/responses_api/)写明 “our API now supports the Responses API format, with the base_url being https://api.deepseek.com”，示例即 `client.responses.create(model="deepseek-flash", …)`（本文 2026-09-22 亲自核对）；官方 Codex 集成页的 `wire_api = "responses"` 与定价页的 `Responses API ✓` 同向（M11 探测抓取）。**运行层面仍未验证**：本环境无 API key，`crates/jh-openai` 至今未对线上 API 发过请求（`crates/jh-openai/src/lib.rs` 的 *Verification status* 一节），端点的实际状态码、SSE 事件名吻合度与响应体反序列化都待真调（解锁命令见 §5 M0）。
+  **`/responses`：实测确认可用（2026-09-22 真调）**。文档证据：DeepSeek 官方[《Using the Responses API》](https://api-docs.deepseek.com/guides/responses_api/)写明 “our API now supports the Responses API format, with the base_url being https://api.deepseek.com”，示例即 `client.responses.create(model="deepseek-flash", …)`；官方 Codex 集成页的 `wire_api = "responses"` 与定价页的 `Responses API ✓` 同向（M11 探测抓取）。**2026-09-22 本环境真调**：`OPENAI_API_KEY=$DEEPSEEK_API_KEY OPENAI_BASE_URL=https://api.deepseek.com OPENAI_MODEL=deepseek-flash cargo test -p jh-openai --test live_smoke -- --ignored --nocapture`——非流式 `live_create_returns_a_completed_response`（`Completed`、usage 38/15）与 SSE 流式 `live_stream_matches_the_final_text`（deltas 重建最终文本）均通过，端点可用（成功路径 2xx）、SSE 事件名与响应体反序列化在运行层面成立；读数与报告位置见 §5 M0。
+  **新登记限制（2026-09-22 真调；本批只登记，不改代码）**：
+  1. `deepseek-flash` 的 thinking 模式不支持强制 `tool_choice`：`live_stream_reports_a_forced_tool_call` 失败，错误体 `{"message":"Thinking mode does not support this tool_choice","type":"invalid_request_error","code":"invalid_request_error"}`（HTTP 400，见已归档 finding）。finding：`.tower/comms/findings/20260922-tower-bug-deepseek-deepseek-flash-thinking-tool-choice.md`。
+  2. thinking 的 reasoning token 计入 `max_output_tokens`：LLM 结构化判断器写死 1024（`crates/jh-app/src/judge/llm.rs:46`），预算被 reasoning 耗尽，4/4 调用返回 `Incomplete`（`incomplete_details.reason=max_output_tokens`），判断无读数；同一提示词抬到 8192 即 `completed` 且输出为纯 JSON（复现命令与读数见 §5 M0）。finding：`.tower/comms/findings/20260922-agent-live-bug-llm-deepseek-flash-4-4-incomplete-1024-max-output-tokens-thi.md`。
   **无状态约束**：DeepSeek 的 Responses 实现无状态（`store`、`previous_response_id` 不支持，未支持参数被静默忽略），因此每次判断请求自带全部材料，判定契约放进用户消息而不是可能被丢弃的 `instructions` 字段（`crates/jh-app/src/judge/llm.rs:18-26`）。
 - **Jev 通道**：使用真实 API；key 只经环境变量（`TYPESAFE_API_KEY`，`crates/jh-jev/src/client.rs:69` `Client::from_env`），不入库、不进文档与日志；模型 pin `jev-1.13.0`（`crates/jh-jev/src/client.rs:20` `DEFAULT_MODEL`），请求显式带版本化 ID、不用别名（依据：[Jev 调研报告](jev-research.md) §5.1、§13.3.5）。
 - **判定分层与概率优先**：能让确定性代码判断的不调模型，能让 Jev 判断的不调 LLM；`probabilities` / `confidence` / `noul` 原值保留，不提前塌缩成布尔值（[AGENTS.md](../AGENTS.md) 技术栈要求；[Jev 调研报告](jev-research.md) §13.3.3）。
@@ -38,8 +41,8 @@
 | # | 能力 | 现状 | 证据（路径 / 符号） |
 | --- | --- | --- | --- |
 | 1 | workspace 与依赖锁定 | 已就位 | 根 `Cargo.toml`：`[workspace] members = ["crates/*"]`、`resolver = "2"`、20 项 `[workspace.dependencies]`（3 条内部 path 依赖 `jh-core` / `jh-jev` / `jh-openai`，17 项外部版本：`tokio 1.53`、`reqwest 0.13`、`serde 1.0`、`thiserror 2.0`、`clap 4.6`、`ratatui 0.30`、`crossterm 0.29` 等；其中 `tracing-subscriber` / `dotenvy` / `toml` 目前无 crate 引用）；`Cargo.lock` 已跟踪入库（`git ls-files Cargo.lock` 命中） |
-| 2 | Jev 客户端（jh-jev） | 已完成，离线验证；**真实调用记录 0** | `crates/jh-jev/src/question.rs:119` `Question::{Choice,Score,Noul}`；`answer.rs:62` `Answer::{Choice,Score,Noul,Unknown}`；`answer.rs:147` `NoulAnswer`（无 `confidence` 字段，类型层面拦住误用）；`client.rs:108` `Client::system_one`（`POST {base_url}/v1/systemone`）；`error.rs:124` `Error`（401/422/429/529 各自变体，`:180` `request_id`、`:193` `retry_after`）；`fixtures/` 8 份官方示例请求/响应，**是官方文档抄件、不是真实录包**（`tests/fixtures.rs` 自述）；真调 smoke 在 `tests/smoke.rs` 标 `#[ignore]`，从未真跑 |
-| 3 | OpenAI 客户端（jh-openai） | 已完成，离线验证；**真实调用记录 0** | `crates/jh-openai/src/client.rs:48` `Client::builder`、`:65` `create`、`:84` `stream`、`:218` `ResponseStream::next_event`；`sse.rs:18` `SseDecoder`（`:35` `push`，手写 SSE，含跨块多字节与 CRLF 处理）；`types.rs:497` `Event`（文档 59 个流事件中解码 20 个，其余落入 `Event::Other`）；`fixtures/` 7 份手工构造的离线样本（非录包）；`tests/live_smoke.rs` 3 个用例标 `#[ignore]`，从未真跑 |
+| 2 | Jev 客户端（jh-jev） | 已完成；**真调已通（2026-09-22）** | `crates/jh-jev/src/question.rs:119` `Question::{Choice,Score,Noul}`；`answer.rs:62` `Answer::{Choice,Score,Noul,Unknown}`；`answer.rs:147` `NoulAnswer`（无 `confidence` 字段，类型层面拦住误用）；`client.rs:108` `Client::system_one`（`POST {base_url}/v1/systemone`）；`error.rs:124` `Error`（401/422/429/529 各自变体，`:180` `request_id`、`:193` `retry_after`）；`fixtures/` 8 份官方示例请求/响应，**是官方文档抄件、不是真实录包**（`tests/fixtures.rs` 自述）；真调 smoke 在 `tests/smoke.rs` 标 `#[ignore]`；2026-09-22 真跑通过（model `jev-1.13.0`、request_id、usage 356/38），`exp --judge jev` 4/4 成功，读数见 §5 M0 |
+| 3 | OpenAI 客户端（jh-openai） | 已完成；**非流式与 SSE 真调已通（2026-09-22）；强制 tool_choice 用例按 provider 限制失败** | `crates/jh-openai/src/client.rs:48` `Client::builder`、`:65` `create`、`:84` `stream`、`:218` `ResponseStream::next_event`；`sse.rs:18` `SseDecoder`（`:35` `push`，手写 SSE，含跨块多字节与 CRLF 处理）；`types.rs:497` `Event`（文档 59 个流事件中解码 20 个，其余落入 `Event::Other`）；`fixtures/` 7 份手工构造的离线样本（非录包）；`tests/live_smoke.rs` 3 个用例标 `#[ignore]`；2026-09-22 真跑 2 通 1 败（`deepseek-flash`、`Completed`、SSE deltas 重建文本；失败与 LLM 判断器读数见 §1.2 新登记限制与 §5 M0） |
 | 4 | TUI 组件库（jh-tui） | **组件库已落地，1.0 不接线（留待 1.x 接线）** | `crates/jh-tui/src/components/mod.rs:11-14` 导出回滚区 / 提示框 / 状态行与快捷键栏 / 审批卡；`app.rs:55` `App`、`actions.rs:22` `ActionId`、`render.rs:65` `RenderGate`、`terminal.rs:81` `TerminalGuard`、`blocks.rs:93` `BlockOutput`（块模型）；快照测试是 `TestBackend` 缓冲区上的内联多行断言（`tests/snapshots.rs` + `tests/common/mod.rs`），不是 insta、无 `.snap` 文件。注意 `RenderGate` 是**重绘闸门**，与旧版路线图的 Gate 决策点同名不同义 |
 | 5 | 组装层与 CLI（jh-app） | **M0 已接线**（`exp`）；`chat` / `ask` / `run` 仍为空壳 | `crates/jh-app/src/main.rs:47-65` `ExpArgs`（`--judge` 可重复 / `--calls` / `--replay` / `--out`）、`:78` `run_exp`；`chat` / `ask` / `run` 仍打印「未实现」并返回 `ExitCode::from(2)`（`:70-73`）；实验层模块 `judge/`（五种适配器，`src/judge/{jev,llm,rule,replay,simulated}.rs`）、`tasks`、`calls`、`metrics`、`report`、`exp` 已落地；依赖 `jh-core` / `jh-jev` / `jh-openai` / `tokio` 等（`crates/jh-app/Cargo.toml`） |
 | 6 | 运行时对象与实验设施 | **M0 部分落地** | **已有**：判断记录（`crates/jh-core/src/record.rs`）、问题定义与版本（`crates/jh-core/src/question.rs`）、初始任务集与隐藏真值（`crates/jh-app/src/tasks.rs` + `crates/jh-app/tasks/initial_tasks.json`）、调用记录落盘（`crates/jh-app/src/calls.rs`）、指标统计与 JSON 报告（`crates/jh-app/src/metrics.rs`、`crates/jh-app/src/report.rs`）；**仍未建**：事件日志与证据、依赖图、失效传播、行动前提复核、观测器契约（M1–M3 的对象）；`var/` 由运行时创建、不入库（`.gitignore` 已列；无实验脚本，命令行 `jev exp` 承担） |
@@ -167,16 +170,21 @@ jev-harness/
 - **退出证据**：得到本环境的质量、延迟、成本基线，能区分真实 API 与模拟运行（研究目标 §12）。
 - **未达标处理**：无 Jev 访问时继续核心模拟，但 Jev 相关结论保持未验证（研究目标 §12）。
 - **模块归属**：`jh-core`（判断器抽象）、`jh-app`（适配器、调用记录、初始任务集）、`jh-jev`（复用，不改）。
-- **前置约束**：所选 provider 的 `/responses` 端点：**文档层面确认提供、运行层面未验证**（§1.2）；无 API key 时 Jev / LLM 相关结论一律保持未验证，不得用模拟或回放结果代替。
-- **开放项**：初始任务集的材料来源与规模（本文 §12 未确定项 8；M0 已用 4 样本最小合成集落地，任务族 A/B/C 的规模仍待先导实验）；所选 provider 的 `/responses` 是否可用（§1.2；文档确认提供，实测待 key）。
-- **落地状态（2026-09-22 回写，M9 / M10 已合并）**：
+- **前置约束**：所选 provider 的 `/responses` 端点：**实测确认可用（2026-09-22，非流式 + SSE；§1.2）**；真调未取得读数时 Jev / LLM 相关结论一律保持未验证，不得用模拟或回放结果代替。
+- **开放项**：初始任务集的材料来源与规模（本文 §12 未确定项 8；M0 已用 4 样本最小合成集落地，任务族 A/B/C 的规模仍待先导实验）；所选 provider 的 `/responses` 是否可用——**已关闭（2026-09-22 真调确认，§1.2）**。
+- **落地状态（2026-09-22 回写；同日追加真调基线）**：
   - **已交付**：判断器接口与判断记录（`jh-core`，merge `20386b4`）；五种判断器适配、初始任务集（4 个中文合成样本 × 3 个问题）、调用记录落盘、`jev exp` 与 JSON 基线报告（`jh-app`，merge `22da7bb`，复核尖端 `c3e5583`）。
-  - **已取得**：离线读数——`cargo run -p jh-app -- exp`（默认 rule + simulated-truth）跑完 4 样本 × 3 题；`--judge replay` 在记录文件已存在时复用成功（首次运行前无记录，该判断器显式标「未验证」，符合预期）。这些读数只是对照与上限估计，**不是本环境的真实基线**。
-  - **未验证（本环境无 API key）**：Jev / LLM 的质量、延迟、usage 读数。两个真调 smoke 保持 `#[ignore]`；`jev exp --judge jev` / `--judge llm` 的 `verification` 为 `not_verified`，命令以非零码退出（报告仍写出）。**相关结论一律标「未验证」，不得用模拟或回放结果替代。**
-  - **解锁命令**（提供 key 后无需改代码；逐条见 `crates/jh-app/tests/live_smoke.rs` 头部）：
-    - Jev：`TYPESAFE_API_KEY=… cargo test -p jh-app --test live_smoke -- --ignored --nocapture`（模型 pin `jev-1.13.0`）
-    - LLM：`OPENAI_API_KEY=… OPENAI_MODEL=deepseek-flash OPENAI_BASE_URL=https://api.deepseek.com cargo test -p jh-app --test live_smoke -- --ignored --nocapture`
-    - 基线报告：`cargo run -p jh-app -- exp --judge jev --judge llm`（报告落 `var/exp/<run>.json`，调用记录追加进 `var/calls.jsonl`）
+  - **真调读数（2026-09-22，`TYPESAFE_API_KEY` / `DEEPSEEK_API_KEY` 可见）**——原始数据在 `var/exp/<run>.json` 与 `var/calls.jsonl`（运行产物、不入库，teardown 后不保留），关键值抄录如下：
+    - **Jev（已验证）**：`cargo test -p jh-jev --test smoke -- --ignored --nocapture` 通过——model `jev-1.13.0`（与 pin 一致）、request_id `req_01a0c889ab9071c9a630f7260b13eb6d`、usage 输入 356 / 输出 38；同端点（官方快速开始样例请求，显式 pin `jev-1.13.0`）裸 curl 复核 **HTTP 200**、0.69 s、usage 425/73。`cargo run -p jh-app -- exp --judge jev`（报告 `var/exp/run-1790070888194.json`）：4/4 成功，一致率 0.750（9/12）、Brier 0.3870、对数损失 0.5902、延迟 min 334 / p50 353 / p95 882 / max 882 ms、usage 输入 3010 / 输出 367（4 次调用全部上报）。
+    - **LLM 通道（已验证）**：`OPENAI_API_KEY=$DEEPSEEK_API_KEY OPENAI_BASE_URL=https://api.deepseek.com OPENAI_MODEL=deepseek-flash cargo test -p jh-openai --test live_smoke -- --ignored --nocapture`——非流式用例通过（`Completed`、输出 `pong`、usage 38/15）；SSE 用例通过（deltas 重建最终文本）；强制 tool_choice 用例按限制 1 失败（§1.2）。
+    - **LLM 结构化判断器（无读数，保持未验证）**：`cargo run -p jh-app -- exp --judge llm`（报告 `var/exp/run-1790070890299.json`）：4/4 失败，错误「判断响应不可用：响应状态是 Incomplete，不是 completed」，quality 无判分，失败调用耗时 min 4956 / p50 5274 / p95 5381 / max 5381 ms（非超时，服务端正常应答）。原因见限制 2（§1.2）：1024 的 `max_output_tokens` 被 thinking token 耗尽；真调复现——同一提示词 cap 1024 → `incomplete (reason=max_output_tokens)`，cap 8192 → `completed`、输出纯 JSON（254 字符）。**本批不改 crate。**
+    - **合并基线（真实与离线同表）**：`cargo run -p jh-app -- exp --judge rule --judge simulated-truth --judge llm --judge jev`（报告 `var/exp/run-1790070911353.json`）——rule 4/4、`simulated`（一致率 1.000、Brier 0.0422）；simulated-truth 4/4、`simulated`（1.000 / 0.0000）；llm 0/4、`not_verified`；jev 4/4、`verified`（0.750 / Brier 0.3912、p50 321 / p95 868 ms、usage 3010/367）。
+    - **口径**：以上只有一个 4 样本 × 3 题的最小合成集（12 条判断）、单日单次运行，**只能作本环境基线，不构成研究结论**，也不能回答 RQ0 / H0；真实读数与模拟 / 回放读数已在报告中分开标注。
+  - **仍未验证**：LLM 结构化判断器在本 provider 上的质量与 usage 读数（4/4 Incomplete，无成功调用，见上）；Jev / LLM 在更大样本与更多任务上的表现；模拟与回放读数仍只作对照与上限估计。
+  - **复现命令**（真调测试保持 `#[ignore]`，`cargo test` 不联网；逐条见 `crates/jh-app/tests/live_smoke.rs` 头部）：
+    - Jev：`TYPESAFE_API_KEY=… cargo test -p jh-jev --test smoke -- --ignored --nocapture`（模型 pin `jev-1.13.0`）
+    - LLM：`OPENAI_API_KEY=… OPENAI_MODEL=deepseek-flash OPENAI_BASE_URL=https://api.deepseek.com cargo test -p jh-openai --test live_smoke -- --ignored --nocapture`
+    - 基线报告：`cargo run -p jh-app -- exp --judge rule --judge simulated-truth --judge llm --judge jev`（报告落 `var/exp/<run>.json`，调用记录追加进 `var/calls.jsonl`）
 
 ### M1 固定问题运行时（对应研究目标 §12 第 2 行）
 
@@ -295,7 +303,7 @@ jev-harness/
 
 - **研究侧**：研究目标 §14.2 的六个问题在 1.0 已实现的机制范围内都有可核查答案，或明确标注为「证据不足」（研究目标 §10.4）；研究目标 §12 的 M5 外部有效性问题除外。负向结果与正向结果同为完成（研究目标 §3.2、§10.4）。
 - **工程侧**：`cargo fmt` / `cargo clippy` / `cargo test` 全绿（[AGENTS.md](../AGENTS.md)）；`jev exp` 能跑完至少一个任务族并产出 JSON 报告；报告含原始数据位置与复现命令。
-- **文档侧**：本文件的架构与运行时规格按实际实现回写；结论与未确定项同步到[项目笔记](project-notes.md)或研究目标的新版本（具体归属待人工确认，见 §13）。**M0 已经完成一轮回写（2026-09-22）**：§3.1 / §3.2 / §3.4 的命名与模块、§1.2 的 provider 与配置口径、§1.3 的现状表、§5 M0 的落地状态与解锁命令、§12 未确定项 1 / 2 / 7 已由 M9 / M10 决定并写入，未确定项 10 升级为「文档确认提供、实测未完成」（变更逐条见 §11）；M1 起每阶段合并在同一位置继续回写。
+- **文档侧**：本文件的架构与运行时规格按实际实现回写；结论与未确定项同步到[项目笔记](project-notes.md)或研究目标的新版本（具体归属待人工确认，见 §13）。**M0 已经完成两轮回写（2026-09-22：实现回写 + 真调基线回写）**：§3.1 / §3.2 / §3.4 的命名与模块、§1.2 的 provider 与配置口径、§1.3 的现状表、§5 M0 的落地状态与复现命令、§12 未确定项 1 / 2 / 7 已由 M9 / M10 决定并写入；随后真调批次把未确定项 10 升级为「实测确认可用」，并在 §1.2 / §5 M0 写入 Jev / LLM 实测读数、两条新登记限制与 §12 #11 的现状更新（变更逐条见 §11）；M1 起每阶段合并在同一位置继续回写。
 
 ## 8. 明确不做（1.0 non-goals）
 
@@ -368,6 +376,14 @@ jev-harness/
 - **更新现状**：§1.3 #5–#8、§1.4 按 M9 / M10 的实际改动与当前测试基线（253 passed / 0 failed / 6 ignored，本批复核）更新。
 - **为何**：§7.2「文档侧：本文件的架构与运行时规格按实际实现回写」；§3.4 上一版写明「Rust 侧的类型与模块命名在实现时随改动确定并在此文件回写」（§12 未确定项 1）。
 
+**2026-09-22 — M0 真调基线回写（真调 Jev / LLM；本批不改代码）**
+
+- **取得真调读数并回写**：§5 M0 的「未验证（本环境无 API key）」段替换为实测读数——Jev `exp` 4/4（一致率 9/12、Brier 0.3870、p50 353 ms、usage 3010/367，model `jev-1.13.0`）、LLM 通道非流式与 SSE 两用例通过、四判断器合并基线的 attempts 与 verification；同时明确「4 个合成样本、单日单次运行，只能作基线，不构成研究结论」，并把关键读数抄录进文档，因为 `var/` 运行产物不入库、teardown 后不保留（原始数据位置与复现命令同段给出）。
+- **升级未确定项**：§1.2 与 §12 #10 从「文档确认提供、实测未完成」改为「实测确认可用」（非流式 + SSE，含具体命令）；§12 #11 更正为「基线已取得，但样本量不足，策略仍未定」。
+- **登记两条 provider 限制**（本批只登记）：thinking 模式不支持强制 `tool_choice`（HTTP 400，错误体与已归档 finding 见 §1.2）；thinking 的 reasoning token 计入 `max_output_tokens`，LLM 结构化判断器写死 1024 导致 4/4 `Incomplete`、质量无读数（复现命令、读数与已归档 finding 见 §1.2 / §5 M0）。
+- **更新现状表**：§1.3 #2 / #3 的「真实调用记录 0」「从未真跑」改为真调已通（含 LLM 通道 2 通 1 败的说明）。
+- **为何**：§7.2 文档侧「按实际实现回写」；研究目标 §12 的 M0 退出证据要求「得到本环境的质量、延迟、成本基线，能区分真实 API 与模拟运行」。实测中出现的失败按纪律如实标「未验证」，不以模拟或回放结果顶替。
+
 ## 12. 未确定项
 
 本版明确标注的事项：已由实现决定的条目写明决定与落点（2026-09-22 M0 批次回写，逐条见 §11）；仍未定的一并列出。
@@ -381,8 +397,8 @@ jev-harness/
 7. **已定（M10，2026-09-22）**：`exp` 子命令的参数形态与 JSON 报告字段——参数 `--judge <NAME>`（可重复；缺省 `rule` + `simulated-truth`）、`--calls <FILE>`（默认 `var/calls.jsonl`）、`--replay <FILE>`（默认 `var/calls.jsonl`）、`--out <FILE>`（缺省 `var/exp/<run>.json`）；报告**顶层字段**固定为 `run` / `generated_at_unix_ms` / `command` / `task_set` / `metric_definitions`（口径声明）/ `judges[]` / `calls_log`（绝对路径）/ `notes`，嵌套读数列**主要字段（非穷举）**：`task_set{name,source,cases,questions}`、`judges[].judge / source / live / versions`、`judges[].verification{status,detail}`、`judges[].calls{attempted,succeeded,failed,errors}`、`judges[].latency_ms{samples,min,p50,p95,max}`、`judges[].usage{calls_with_usage,input_tokens,output_tokens}`、`judges[].quality{judgments,agreements,agreement_rate,unscored,boundary_readings,brier_mean,log_loss_mean,log_loss_undefined,score_mae,score_mae_samples,per_question[]}`；完整字段定义以 `crates/jh-app/src/report.rs` 为准。报告不含价格折算（仓库无权威价格表）。实现见 `crates/jh-app/src/{exp,report,metrics}.rs`。
 8. 任务族 A/B/C 的材料来源与规模（先导实验后定，研究目标 §10.3）。**仍未定**；M0 已用 4 样本最小合成集落地（`crates/jh-app/tasks/initial_tasks.json`）。
 9. `jh-core` 是否引入 `tokio`，以及调度的具体实现形态（§3.3）。**仍未定**；M0 的 `jh-core` 只依赖 `serde` / `serde_json` / `thiserror`，无异步运行时。
-10. **升级（M11 探测，2026-09-22）**：所选 LLM provider 是否提供 `/responses`——文档层面确认提供，运行层面实测未完成（本环境无 key）。证据：DeepSeek 官方[《Using the Responses API》](https://api-docs.deepseek.com/guides/responses_api/)、Codex 集成页的 `wire_api = "responses"`、定价页的 `Responses API ✓`；仍需真调确认端点的实际状态码、SSE 事件吻合度与响应体反序列化。配置口径见 §1.2。
-11. 中文输入的处理策略（原文 / 英译 / 英文 instructions）——由 M0 基线结论决定。**仍未定**：M0 真调基线未取得（无 key，见 §5 M0 落地状态），没有可依据的结论。
+10. **已定（2026-09-22 真调）**：所选 LLM provider 是否提供 `/responses`——**实测确认可用**：非流式与 SSE 两个真调用例通过（`deepseek-flash`、`Completed`、deltas 重建最终文本、usage 正常），端点可用（成功路径 2xx）、SSE 事件与响应体反序列化均吻合；命令与读数见 §1.2 / §5 M0（文档证据：DeepSeek 官方[《Using the Responses API》](https://api-docs.deepseek.com/guides/responses_api/)、Codex 集成页 `wire_api = "responses"`、定价页 `Responses API ✓`）。同时登记两条新限制（本批只登记）：thinking 模式不支持强制 `tool_choice`（HTTP 400 `invalid_request_error`）与 thinking 的 reasoning token 计入 `max_output_tokens`（LLM 判断器 1024 上限下 4/4 `Incomplete`）；两条均有已归档 finding，路径见 §1.2。配置口径见 §1.2。
+11. 中文输入的处理策略（原文 / 英译 / 英文 instructions）——由 M0 基线结论决定。**仍未定**：M0 真调基线已取得（2026-09-22，Jev 4 样本；见 §5 M0），但 4 样本不足以支撑策略判断，也不构成研究结论。
 12. 批处理与逐问在关键判定上的取舍——由实测决定（本文 §3.2；实验口径见 [Jev 调研报告](jev-research.md) §14.3 E3）。**仍未定**；接口层已同时支持两种表达（`Questions` 放 1 或 N 个问题）。
 13. E4 注入诊断是否在 M4 安排；若不安排，须在实验报告中写明理由（见 §6.9）。**仍未定。**
 
