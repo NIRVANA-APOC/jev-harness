@@ -170,14 +170,16 @@ mod tests {
 
     #[test]
     fn debug_redacts_api_key() {
+        // 占位串（不是任何真实形态的 key），只用来验证 Debug 不把它打出来。
+        const PLACEHOLDER: &str = "unit-test-placeholder-not-a-key";
         let client = Client {
             base_url: DEFAULT_BASE_URL.to_owned(),
-            api_key: "ts_live_super_secret".to_owned(),
+            api_key: PLACEHOLDER.to_owned(),
             timeout: DEFAULT_TIMEOUT,
             http: reqwest::Client::new(),
         };
         let rendered = format!("{client:?}");
-        assert!(!rendered.contains("ts_live_super_secret"), "{rendered}");
+        assert!(!rendered.contains(PLACEHOLDER), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains(DEFAULT_BASE_URL), "{rendered}");
     }
