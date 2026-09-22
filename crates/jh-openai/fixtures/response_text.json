@@ -1,0 +1,47 @@
+{
+  "id": "resp_011",
+  "object": "response",
+  "created_at": 1758500100,
+  "status": "completed",
+  "model": "gpt-5",
+  "output": [
+    {
+      "id": "msg_011",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Rust 的所有权模型会移动值。",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "url": "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html",
+              "title": "Understanding Ownership",
+              "start_index": 0,
+              "end_index": 4
+            }
+          ],
+          "logprobs": []
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 36,
+    "input_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 0 },
+    "output_tokens": 87,
+    "output_tokens_details": { "reasoning_tokens": 0 },
+    "total_tokens": 123
+  },
+  "error": null,
+  "incomplete_details": null,
+  "parallel_tool_calls": true,
+  "tool_choice": "auto",
+  "tools": [],
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "instructions": null,
+  "metadata": {}
+}

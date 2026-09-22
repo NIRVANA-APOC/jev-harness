@@ -1,0 +1,25 @@
+{
+  "id": "resp_013",
+  "object": "response",
+  "created_at": 1758500400,
+  "status": "incomplete",
+  "model": "gpt-5",
+  "output": [
+    {
+      "id": "msg_013",
+      "type": "message",
+      "status": "incomplete",
+      "role": "assistant",
+      "content": [{ "type": "output_text", "text": "The answer is 42 because", "annotations": [], "logprobs": [] }]
+    }
+  ],
+  "usage": {
+    "input_tokens": 12,
+    "input_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 0 },
+    "output_tokens": 16,
+    "output_tokens_details": { "reasoning_tokens": 0 },
+    "total_tokens": 28
+  },
+  "error": null,
+  "incomplete_details": { "reason": "max_output_tokens" }
+}
