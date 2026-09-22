@@ -55,7 +55,7 @@ async fn the_offline_judges_run_the_initial_task_set() {
     assert_eq!(rule.calls.attempted, cases);
     assert_eq!(rule.calls.succeeded, cases);
     assert_eq!(rule.calls.failed, 0);
-    assert_eq!(rule.versions, vec!["rules-v2".to_owned()]);
+    assert_eq!(rule.versions, vec!["rules-v3".to_owned()]);
     assert_eq!(rule.quality.judgments, judgments);
     assert_eq!(rule.quality.agreements, judgments);
     assert_eq!(rule.quality.agreement_rate, Some(1.0));
@@ -91,7 +91,7 @@ async fn the_offline_judges_run_the_initial_task_set() {
         .iter()
         .filter_map(|entry| match entry {
             CallEntry::Judgment { record, .. } => Some(record.source),
-            CallEntry::Failure { .. } => None,
+            CallEntry::Failure { .. } | CallEntry::ModelCall { .. } => None,
         })
         .collect();
     assert!(sources.contains(&JudgeSource::Rule));
@@ -99,7 +99,7 @@ async fn the_offline_judges_run_the_initial_task_set() {
     assert!(
         entries.iter().all(|entry| match entry {
             CallEntry::Judgment { record, .. } => record.judgments.len() == 3,
-            CallEntry::Failure { .. } => false,
+            CallEntry::Failure { .. } | CallEntry::ModelCall { .. } => false,
         }),
         "每个样本的判断记录应含三个问题"
     );
@@ -131,7 +131,7 @@ async fn replay_reuses_recorded_answers_and_keeps_its_own_source_label() {
     );
     assert_eq!(
         replay.versions,
-        vec!["rules-v2".to_owned()],
+        vec!["rules-v3".to_owned()],
         "回放保留原记录的执行者版本"
     );
     assert_eq!(replay.quality.agreement_rate, Some(1.0));
@@ -197,7 +197,7 @@ async fn replay_does_not_consume_lines_written_by_the_same_run() {
     );
 
     // 同一次运行里 simulated-truth 排在 replay 之前，且 --calls 与 --replay 同为默认路径。
-    // 回放只准消费运行前已落盘的行，因此必须复用 rules-v2 的答案。
+    // 回放只准消费运行前已落盘的行，因此必须复用 rules-v3 的答案。
     let mixed = options(
         &dir,
         "run-mixed",
@@ -213,7 +213,7 @@ async fn replay_does_not_consume_lines_written_by_the_same_run() {
     );
     assert_eq!(
         replay.versions,
-        vec!["rules-v2".to_owned()],
+        vec!["rules-v3".to_owned()],
         "回放只能消费本次运行之前已落盘的行，不能拿到本次 simulated-truth 的版本串"
     );
     assert_eq!(replay.quality.agreement_rate, Some(1.0));

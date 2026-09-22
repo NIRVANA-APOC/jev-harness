@@ -1,0 +1,1719 @@
+{
+  "name": "family-b",
+  "source": "crates/jh-app/tasks/family_b.json",
+  "notes": "任务族 B：现有问题无法区分的成对场景（研究目标 §9.3）。3 对 × 每对 2 个未见变体，每对一 B1、一 B2；B1 的关键证据在初始快照里给全（输入获取过程固定），B2 的关键证据不在判断可见的材料里、只能靠计费的观察动作取得。隐藏真值只进判分与独立验收，不进判断请求。问题定义里写清「未列入候选集」（other）的判据——M1 的 A1 教训。",
+  "questions": [
+    {
+      "id": "b_pair_cause_p1",
+      "version": 1,
+      "reads": [
+        "app.log"
+      ],
+      "question": {
+        "type": "choice",
+        "instructions": "这次故障的首要原因是哪一类（expired_credential、clock_skew）？只按这次读到的材料归因；证据不足时按 other 的判据作答。",
+        "criteria": {
+          "expired_credential": "服务端证书已过期（notAfter 早于当前时间），系统时钟与权威时钟一致",
+          "clock_skew": "本机系统时钟偏差超窗（证书本身仍在有效期内）",
+          "other": "未列入候选集的原因：**读到的记录里没有任何一条**能把上面的候选区分开时（含关键证据尚未取得）必须选 other；判据是「需要的那份证据不在这次读到的材料里」，不要从候选集里挑一个最像的标签"
+        }
+      }
+    },
+    {
+      "id": "b_pair_cause_p2",
+      "version": 1,
+      "reads": [
+        "app.log"
+      ],
+      "question": {
+        "type": "choice",
+        "instructions": "这次故障的首要原因是哪一类（upstream_throttle、retry_storm）？只按这次读到的材料归因；证据不足时按 other 的判据作答。",
+        "criteria": {
+          "upstream_throttle": "上游主动限流（返回 429 / Retry-After），客户端重试次数很少",
+          "retry_storm": "客户端重试策略失控（窗口内重试次数远超上限），上游本身正常",
+          "other": "未列入候选集的原因：**读到的记录里没有任何一条**能把上面的候选区分开时（含关键证据尚未取得）必须选 other；判据是「需要的那份证据不在这次读到的材料里」，不要从候选集里挑一个最像的标签"
+        }
+      }
+    },
+    {
+      "id": "b_pair_cause_p3",
+      "version": 1,
+      "reads": [
+        "app.log"
+      ],
+      "question": {
+        "type": "choice",
+        "instructions": "这次故障的首要原因是哪一类（authority_missing、network_partition）？只按这次读到的材料归因；证据不足时按 other 的判据作答。",
+        "criteria": {
+          "authority_missing": "权威记录缺失（权威可达但应答 NXDOMAIN）",
+          "network_partition": "到权威的链路中断（探测丢包 100%）",
+          "other": "未列入候选集的原因：**读到的记录里没有任何一条**能把上面的候选区分开时（含关键证据尚未取得）必须选 other；判据是「需要的那份证据不在这次读到的材料里」，不要从候选集里挑一个最像的标签"
+        }
+      }
+    }
+  ],
+  "pairs": [
+    {
+      "id": "P1",
+      "title": "证书过期 vs 时钟偏差",
+      "question": "b_pair_cause_p1",
+      "key_object": "credential.audit",
+      "probe_action": "probe-credential-audit",
+      "sides": [
+        "expired_credential",
+        "clock_skew"
+      ],
+      "remedies": {
+        "expired_credential": "renew-credential",
+        "clock_skew": "resync-clock"
+      },
+      "dev_case": "D-P1",
+      "variants": [
+        "P1-V1",
+        "P1-V2"
+      ]
+    },
+    {
+      "id": "P2",
+      "title": "上游限流 vs 客户端重试风暴",
+      "question": "b_pair_cause_p2",
+      "key_object": "upstream.audit",
+      "probe_action": "probe-upstream-audit",
+      "sides": [
+        "upstream_throttle",
+        "retry_storm"
+      ],
+      "remedies": {
+        "upstream_throttle": "apply-backoff",
+        "retry_storm": "fix-retry-policy"
+      },
+      "dev_case": "D-P2",
+      "variants": [
+        "P2-V1",
+        "P2-V2"
+      ]
+    },
+    {
+      "id": "P3",
+      "title": "权威记录缺失 vs 网络分区",
+      "question": "b_pair_cause_p3",
+      "key_object": "dns.audit",
+      "probe_action": "probe-dns-audit",
+      "sides": [
+        "authority_missing",
+        "network_partition"
+      ],
+      "remedies": {
+        "authority_missing": "pin-authority-record",
+        "network_partition": "repair-network-route"
+      },
+      "dev_case": "D-P3",
+      "variants": [
+        "P3-V1",
+        "P3-V2"
+      ]
+    }
+  ],
+  "observables": [
+    {
+      "object": "app.log",
+      "obtained_by": "initial",
+      "fields": [
+        "service",
+        "lines"
+      ],
+      "note": "初始快照里就有的服务日志（措辞故意与两侧都相容）"
+    },
+    {
+      "object": "service.manifest",
+      "obtained_by": "initial",
+      "fields": [
+        "service",
+        "owner",
+        "tier"
+      ],
+      "note": "服务清单：与故障原因无关"
+    },
+    {
+      "object": "task.queue",
+      "obtained_by": "initial",
+      "fields": [
+        "pending",
+        "note"
+      ],
+      "note": "排期快照：与故障原因无关"
+    },
+    {
+      "object": "credential.audit",
+      "obtained_by": "probe-credential-audit",
+      "fields": [
+        "service",
+        "cert_not_after",
+        "host_utc",
+        "authority_utc",
+        "clock_offset_s",
+        "summary"
+      ],
+      "note": "证书窗口与对时结果：B1 里已在初始快照中，B2 里靠观察动作取得"
+    },
+    {
+      "object": "upstream.audit",
+      "obtained_by": "probe-upstream-audit",
+      "fields": [
+        "service",
+        "window_s",
+        "client_attempts",
+        "upstream_status",
+        "retry_after_s",
+        "summary"
+      ],
+      "note": "上游窗口与客户端重试次数：B1 里已在初始快照中，B2 里靠观察动作取得"
+    },
+    {
+      "object": "dns.audit",
+      "obtained_by": "probe-dns-audit",
+      "fields": [
+        "service",
+        "query",
+        "authority_reachable",
+        "authority_answer",
+        "loss_pct",
+        "timeout_ms",
+        "summary"
+      ],
+      "note": "权威可达性与应答：B1 里已在初始快照中，B2 里靠观察动作取得"
+    }
+  ],
+  "validation": [
+    {
+      "id": "P1-positive-a",
+      "pair": "P1",
+      "context": "开发案例的正例（材料足够，关键证据在材料里）",
+      "material": {
+        "app.log": {
+          "service": "billing-api",
+          "lines": [
+            "03:00:02 billing-api 上报：TLS 握手失败（certificate verify failed）",
+            "03:00:03 排查记录：故障窗口内网络正常、上游健康检查通过；握手失败的具体原因尚未归因"
+          ]
+        },
+        "credential.audit": {
+          "cert_not_after": "2026-09-20T00:00:00Z",
+          "host_utc": "2026-09-22T03:00:00Z",
+          "authority_utc": "2026-09-22T03:00:00Z",
+          "clock_offset_s": 0,
+          "service": "billing-api",
+          "summary": "billing-api 的证书窗口已过期（notAfter 早于当前时间），本机时钟与权威时钟一致"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "expired_credential"
+      }
+    },
+    {
+      "id": "P1-positive-b",
+      "pair": "P1",
+      "context": "开发案例的正例（材料足够，关键证据在材料里）",
+      "material": {
+        "app.log": {
+          "service": "search-index",
+          "lines": [
+            "03:06:58 search-index 上报：TLS 握手失败（certificate verify failed: unable to get local issuer）",
+            "03:07:00 排查记录：服务端证书存档未随本次事故提供，失败原因待定；链路与上游均无异常"
+          ]
+        },
+        "credential.audit": {
+          "cert_not_after": "2026-12-31T00:00:00Z",
+          "host_utc": "2026-09-22T03:07:12Z",
+          "authority_utc": "2026-09-22T03:00:00Z",
+          "clock_offset_s": 432,
+          "service": "search-index",
+          "summary": "search-index 的证书仍在有效窗口内；系统时钟偏差超窗：本机比权威时钟快 432 秒"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "clock_skew"
+      }
+    },
+    {
+      "id": "P1-negative",
+      "pair": "P1",
+      "context": "反例：材料不足（关键证据不在材料里），正确读法是 other",
+      "material": {
+        "app.log": {
+          "service": "billing-api",
+          "lines": [
+            "03:00:02 billing-api 上报：TLS 握手失败（certificate verify failed）",
+            "03:00:03 排查记录：故障窗口内网络正常、上游健康检查通过；握手失败的具体原因尚未归因"
+          ]
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "other"
+      }
+    },
+    {
+      "id": "P1-unseen-wording",
+      "pair": "P1",
+      "context": "不同表述 / 不同服务的未见变体（材料足够）",
+      "material": {
+        "app.log": {
+          "service": "mail-relay",
+          "lines": [
+            "03:06:58 mail-relay 上报：TLS 握手失败（certificate verify failed: unable to get local issuer）",
+            "03:07:00 排查记录：服务端证书存档未随本次事故提供，失败原因待定；链路与上游均无异常"
+          ]
+        },
+        "credential.audit": {
+          "cert_not_after": "2026-12-31T00:00:00Z",
+          "host_utc": "2026-09-22T03:07:12Z",
+          "authority_utc": "2026-09-22T03:00:00Z",
+          "clock_offset_s": 432,
+          "summary": "mail-relay 的证书仍在有效期内；本机时钟比权威时钟快 2 分 40 秒，系统时钟偏差超窗（对表后即可恢复）",
+          "service": "mail-relay"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "clock_skew"
+      }
+    },
+    {
+      "id": "P2-positive-a",
+      "pair": "P2",
+      "context": "开发案例的正例（材料足够，关键证据在材料里）",
+      "material": {
+        "app.log": {
+          "service": "order-api",
+          "lines": [
+            "03:11:40 order-api 上报：写请求大范围失败（HTTP 503，伴随 429）",
+            "03:11:41 排查记录：客户端侧重试配置未见异常；上游是否限流尚未核实"
+          ]
+        },
+        "upstream.audit": {
+          "window_s": 60,
+          "client_attempts": 3,
+          "upstream_status": 429,
+          "retry_after_s": 12,
+          "service": "order-api",
+          "summary": "order-api 窗口内客户端只重试 3 次；上游返回 429 并带 Retry-After=12s"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "upstream_throttle"
+      }
+    },
+    {
+      "id": "P2-positive-b",
+      "pair": "P2",
+      "context": "开发案例的正例（材料足够，关键证据在材料里）",
+      "material": {
+        "app.log": {
+          "service": "ledger-api",
+          "lines": [
+            "03:19:02 ledger-api 上报：写请求大量超时，重试队列持续增长",
+            "03:19:03 排查记录：上游健康检查通过；失败是否由客户端重试策略引起尚未归因"
+          ]
+        },
+        "upstream.audit": {
+          "window_s": 60,
+          "client_attempts": 380,
+          "upstream_status": 200,
+          "retry_after_s": 0,
+          "service": "ledger-api",
+          "summary": "ledger-api 窗口内客户端重试次数远超上限（380 次），上游返回 200"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "retry_storm"
+      }
+    },
+    {
+      "id": "P2-negative",
+      "pair": "P2",
+      "context": "反例：材料不足（关键证据不在材料里），正确读法是 other",
+      "material": {
+        "app.log": {
+          "service": "billing-api",
+          "lines": [
+            "03:11:40 billing-api 上报：写请求大范围失败（HTTP 503，伴随 429）",
+            "03:11:41 排查记录：客户端侧重试配置未见异常；上游是否限流尚未核实"
+          ]
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "other"
+      }
+    },
+    {
+      "id": "P2-unseen-wording",
+      "pair": "P2",
+      "context": "不同表述 / 不同服务的未见变体（材料足够）",
+      "material": {
+        "app.log": {
+          "service": "queue-api",
+          "lines": [
+            "03:19:02 queue-api 上报：写请求大量超时，重试队列持续增长",
+            "03:19:03 排查记录：上游健康检查通过；失败是否由客户端重试策略引起尚未归因"
+          ]
+        },
+        "upstream.audit": {
+          "window_s": 60,
+          "client_attempts": 380,
+          "upstream_status": 200,
+          "retry_after_s": 0,
+          "summary": "queue-api 窗口内客户端重试次数远超上限（512 次），上游返回 200",
+          "service": "queue-api"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "retry_storm"
+      }
+    },
+    {
+      "id": "P3-positive-a",
+      "pair": "P3",
+      "context": "开发案例的正例（材料足够，关键证据在材料里）",
+      "material": {
+        "app.log": {
+          "service": "search-index",
+          "lines": [
+            "03:24:10 search-index 上报：解析 api.internal 失败（SERVFAIL）",
+            "03:24:11 排查记录：本地解析器可达，权威侧情况未核实"
+          ]
+        },
+        "dns.audit": {
+          "query": "api.internal A",
+          "authority_reachable": true,
+          "authority_answer": "NXDOMAIN",
+          "loss_pct": 0,
+          "timeout_ms": 250,
+          "service": "search-index",
+          "summary": "权威应答 NXDOMAIN：search-index 查询的权威记录缺失（权威可达、链路无损）"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "authority_missing"
+      }
+    },
+    {
+      "id": "P3-positive-b",
+      "pair": "P3",
+      "context": "开发案例的正例（材料足够，关键证据在材料里）",
+      "material": {
+        "app.log": {
+          "service": "billing-api",
+          "lines": [
+            "03:31:05 billing-api 上报：解析 api.internal 超时，连接被重置",
+            "03:31:06 排查记录：解析器进程正常，上游链路状态尚未确认"
+          ]
+        },
+        "dns.audit": {
+          "query": "api.internal A",
+          "authority_reachable": false,
+          "authority_answer": null,
+          "loss_pct": 100,
+          "timeout_ms": 2000,
+          "service": "billing-api",
+          "summary": "billing-api 探测丢包 100%：到权威的链路中断，取不到应答（不是记录缺失）"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "network_partition"
+      }
+    },
+    {
+      "id": "P3-negative",
+      "pair": "P3",
+      "context": "反例：材料不足（关键证据不在材料里），正确读法是 other",
+      "material": {
+        "app.log": {
+          "service": "billing-api",
+          "lines": [
+            "03:24:10 billing-api 上报：解析 api.internal 失败（SERVFAIL）",
+            "03:24:11 排查记录：本地解析器可达，权威侧情况未核实"
+          ]
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "other"
+      }
+    },
+    {
+      "id": "P3-unseen-wording",
+      "pair": "P3",
+      "context": "不同表述 / 不同服务的未见变体（材料足够）",
+      "material": {
+        "app.log": {
+          "service": "media-api",
+          "lines": [
+            "03:31:05 media-api 上报：解析 api.internal 超时，连接被重置",
+            "03:31:06 排查记录：解析器进程正常，上游链路状态尚未确认"
+          ]
+        },
+        "dns.audit": {
+          "query": "api.internal A",
+          "authority_reachable": false,
+          "authority_answer": null,
+          "loss_pct": 100,
+          "timeout_ms": 2000,
+          "summary": "media-api 探测丢包 100%：到权威的链路完全不通，与记录是否存在无关",
+          "service": "media-api"
+        }
+      },
+      "expected": {
+        "type": "choice",
+        "label": "network_partition"
+      }
+    }
+  ],
+  "development": [
+    {
+      "id": "D-P1",
+      "pair": "P1",
+      "subset": "B1",
+      "side": "clock_skew",
+      "notes": "B1：关键证据 credential.audit 已在初始快照里给全（输入获取过程固定），固定问题只读 app.log、读不到它；正确读法在材料足够时是 clock_skew，材料不足时按 other 的判据。 对侧：expired_credential。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "mail-relay",
+            "lines": [
+              "03:06:58 mail-relay 上报：TLS 握手失败（certificate verify failed: unable to get local issuer）",
+              "03:07:00 排查记录：服务端证书存档未随本次事故提供，失败原因待定；链路与上游均无异常"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "mail-relay",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        },
+        {
+          "source": "tool:read_audit",
+          "at_unix_ms": 1700001000300,
+          "object": "credential.audit",
+          "version": 1,
+          "content": {
+            "cert_not_after": "2026-12-31T00:00:00Z",
+            "host_utc": "2026-09-22T03:07:12Z",
+            "authority_utc": "2026-09-22T03:00:00Z",
+            "clock_offset_s": 432,
+            "service": "mail-relay",
+            "summary": "mail-relay 的证书仍在有效窗口内；系统时钟偏差超窗：本机比权威时钟快 432 秒"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p1",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "renew-credential",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "expired_credential"
+            }
+          ]
+        },
+        {
+          "id": "resync-clock",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "clock_skew"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p1": {
+              "type": "choice",
+              "label": "clock_skew"
+            }
+          },
+          "required": [
+            "resync-clock"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p1": {
+              "type": "choice",
+              "label": "clock_skew"
+            }
+          },
+          "required": [
+            "resync-clock"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "D-P2",
+      "pair": "P2",
+      "subset": "B2",
+      "side": "upstream_throttle",
+      "notes": "B2：关键证据不在判断可见的材料里（初始快照没有 upstream.audit），只能靠计费观察动作 probe-upstream-audit 取得；观察须计费，防止「永远读取全部信息」成为无代价策略（研究目标 §9.3）。 对侧：retry_storm。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "order-api",
+            "lines": [
+              "03:11:40 order-api 上报：写请求大范围失败（HTTP 503，伴随 429）",
+              "03:11:41 排查记录：客户端侧重试配置未见异常；上游是否限流尚未核实"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "order-api",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p2",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "probe-upstream-audit",
+          "cost_units": 3.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "other"
+            }
+          ],
+          "effect": {
+            "source": "tool:probe-upstream-audit",
+            "object": "upstream.audit",
+            "version": 1,
+            "content": {
+              "window_s": 60,
+              "client_attempts": 3,
+              "upstream_status": 429,
+              "retry_after_s": 12,
+              "service": "order-api",
+              "summary": "order-api 窗口内客户端只重试 3 次；上游返回 429 并带 Retry-After=12s"
+            },
+            "note": "观察动作产出关键证据：upstream.audit"
+          }
+        },
+        {
+          "id": "apply-backoff",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "upstream_throttle"
+            }
+          ]
+        },
+        {
+          "id": "fix-retry-policy",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "retry_storm"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p2": {
+              "type": "choice",
+              "label": "upstream_throttle"
+            }
+          },
+          "required": [
+            "probe-upstream-audit"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p2": {
+              "type": "choice",
+              "label": "upstream_throttle"
+            }
+          },
+          "required": [
+            "probe-upstream-audit",
+            "apply-backoff"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "D-P3",
+      "pair": "P3",
+      "subset": "B1",
+      "side": "authority_missing",
+      "notes": "B1：关键证据 dns.audit 已在初始快照里给全（输入获取过程固定），固定问题只读 app.log、读不到它；正确读法在材料足够时是 authority_missing，材料不足时按 other 的判据。 对侧：network_partition。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "search-index",
+            "lines": [
+              "03:24:10 search-index 上报：解析 api.internal 失败（SERVFAIL）",
+              "03:24:11 排查记录：本地解析器可达，权威侧情况未核实"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "search-index",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        },
+        {
+          "source": "tool:read_audit",
+          "at_unix_ms": 1700001000300,
+          "object": "dns.audit",
+          "version": 1,
+          "content": {
+            "query": "api.internal A",
+            "authority_reachable": true,
+            "authority_answer": "NXDOMAIN",
+            "loss_pct": 0,
+            "timeout_ms": 250,
+            "service": "search-index",
+            "summary": "权威应答 NXDOMAIN：search-index 查询的权威记录缺失（权威可达、链路无损）"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p3",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "pin-authority-record",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "authority_missing"
+            }
+          ]
+        },
+        {
+          "id": "repair-network-route",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "network_partition"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p3": {
+              "type": "choice",
+              "label": "authority_missing"
+            }
+          },
+          "required": [
+            "pin-authority-record"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p3": {
+              "type": "choice",
+              "label": "authority_missing"
+            }
+          },
+          "required": [
+            "pin-authority-record"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    }
+  ],
+  "variants": [
+    {
+      "id": "P1-V1",
+      "pair": "P1",
+      "subset": "B1",
+      "side": "expired_credential",
+      "notes": "B1：关键证据 credential.audit 已在初始快照里给全（输入获取过程固定），固定问题只读 app.log、读不到它；正确读法在材料足够时是 expired_credential，材料不足时按 other 的判据。 对侧：clock_skew。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "billing-api",
+            "lines": [
+              "03:00:02 billing-api 上报：TLS 握手失败（certificate verify failed）",
+              "03:00:03 排查记录：故障窗口内网络正常、上游健康检查通过；握手失败的具体原因尚未归因"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "billing-api",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        },
+        {
+          "source": "tool:read_audit",
+          "at_unix_ms": 1700001000300,
+          "object": "credential.audit",
+          "version": 1,
+          "content": {
+            "cert_not_after": "2026-09-20T00:00:00Z",
+            "host_utc": "2026-09-22T03:00:00Z",
+            "authority_utc": "2026-09-22T03:00:00Z",
+            "clock_offset_s": 0,
+            "service": "billing-api",
+            "summary": "billing-api 的证书窗口已过期（notAfter 早于当前时间），本机时钟与权威时钟一致"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p1",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "renew-credential",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "expired_credential"
+            }
+          ]
+        },
+        {
+          "id": "resync-clock",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "clock_skew"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p1": {
+              "type": "choice",
+              "label": "expired_credential"
+            }
+          },
+          "required": [
+            "renew-credential"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p1": {
+              "type": "choice",
+              "label": "expired_credential"
+            }
+          },
+          "required": [
+            "renew-credential"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "P1-V2",
+      "pair": "P1",
+      "subset": "B2",
+      "side": "clock_skew",
+      "notes": "B2：关键证据不在判断可见的材料里（初始快照没有 credential.audit），只能靠计费观察动作 probe-credential-audit 取得；观察须计费，防止「永远读取全部信息」成为无代价策略（研究目标 §9.3）。 对侧：expired_credential。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "search-index",
+            "lines": [
+              "03:06:58 search-index 上报：TLS 握手失败（certificate verify failed: unable to get local issuer）",
+              "03:07:00 排查记录：服务端证书存档未随本次事故提供，失败原因待定；链路与上游均无异常"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "search-index",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p1",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "probe-credential-audit",
+          "cost_units": 3.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "other"
+            }
+          ],
+          "effect": {
+            "source": "tool:probe-credential-audit",
+            "object": "credential.audit",
+            "version": 1,
+            "content": {
+              "cert_not_after": "2026-12-31T00:00:00Z",
+              "host_utc": "2026-09-22T03:07:12Z",
+              "authority_utc": "2026-09-22T03:00:00Z",
+              "clock_offset_s": 432,
+              "service": "search-index",
+              "summary": "search-index 的证书仍在有效窗口内；系统时钟偏差超窗：本机比权威时钟快 432 秒"
+            },
+            "note": "观察动作产出关键证据：credential.audit"
+          }
+        },
+        {
+          "id": "renew-credential",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "expired_credential"
+            }
+          ]
+        },
+        {
+          "id": "resync-clock",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p1",
+              "equals": "clock_skew"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p1": {
+              "type": "choice",
+              "label": "clock_skew"
+            }
+          },
+          "required": [
+            "probe-credential-audit"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p1": {
+              "type": "choice",
+              "label": "clock_skew"
+            }
+          },
+          "required": [
+            "probe-credential-audit",
+            "resync-clock"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "P2-V1",
+      "pair": "P2",
+      "subset": "B2",
+      "side": "upstream_throttle",
+      "notes": "B2：关键证据不在判断可见的材料里（初始快照没有 upstream.audit），只能靠计费观察动作 probe-upstream-audit 取得；观察须计费，防止「永远读取全部信息」成为无代价策略（研究目标 §9.3）。 对侧：retry_storm。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "order-api",
+            "lines": [
+              "03:11:40 order-api 上报：写请求大范围失败（HTTP 503，伴随 429）",
+              "03:11:41 排查记录：客户端侧重试配置未见异常；上游是否限流尚未核实"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "order-api",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p2",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "probe-upstream-audit",
+          "cost_units": 3.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "other"
+            }
+          ],
+          "effect": {
+            "source": "tool:probe-upstream-audit",
+            "object": "upstream.audit",
+            "version": 1,
+            "content": {
+              "window_s": 60,
+              "client_attempts": 3,
+              "upstream_status": 429,
+              "retry_after_s": 12,
+              "service": "order-api",
+              "summary": "order-api 窗口内客户端只重试 3 次；上游返回 429 并带 Retry-After=12s"
+            },
+            "note": "观察动作产出关键证据：upstream.audit"
+          }
+        },
+        {
+          "id": "apply-backoff",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "upstream_throttle"
+            }
+          ]
+        },
+        {
+          "id": "fix-retry-policy",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "retry_storm"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p2": {
+              "type": "choice",
+              "label": "upstream_throttle"
+            }
+          },
+          "required": [
+            "probe-upstream-audit"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p2": {
+              "type": "choice",
+              "label": "upstream_throttle"
+            }
+          },
+          "required": [
+            "probe-upstream-audit",
+            "apply-backoff"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "P2-V2",
+      "pair": "P2",
+      "subset": "B1",
+      "side": "retry_storm",
+      "notes": "B1：关键证据 upstream.audit 已在初始快照里给全（输入获取过程固定），固定问题只读 app.log、读不到它；正确读法在材料足够时是 retry_storm，材料不足时按 other 的判据。 对侧：upstream_throttle。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "ledger-api",
+            "lines": [
+              "03:19:02 ledger-api 上报：写请求大量超时，重试队列持续增长",
+              "03:19:03 排查记录：上游健康检查通过；失败是否由客户端重试策略引起尚未归因"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "ledger-api",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        },
+        {
+          "source": "tool:read_audit",
+          "at_unix_ms": 1700001000300,
+          "object": "upstream.audit",
+          "version": 1,
+          "content": {
+            "window_s": 60,
+            "client_attempts": 380,
+            "upstream_status": 200,
+            "retry_after_s": 0,
+            "service": "ledger-api",
+            "summary": "ledger-api 窗口内客户端重试次数远超上限（380 次），上游返回 200"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p2",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "apply-backoff",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "upstream_throttle"
+            }
+          ]
+        },
+        {
+          "id": "fix-retry-policy",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p2",
+              "equals": "retry_storm"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p2": {
+              "type": "choice",
+              "label": "retry_storm"
+            }
+          },
+          "required": [
+            "fix-retry-policy"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p2": {
+              "type": "choice",
+              "label": "retry_storm"
+            }
+          },
+          "required": [
+            "fix-retry-policy"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "P3-V1",
+      "pair": "P3",
+      "subset": "B1",
+      "side": "network_partition",
+      "notes": "B1：关键证据 dns.audit 已在初始快照里给全（输入获取过程固定），固定问题只读 app.log、读不到它；正确读法在材料足够时是 network_partition，材料不足时按 other 的判据。 对侧：authority_missing。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "billing-api",
+            "lines": [
+              "03:31:05 billing-api 上报：解析 api.internal 超时，连接被重置",
+              "03:31:06 排查记录：解析器进程正常，上游链路状态尚未确认"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "billing-api",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        },
+        {
+          "source": "tool:read_audit",
+          "at_unix_ms": 1700001000300,
+          "object": "dns.audit",
+          "version": 1,
+          "content": {
+            "query": "api.internal A",
+            "authority_reachable": false,
+            "authority_answer": null,
+            "loss_pct": 100,
+            "timeout_ms": 2000,
+            "service": "billing-api",
+            "summary": "billing-api 探测丢包 100%：到权威的链路中断，取不到应答（不是记录缺失）"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p3",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "pin-authority-record",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "authority_missing"
+            }
+          ]
+        },
+        {
+          "id": "repair-network-route",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "network_partition"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p3": {
+              "type": "choice",
+              "label": "network_partition"
+            }
+          },
+          "required": [
+            "repair-network-route"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p3": {
+              "type": "choice",
+              "label": "network_partition"
+            }
+          },
+          "required": [
+            "repair-network-route"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    },
+    {
+      "id": "P3-V2",
+      "pair": "P3",
+      "subset": "B2",
+      "side": "authority_missing",
+      "notes": "B2：关键证据不在判断可见的材料里（初始快照没有 dns.audit），只能靠计费观察动作 probe-dns-audit 取得；观察须计费，防止「永远读取全部信息」成为无代价策略（研究目标 §9.3）。 对侧：network_partition。措辞、服务名与初始快照按未见变体重写。",
+      "rounds": 3,
+      "initial": [
+        {
+          "source": "tool:read_log",
+          "at_unix_ms": 1700001000000,
+          "object": "app.log",
+          "version": 1,
+          "content": {
+            "service": "search-index",
+            "lines": [
+              "03:24:10 search-index 上报：解析 api.internal 失败（SERVFAIL）",
+              "03:24:11 排查记录：本地解析器可达，权威侧情况未核实"
+            ]
+          }
+        },
+        {
+          "source": "tool:read_manifest",
+          "at_unix_ms": 1700001000100,
+          "object": "service.manifest",
+          "version": 1,
+          "content": {
+            "service": "search-index",
+            "owner": "platform",
+            "tier": "tier-1"
+          }
+        },
+        {
+          "source": "tool:read_queue",
+          "at_unix_ms": 1700001000200,
+          "object": "task.queue",
+          "version": 1,
+          "content": {
+            "pending": 4,
+            "note": "排期快照：与本次故障无关"
+          }
+        }
+      ],
+      "tracked": [
+        {
+          "question": "b_pair_cause_p3",
+          "due_round": 0
+        }
+      ],
+      "extra_dependencies": [],
+      "steps": [
+        {
+          "round": 1,
+          "when": "before_ask",
+          "note": "无关变化：只更新了与本次故障无关的排期快照（用来检验「无关结果保留」）",
+          "change": {
+            "kind": "append",
+            "source": "tool:read_queue",
+            "at_unix_ms": 1700001400000,
+            "object": "task.queue",
+            "version": 2,
+            "content": {
+              "pending": 5,
+              "note": "排期快照更新：与本次故障无关"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "probe-dns-audit",
+          "cost_units": 3.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "other"
+            }
+          ],
+          "effect": {
+            "source": "tool:probe-dns-audit",
+            "object": "dns.audit",
+            "version": 1,
+            "content": {
+              "query": "api.internal A",
+              "authority_reachable": true,
+              "authority_answer": "NXDOMAIN",
+              "loss_pct": 0,
+              "timeout_ms": 250,
+              "service": "search-index",
+              "summary": "权威应答 NXDOMAIN：search-index 查询的权威记录缺失（权威可达、链路无损）"
+            },
+            "note": "观察动作产出关键证据：dns.audit"
+          }
+        },
+        {
+          "id": "pin-authority-record",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "authority_missing"
+            }
+          ]
+        },
+        {
+          "id": "repair-network-route",
+          "cost_units": 4.0,
+          "requires": [
+            {
+              "question": "b_pair_cause_p3",
+              "equals": "network_partition"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "truth": {
+            "b_pair_cause_p3": {
+              "type": "choice",
+              "label": "authority_missing"
+            }
+          },
+          "required": [
+            "probe-dns-audit"
+          ]
+        },
+        {
+          "truth": {
+            "b_pair_cause_p3": {
+              "type": "choice",
+              "label": "authority_missing"
+            }
+          },
+          "required": [
+            "probe-dns-audit",
+            "pin-authority-record"
+          ]
+        }
+      ],
+      "acceptance": {
+        "bind_deliverable": false
+      }
+    }
+  ]
+}

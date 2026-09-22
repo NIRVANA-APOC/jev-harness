@@ -47,8 +47,9 @@ use std::time::Instant;
 
 use jh_core::{
     ActionId, Answer, EdgeKind, EdgeOrigin, EvaluationStatus, InputProjection, JsonlEvidenceLog,
-    Judge, JudgeRequest, JudgmentRecord, NodeId, NodeRef, ObjectId, PremiseCheck, QuestionId,
-    QuestionVersion, SemanticState, SnapshotCheck, SnapshotId, State, Validity, verify_snapshot,
+    Judge, JudgeRequest, JudgmentRecord, NewEvidence, NodeId, NodeRef, ObjectId, PremiseCheck,
+    QuestionId, QuestionSpec, QuestionVersion, SemanticState, SnapshotCheck, SnapshotId, State,
+    Validity, verify_snapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,8 +58,8 @@ use crate::calls::{CallEntry, CallLog};
 use crate::error::Error;
 use crate::exp::unix_ms;
 use crate::family::{
-    Acceptance, AcceptanceInput, Environment, FamilyA, FamilyTask, Gate, StepEffect, StepWhen,
-    accept,
+    Acceptance, AcceptanceInput, ActionSpec, Change, Environment, FamilyTask, Gate, QuestionSet,
+    StepEffect, StepWhen, accept,
 };
 use crate::judge::JudgeName;
 use crate::metrics;
@@ -321,6 +322,9 @@ pub struct TaskTrace {
     pub steps: Vec<StepEffect>,
     /// 行动决策。
     pub decisions: Vec<DecisionTrace>,
+    /// 影子判断（参与判断、不进决策）；没有影子计划时为空。
+    #[serde(default)]
+    pub shadows: Vec<ShadowTrace>,
     /// 完成声明。
     pub claims: Vec<ClaimTrace>,
     /// 独立验收结果。
@@ -358,7 +362,7 @@ impl TaskTrace {
 /// 一次单任务运行的全部外部依赖。
 pub struct LoopContext<'a> {
     /// 任务族（问题集与读取范围）。
-    pub family: &'a FamilyA,
+    pub family: &'a dyn QuestionSet,
     /// 判定器。
     pub judge: &'a dyn Judge,
     /// 判定器名字。
@@ -372,8 +376,74 @@ pub struct LoopContext<'a> {
     /// 写进轨迹，让「这次真实调用打到了哪个端点」有运行时的原始记录，而不是只能从写报告时的
     /// shell 环境去猜。
     pub endpoint: Option<String>,
+    /// 影子计划：本轮额外问、控制路径不读的问题（研究目标 §6.2 第 6 步）。
+    pub shadow: Option<&'a ShadowPlan>,
     /// 调用记录（JSONL，追加）。
     pub calls: &'a mut CallLog,
+}
+
+/// 影子计划：在正常判断之外额外问的问题——它们**参与判断**（真实调用、判分、进轨迹），
+/// 但**不进决策**：控制路径只读主状态里的节点，影子答案落在另一个状态里。
+///
+/// 影子读数用来回答「若采纳新问题，会不会改变有价值的行动分支」：每条影子判断都对着本轮的实际
+/// 决策算出「换成它会怎样」，改变方向按独立验收的正当性口径（[`FamilyTask::justified_at_round`]）
+/// 判定。
+pub struct ShadowPlan {
+    /// 影子问题。
+    pub questions: Vec<ShadowQuestion>,
+}
+
+/// 一条影子问题：被精化的那个门控问题 + 候选版本的定义与读取范围。
+pub struct ShadowQuestion {
+    /// 问题标识（与门控问题同名：精化 = 同一个 ID 的新版本）。
+    pub question: QuestionId,
+    /// 候选版本的定义。
+    pub spec: QuestionSpec,
+    /// 候选版本声明的读取对象。
+    pub scope: Vec<ObjectId>,
+    /// 这条影子问题是什么（进轨迹，供复核）。
+    pub note: String,
+}
+
+/// 一条影子判断的轨迹。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowTrace {
+    /// 第几轮。
+    pub round: usize,
+    /// 提问相位。
+    pub phase: usize,
+    /// 问题。
+    pub question: QuestionId,
+    /// 影子版本。
+    pub question_version: QuestionVersion,
+    /// 读出的标签；读不出时为空串。
+    pub reading: String,
+    /// 隐藏真值标签（判分侧）。
+    pub truth: Option<String>,
+    /// 与隐藏真值是否一致。
+    pub agreement: Option<bool>,
+    /// 影子判断的输入投影（材料充分性按它判定）。
+    pub projection: InputProjection,
+    /// 这次影子判断失败时的错误原文（失败就是失败，不给空答案）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    /// 把这条影子判断换进决策器会改变的行动分支。
+    pub branches: Vec<BranchChange>,
+}
+
+/// 一条行动分支的改变：同一轮里同一个动作，实际结果与「采纳影子判断后」的结果不同。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchChange {
+    /// 动作。
+    pub action: ActionId,
+    /// 实际结果。
+    pub actual: DecisionOutcome,
+    /// 采纳影子判断后的结果。
+    pub hypothetical: DecisionOutcome,
+    /// 改变后是不是「发出一个正当的动作」（研究目标 §6.5 的「有价值的行动分支」）。
+    pub toward_justified: bool,
+    /// 依据说明。
+    pub detail: String,
 }
 
 /// 跑完一个任务的整条循环，返回轨迹。
@@ -402,9 +472,13 @@ pub async fn run_task(
         reuses: Vec::new(),
         steps: Vec::new(),
         decisions: Vec::new(),
+        shadows: Vec::new(),
         claims: Vec::new(),
         acceptance: None,
     };
+
+    // 影子判断落在自己的状态里：控制路径只读 `state`，所以影子结果结构上进不了决策。
+    let mut shadow_state = context.shadow.map(|_| SemanticState::in_memory());
 
     for round in 0..task.rounds {
         // 1. 提问前的扰动：这一轮的判断能看到它们。
@@ -431,8 +505,41 @@ pub async fn run_task(
             record_ask(task, &mut state, &mut trace, pending)?;
         }
 
+        // 4.5 影子判断：额外发、落进影子状态；控制路径不读它。
+        let mut pending_shadows = Vec::new();
+        if let (Some(plan), Some(shadow_state)) = (context.shadow, shadow_state.as_mut()) {
+            for question in &plan.questions {
+                pending_shadows.push(
+                    shadow_ask(
+                        context,
+                        task,
+                        round,
+                        environment.phase(),
+                        &state,
+                        shadow_state,
+                        question,
+                    )
+                    .await?,
+                );
+            }
+        }
+
         // 5. 决定行动。
         decide(context, task, round, &mut state, &mut trace)?;
+
+        // 5.5 影子读数：把每条影子判断换进决策器，看本轮的行动分支会不会变。
+        for mut shadow in pending_shadows {
+            let answer = shadow.answer.take();
+            shadow.trace.branches = branch_changes(
+                task,
+                round,
+                &state,
+                &trace.decisions,
+                &shadow.trace.question,
+                answer.as_ref(),
+            );
+            trace.shadows.push(shadow.trace);
+        }
     }
 
     // 5. 完成声明：写进轨迹、计入条数，但不作证据。
@@ -472,9 +579,13 @@ struct Ask {
 /// 本轮的调度：要问哪些问题、哪些直接复用。
 ///
 /// **H1 开关的唯一分叉点之一**：关闭臂只问「从没答上来的问题」，不看失效标记。
+///
+/// 不在这条分叉里的另一条规则（两臂、两个族都适用）：**证据需求没满足就重问**——问题声明的读取
+/// 对象里，有哪个现在有当前版本、而手上的答案当时没读到它，那份答案就是在材料不齐时给出的。
+/// 任务族 B 的 B2 靠它把观察动作的产出接进下一轮判断（研究目标 §6.3 的「触发条件」）。
 fn schedule(
     arm: Arm,
-    family: &FamilyA,
+    family: &dyn QuestionSet,
     task: &FamilyTask,
     round: usize,
     state: &SemanticState,
@@ -487,20 +598,31 @@ fn schedule(
             continue;
         }
         let latest = latest_node(state, &tracked.question);
-        let ask = match arm.recompute() {
-            Recompute::Full => true,
-            Recompute::Incremental => match latest {
-                None => true,
-                Some(node) => match node.evaluation {
-                    // 关闭臂：只要答上过一次就继续用，不看它是否已经失效。
-                    EvaluationStatus::Succeeded => {
-                        arm.uses_propagation() && node.validity != Validity::Current
-                    }
-                    // 从没答上来（未请求 / 失败）：任何臂都要再问。
-                    _ => true,
+        let requirement_unmet = latest.is_some_and(|node| {
+            family
+                .reads(&tracked.question)
+                .unwrap_or_default()
+                .iter()
+                .any(|object| {
+                    state.evidence().current_version(object).is_some()
+                        && !node.projection.reads(object)
+                })
+        });
+        let ask = requirement_unmet
+            || match arm.recompute() {
+                Recompute::Full => true,
+                Recompute::Incremental => match latest {
+                    None => true,
+                    Some(node) => match node.evaluation {
+                        // 关闭臂：只要答上过一次就继续用，不看它是否已经失效。
+                        EvaluationStatus::Succeeded => {
+                            arm.uses_propagation() && node.validity != Validity::Current
+                        }
+                        // 从没答上来（未请求 / 失败）：任何臂都要再问。
+                        _ => true,
+                    },
                 },
-            },
-        };
+            };
 
         if ask {
             needed.push(tracked.question.clone());
@@ -523,17 +645,18 @@ fn schedule(
 
 /// 按读取范围分组：范围相同的问题共享一次请求（研究目标 §5.3 的保守依赖口径）。
 ///
-/// 读取范围只有一个真身：问题集声明的那份（[`FamilyA::scope`]，来自任务 JSON 的 `reads`）。
-/// 这里不保留副本——否则改问题集时投影与「漏失效 / 误失效」读数会一起漂，守卫就被自己破坏了。
-fn group_by_scope(family: &FamilyA, questions: Vec<QuestionId>) -> Result<Vec<Ask>, Error> {
+/// 读取范围只有一个真身：问题集当前的声明（[`QuestionSet::reads`]，任务族 A 来自任务 JSON 的
+/// `reads`，任务族 B 来自问题库启用版本的证据需求）。这里不保留副本——否则改问题集时投影与
+/// 「漏失效 / 误失效」读数会一起漂，守卫就被自己破坏了。
+fn group_by_scope(family: &dyn QuestionSet, questions: Vec<QuestionId>) -> Result<Vec<Ask>, Error> {
     let mut groups: BTreeMap<Vec<ObjectId>, Vec<QuestionId>> = BTreeMap::new();
     for question in questions {
-        let scope = family.scope(&question).ok_or_else(|| {
+        let scope = family.reads(&question).ok_or_else(|| {
             Error::TaskSet(format!(
-                "问题 `{question}` 没有声明读取范围：它不在当前固定问题集里"
+                "问题 `{question}` 没有声明读取范围：它不在当前问题集里"
             ))
         })?;
-        groups.entry(scope.to_vec()).or_default().push(question);
+        groups.entry(scope).or_default().push(question);
     }
     Ok(groups
         .into_iter()
@@ -629,16 +752,12 @@ async fn send_ask(
 
     let mut questions = BTreeMap::new();
     for question in &ask.questions {
-        let spec = context
-            .family
-            .question(question)
-            .ok_or_else(|| {
-                Error::TaskSet(format!(
-                    "任务 {}：问题 `{question}` 不在固定问题集里",
-                    task.id
-                ))
-            })?
-            .clone();
+        let spec = context.family.enabled_question(question).ok_or_else(|| {
+            Error::TaskSet(format!(
+                "任务 {}：问题 `{question}` 不在当前问题集里",
+                task.id
+            ))
+        })?;
         questions.insert(question.clone(), spec);
     }
 
@@ -778,7 +897,7 @@ fn record_ask(
             .answer
             .clone();
         let reading = metrics::reading(&answer);
-        let truth = task.truth_at(phase, question);
+        let truth = task.truth_for(phase, question, |object| recorded.projection.reads(object));
         let score = truth
             .as_ref()
             .and_then(|truth| metrics::score(&answer, truth));
@@ -817,6 +936,211 @@ fn fail_nodes(
         state.set_evaluation(*node, EvaluationStatus::Failed(error.to_owned()))?;
     }
     Ok(())
+}
+
+/// 已经回来的影子判断：轨迹 + 答案（答案给「换成它会怎样」的分支计算用）。
+struct PendingShadow {
+    trace: ShadowTrace,
+    answer: Option<Answer>,
+}
+
+/// 发一次影子判断：装配材料、调判定器、把节点与记录落进**影子状态**。
+///
+/// 材料装配与投影规则跟正常请求完全一致（同一份 state、同一条 [`assemble`]、同一组读取范围），
+/// 差别只有结果落在哪里：控制路径（前提门、行动复核）只读主状态，影子结果结构上进不了决策。
+async fn shadow_ask(
+    context: &mut LoopContext<'_>,
+    task: &FamilyTask,
+    round: usize,
+    phase: usize,
+    state: &SemanticState,
+    shadow_state: &mut SemanticState,
+    question: &ShadowQuestion,
+) -> Result<PendingShadow, Error> {
+    let (material, projection) = assemble(state, &question.scope);
+    let snapshot = SnapshotId::from(format!("{}-r{round}-shadow-{}", task.id, question.question));
+    let mut questions = BTreeMap::new();
+    questions.insert(question.question.clone(), question.spec.clone());
+    let request = JudgeRequest {
+        snapshot: snapshot.clone(),
+        state: material,
+        questions,
+    };
+
+    let node = shadow_state.declare_node(
+        question.question.clone(),
+        question.spec.version,
+        projection.clone(),
+    );
+    let started = Instant::now();
+    let outcome = context.judge.judge(&request).await;
+    let latency = started.elapsed();
+
+    let mut trace = ShadowTrace {
+        round,
+        phase,
+        question: question.question.clone(),
+        question_version: question.spec.version,
+        reading: String::new(),
+        truth: None,
+        agreement: None,
+        projection: projection.clone(),
+        failure: None,
+        branches: Vec::new(),
+    };
+
+    let result = match outcome {
+        Ok(response) => match JudgmentRecord::from_response(&request, &response, latency) {
+            Ok(record) => {
+                shadow_state.record_judgment(node, record.clone())?;
+                context.calls.append(&CallEntry::Judgment {
+                    run: context.run.clone(),
+                    case: format!("{}-r{round}-shadow", task.id),
+                    record: Box::new(record.clone()),
+                })?;
+                Ok(record)
+            }
+            Err(error) => {
+                let text = error.to_string();
+                shadow_state.set_evaluation(node, EvaluationStatus::Failed(text.clone()))?;
+                context.calls.append(&CallEntry::Failure {
+                    run: context.run.clone(),
+                    case: format!("{}-r{round}-shadow", task.id),
+                    source: context.channel.source(),
+                    latency_ms: latency.as_millis() as u64,
+                    error: text.clone(),
+                })?;
+                Err(text)
+            }
+        },
+        Err(error) => {
+            let text = error.to_string();
+            shadow_state.set_evaluation(node, EvaluationStatus::Failed(text.clone()))?;
+            context.calls.append(&CallEntry::Failure {
+                run: context.run.clone(),
+                case: format!("{}-r{round}-shadow", task.id),
+                source: context.channel.source(),
+                latency_ms: latency.as_millis() as u64,
+                error: text.clone(),
+            })?;
+            Err(text)
+        }
+    };
+
+    match result {
+        Ok(record) => {
+            let answer = record
+                .judgments
+                .get(&question.question)
+                .map(|judgment| judgment.answer.clone());
+            if let Some(answer) = &answer {
+                let truth =
+                    task.truth_for(phase, &question.question, |object| projection.reads(object));
+                let score = truth
+                    .as_ref()
+                    .and_then(|truth| metrics::score(answer, truth));
+                trace.reading = metrics::reading(answer)
+                    .map(|reading| reading.label)
+                    .unwrap_or_default();
+                trace.truth = truth.as_ref().map(metrics::truth_label);
+                trace.agreement = score.map(|score| score.agreement);
+            }
+            Ok(PendingShadow { trace, answer })
+        }
+        Err(text) => {
+            trace.failure = Some(text);
+            Ok(PendingShadow {
+                trace,
+                answer: None,
+            })
+        }
+    }
+}
+
+/// 把一条影子判断换进决策器：本轮的行动分支会不会变。
+///
+/// 判据与真实决策同一条（[`gate_holds`]）：除了被精化的那个门控问题用影子答案，其余前提都用主状态
+/// 里手上的答案。实际结果取本轮的实际决策结果；`Executed` 只按前提门口径给出，不含发出前的前提复核
+/// （那是 H1 的机制，`Blocked` 与实际结果一起报出来）。
+fn branch_changes(
+    task: &FamilyTask,
+    round: usize,
+    state: &SemanticState,
+    decisions: &[DecisionTrace],
+    shadow_question: &QuestionId,
+    shadow_answer: Option<&Answer>,
+) -> Vec<BranchChange> {
+    let Some(shadow_answer) = shadow_answer else {
+        return Vec::new();
+    };
+    let executed_before: BTreeSet<&ActionId> = decisions
+        .iter()
+        .filter(|decision| decision.round < round && decision.outcome == DecisionOutcome::Executed)
+        .map(|decision| &decision.action)
+        .collect();
+
+    let mut changes = Vec::new();
+    for spec in &task.actions {
+        if executed_before.contains(&spec.id) {
+            continue;
+        }
+        let Some(actual) = decisions
+            .iter()
+            .find(|decision| decision.round == round && decision.action == spec.id)
+        else {
+            continue;
+        };
+
+        let mut satisfied = true;
+        let mut unresolved = false;
+        for gate in &spec.requires {
+            if gate.question == *shadow_question {
+                if !gate_holds(gate, shadow_answer) {
+                    satisfied = false;
+                }
+                continue;
+            }
+            match latest_answer(state, &gate.question) {
+                None => {
+                    unresolved = true;
+                    satisfied = false;
+                }
+                Some(node) => {
+                    let answer = node
+                        .judgment()
+                        .expect("有记录的节点必有答案")
+                        .answer
+                        .clone();
+                    if !gate_holds(gate, &answer) {
+                        satisfied = false;
+                    }
+                }
+            }
+        }
+
+        let hypothetical = if unresolved {
+            DecisionOutcome::Unresolved
+        } else if satisfied {
+            DecisionOutcome::Executed
+        } else {
+            DecisionOutcome::GateUnsatisfied
+        };
+        if hypothetical == actual.outcome {
+            continue;
+        }
+        changes.push(BranchChange {
+            action: spec.id.clone(),
+            actual: actual.outcome,
+            hypothetical,
+            toward_justified: hypothetical == DecisionOutcome::Executed
+                && task.justified_at_round(round, &spec.id),
+            detail: format!(
+                "第 {round} 轮：实际 {:?} → 若采纳影子判断 {:?}（门取影子答案，其余前提取手上答案；Executed 不含发出前的前提复核）",
+                actual.outcome, hypothetical
+            ),
+        });
+    }
+    changes
 }
 
 /// 决定这一轮的行动。
@@ -929,9 +1253,54 @@ fn decide(
             decision.cost_units = 0.0;
         }
 
+        // 观察类动作的产出：真的发出之后，它带来的证据进证据日志（计费动作的副作用）。
+        if decision.outcome == DecisionOutcome::Executed {
+            apply_action_effect(task, round, state, trace, spec)?;
+        }
+
         trace.decisions.push(decision);
     }
 
+    Ok(())
+}
+
+/// 执行一个观察类动作的产出：把它的证据追加进证据日志，并记下它引起的失效传播。
+///
+/// 产出进 `trace.steps`——它是这一轮真实发生的变化，与脚本扰动同一种记录（`when` 记
+/// [`StepWhen::AfterAsk`]：它发生在提问之后，下一轮才看得到）。
+fn apply_action_effect(
+    task: &FamilyTask,
+    round: usize,
+    state: &mut SemanticState,
+    trace: &mut TaskTrace,
+    spec: &ActionSpec,
+) -> Result<(), Error> {
+    let Some(effect) = &spec.effect else {
+        return Ok(());
+    };
+    let at_unix_ms = unix_ms();
+    let (_, invalidation) = state.append_evidence(NewEvidence {
+        source: effect.source.clone(),
+        at_unix_ms,
+        object: effect.object.clone(),
+        version: effect.version,
+        content: effect.content.clone(),
+    })?;
+    trace.steps.push(StepEffect {
+        round,
+        when: StepWhen::AfterAsk,
+        phase: task.decision_phase(round),
+        at_unix_ms,
+        note: format!("动作 `{}` 的产出：{}", spec.id, effect.note),
+        change: Change::Append {
+            source: effect.source.clone(),
+            at_unix_ms,
+            object: effect.object.clone(),
+            version: effect.version,
+            content: effect.content.clone(),
+        },
+        invalidation,
+    });
     Ok(())
 }
 
@@ -1079,6 +1448,7 @@ mod tests {
             arm,
             run: name.to_owned(),
             endpoint: None,
+            shadow: None,
             calls: &mut calls,
         };
         run_task(

@@ -29,8 +29,8 @@ use super::derived_confidence;
 
 /// 规则表版本；改规则表必须改这里。
 ///
-/// `rules-v2`：补上任务族 A（M1 固定问题集）的四道题，v1 只覆盖 M0 初始任务集。
-pub const VERSION: &str = "rules-v2";
+/// `rules-v3`：补上任务族 B（成对场景）的三道门控问题，v2 覆盖任务族 A 与 M0 初始任务集。
+pub const VERSION: &str = "rules-v3";
 
 /// 命中规则时给该标签的名义概率质量，其余标签均分剩下的质量。
 ///
@@ -209,6 +209,53 @@ pub const RULES: &[Rule] = &[
         question: "deliverable_ready",
         markers: &[],
         verdict: Verdict::Noul(0.1),
+    },
+    // 任务族 B（成对场景）：读到关键证据对象时按决定性标记作答；读不到时落到 `other`
+    // ——那正是「材料不足」的正确读法（判据写在问题定义的 other 选项里）。
+    Rule {
+        question: "b_pair_cause_p1",
+        markers: &["credential.audit", "证书窗口已过期"],
+        verdict: Verdict::Choice("expired_credential"),
+    },
+    Rule {
+        question: "b_pair_cause_p1",
+        markers: &["credential.audit", "系统时钟偏差超窗"],
+        verdict: Verdict::Choice("clock_skew"),
+    },
+    Rule {
+        question: "b_pair_cause_p1",
+        markers: &[],
+        verdict: Verdict::Choice("other"),
+    },
+    Rule {
+        question: "b_pair_cause_p2",
+        markers: &["upstream.audit", "上游返回 429"],
+        verdict: Verdict::Choice("upstream_throttle"),
+    },
+    Rule {
+        question: "b_pair_cause_p2",
+        markers: &["upstream.audit", "客户端重试次数远超上限"],
+        verdict: Verdict::Choice("retry_storm"),
+    },
+    Rule {
+        question: "b_pair_cause_p2",
+        markers: &[],
+        verdict: Verdict::Choice("other"),
+    },
+    Rule {
+        question: "b_pair_cause_p3",
+        markers: &["dns.audit", "权威应答 NXDOMAIN"],
+        verdict: Verdict::Choice("authority_missing"),
+    },
+    Rule {
+        question: "b_pair_cause_p3",
+        markers: &["dns.audit", "丢包 100%"],
+        verdict: Verdict::Choice("network_partition"),
+    },
+    Rule {
+        question: "b_pair_cause_p3",
+        markers: &[],
+        verdict: Verdict::Choice("other"),
     },
 ];
 
