@@ -1,0 +1,3 @@
+# 本地参考资料：放置在此的第三方代码库（如 reference/grok-build，约 144MB）
+# 仅供查阅，不入 git 历史。相关决策见 AGENTS.md「项目决策」一节。
+/reference/
