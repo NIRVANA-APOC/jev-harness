@@ -1,0 +1,17 @@
+[package]
+name = "jh-tui"
+version = "0.1.0"
+edition = "2024"
+description = "jev-harness 的终端 UI 组件套件（Grok 风格，单 crate，按需渲染）"
+publish = false
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+textwrap = { workspace = true }
+
+# 只为 examples/demo.rs 的信号触发展示（SIGINT/SIGTERM/SIGHUP → 终端恢复）；库本身不依赖 tokio。
+[dev-dependencies]
+tokio = { workspace = true }
