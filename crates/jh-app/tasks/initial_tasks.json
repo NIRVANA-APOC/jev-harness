@@ -1,0 +1,96 @@
+{
+  "name": "initial",
+  "questions": {
+    "failure_kind": {
+      "version": 1,
+      "question": {
+        "type": "choice",
+        "instructions": "根据 state 的 log 记录，这次失败最接近哪一类原因？只依据记录里写下的事实，不推测没有被记录的原因。",
+        "criteria": {
+          "cache_stale": "取消或回滚确认之后，仍有同一任务的写入，或读取命中了过期值",
+          "tool_timeout": "工具调用在预算内没有返回结果",
+          "spec_mismatch": "实现与验收标准不一致",
+          "other": "以上都不像，或日志不足以归因"
+        }
+      }
+    },
+    "evidence_strength": {
+      "version": 1,
+      "question": {
+        "type": "score",
+        "instructions": "现有 log 对上面这个判断的支持强度如何？按证据条数与独立性判断。",
+        "criteria": [
+          "无直接证据",
+          "弱：只有一条间接记录",
+          "中：两条记录指向同一原因但可能同源",
+          "强：记录直接给出时间顺序与因果"
+        ]
+      }
+    },
+    "needs_new_observation": {
+      "version": 1,
+      "question": {
+        "type": "noul",
+        "instructions": "在现有 log 之外，是否必须新增观测（新日志或新工具调用）才能确诊？",
+        "criteria": {
+          "false": "现有 log 已经足够确诊，不需要新增观测",
+          "true": "现有 log 缺少决定性记录，必须先补观测"
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "case-001-cancel-then-write",
+      "notes": "取消确认之后仍有同一任务的缓存写入：日志直接给出时间顺序与因果，真值可由日志独立复核。",
+      "state": {
+        "task": "任务 A：取消一个已确认的部署，并确认该任务的缓存不再写入。",
+        "log": "09:00:01 取消确认落库：任务 A 标记为已取消\n09:00:05 任务 A 的缓存写入队列仍然写入 key=deploy:A\n09:00:06 读取 key=deploy:A 命中刚刚写入的值"
+      },
+      "truth": {
+        "failure_kind": { "type": "choice", "label": "cache_stale" },
+        "evidence_strength": { "type": "score", "level": 3 },
+        "needs_new_observation": { "type": "noul", "yes": false }
+      }
+    },
+    {
+      "id": "case-002-tool-timeout",
+      "notes": "工具调用超时：日志给出预算与超时事实，但没有返回内容；归因已足够。",
+      "state": {
+        "task": "任务 B：调用部署状态工具，按返回结果更新任务状态。",
+        "log": "09:10:00 调用工具 deploy_status(task=B)\n09:10:30 工具调用超时：30s 预算内没有返回\n09:10:31 本次调用没有写入任何缓存"
+      },
+      "truth": {
+        "failure_kind": { "type": "choice", "label": "tool_timeout" },
+        "evidence_strength": { "type": "score", "level": 2 },
+        "needs_new_observation": { "type": "noul", "yes": false }
+      }
+    },
+    {
+      "id": "case-003-spec-mismatch",
+      "notes": "实现与验收标准不一致，但日志没有记录标准是否被改过：归因不足，需要新观测。",
+      "state": {
+        "task": "任务 C：按验收标准生成部署清单。",
+        "log": "09:20:00 生成清单，字段为 name 与 region\n09:20:01 验收标准要求字段 name、region 与 replicas\n09:20:02 校验失败：清单缺少 replicas 字段\n09:20:03 未记录验收标准是否被修改过"
+      },
+      "truth": {
+        "failure_kind": { "type": "choice", "label": "spec_mismatch" },
+        "evidence_strength": { "type": "score", "level": 2 },
+        "needs_new_observation": { "type": "noul", "yes": true }
+      }
+    },
+    {
+      "id": "case-004-truncated-log",
+      "notes": "日志被截断、只留两行：不足以归因，真值是 other 且需要新观测。",
+      "state": {
+        "task": "任务 D：继续上一轮未完成的任务，日志只保留最后两行。",
+        "log": "09:30:00 任务 D 开始\n09:30:01 任务 D 中止，原因未记录"
+      },
+      "truth": {
+        "failure_kind": { "type": "choice", "label": "other" },
+        "evidence_strength": { "type": "score", "level": 0 },
+        "needs_new_observation": { "type": "noul", "yes": true }
+      }
+    }
+  ]
+}

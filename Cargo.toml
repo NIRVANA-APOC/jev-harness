@@ -4,6 +4,10 @@ resolver = "2"
 
 # 版本只写当前 crates.io 稳定版的 major.minor，patch 由 Cargo.lock 锁定（见 docs/roadmap-1.0.md §2）。
 [workspace.dependencies]
+# workspace 内部 crate：一律走 path 引用，各 crate 用 `dep = { workspace = true }` 取用（同版本策略）。
+jh-core = { path = "crates/jh-core" }
+jh-jev = { path = "crates/jh-jev" }
+jh-openai = { path = "crates/jh-openai" }
 tokio = { version = "1.53", features = [
     "rt-multi-thread",
     "macros",
