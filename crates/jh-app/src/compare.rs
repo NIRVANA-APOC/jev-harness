@@ -103,8 +103,11 @@ pub struct CompareReport {
     pub arms: Vec<ArmReport>,
     /// 臂配对读数（每条只在同一口径内比较）。
     pub pairings: Vec<PairingReading>,
-    /// 本次运行相关的非保密环境（模型与端点；key 只记「是否设置」）。
-    pub judge_environment: JudgeEnvironment,
+    /// **写这份报告时**的非保密环境（模型与端点；key 只记「是否设置」）。
+    ///
+    /// 重建报告时它反映重建时刻的 shell，不是那次运行的环境——真实运行的模型与端点以轨迹为准
+    /// （每条判断的 `version` 有模型，`TaskTrace::judge_endpoint` 有端点）。
+    pub report_environment: ReportEnvironment,
     /// 轨迹目录（绝对路径）。
     pub traces_dir: String,
     /// 证据日志目录（绝对路径）。
@@ -115,12 +118,19 @@ pub struct CompareReport {
     pub notes: Vec<String>,
 }
 
-/// 本次运行相关的非保密环境。
+/// **写这份报告时**的非保密环境。
 ///
 /// 只记模型标识与端点（复现时要用的那两样），以及 **key 是否设置**——key 的值任何情况下都不写进
 /// 报告、日志或轨迹（`docs/roadmap-1.0.md` §9 风险表：key 只经环境变量）。
+///
+/// [`ReportEnvironment::recorded_at`] 标出这份取值是**什么样**的：`run` 表示报告与调用同进程产出
+/// （取值就是那次运行的环境），`regenerate` 表示报告是从轨迹重建的（取值只是重建时刻的 shell）。
+/// 那次运行真正用到的模型与端点在轨迹里：每条判断的 `version` 是模型，`TaskTrace::judge_endpoint`
+/// 是端点（新代码产出的轨迹才有这个字段）。
 #[derive(Debug, Clone, Serialize)]
-pub struct JudgeEnvironment {
+pub struct ReportEnvironment {
+    /// 这份环境取值的来源：`run`（与调用同进程）或 `regenerate`（重建报告时的 shell）。
+    pub recorded_at: String,
     /// `OPENAI_MODEL`（LLM 判定器的模型、必填）。
     pub openai_model: Option<String>,
     /// `OPENAI_BASE_URL`（LLM 端点、必填）。
@@ -432,6 +442,20 @@ pub struct TaskSummary {
     pub evidence: String,
 }
 
+/// 真实通道的端点（不含 key）：优先取环境变量覆盖，其次取通道的官方缺省；本地判定器给 `None`。
+fn endpoint_for(name: JudgeName) -> Option<String> {
+    let from_env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+    match name {
+        JudgeName::Llm => {
+            from_env("OPENAI_BASE_URL").or_else(|| Some(jh_openai::BASE_URL.to_owned()))
+        }
+        JudgeName::Jev => {
+            from_env("TYPESAFE_BASE_URL").or_else(|| Some(jh_jev::DEFAULT_BASE_URL.to_owned()))
+        }
+        JudgeName::Rule | JudgeName::Replay | JudgeName::SimulatedTruth => None,
+    }
+}
+
 /// 跑四组臂 × 全部任务，汇出报告。
 pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOutcome, Error> {
     let tasks: Vec<&FamilyTask> = match options.max_tasks {
@@ -465,6 +489,7 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
 
         for arm in &options.arms {
             let mut accumulator = Accumulator::new(*name, *arm);
+            let endpoint = endpoint_for(*name);
             for task in &tasks {
                 let stem = format!("{}-{}-{}", name.cli_name(), arm.label(), task.id);
                 let evidence_path = evidence_dir.join(format!("{stem}.jsonl"));
@@ -475,6 +500,7 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
                     channel: *name,
                     arm: *arm,
                     run: options.run.clone(),
+                    endpoint: endpoint.clone(),
                     calls: &mut calls,
                 };
                 let trace = run_task(&mut context, task, &evidence_path).await?;
@@ -514,7 +540,7 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
             metric_definitions: CompareMetricDefinitions::declared(),
             arms: reports,
             pairings,
-            judge_environment: judge_environment(),
+            report_environment: report_environment("run"),
             traces_dir: absolute(&traces_dir),
             evidence_dir: absolute(&evidence_dir),
             calls_log: absolute(&options.calls_path),
@@ -524,11 +550,12 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
     })
 }
 
-/// 本次运行相关的非保密环境。
-pub fn judge_environment() -> JudgeEnvironment {
+/// 写报告时的非保密环境；`recorded_at` 标出来源（`run` / `regenerate`）。
+pub fn report_environment(recorded_at: &str) -> ReportEnvironment {
     let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     let value = |name: &str| std::env::var(name).ok().filter(|text| !text.is_empty());
-    JudgeEnvironment {
+    ReportEnvironment {
+        recorded_at: recorded_at.to_owned(),
         openai_model: value("OPENAI_MODEL"),
         openai_base_url: value("OPENAI_BASE_URL"),
         openai_api_key_set: set("OPENAI_API_KEY"),
@@ -543,7 +570,7 @@ pub fn judge_environment() -> JudgeEnvironment {
 /// 只带上与所选判定器相关的变量：跑 `rule` / `replay` 时不该出现模型或端点，免得把命令写成
 /// 「看起来要联网」。
 pub fn reproduction_command(argv: &[String], judges: &[JudgeName]) -> String {
-    let environment = judge_environment();
+    let environment = report_environment("command");
     let mut prefix: Vec<String> = Vec::new();
     let mut push = |name: &str, shown: &str| prefix.push(format!("{name}={shown}"));
 
@@ -620,14 +647,31 @@ fn pairings(arms: &[ArmReport]) -> Vec<PairingReading> {
             ) else {
                 continue;
             };
+            let (left_reading, right_reading) = (reading(left), reading(right));
+            // 这句按本组读数现场生成，不写死数字：两组之间「要不要复算」既可能只体现在成本上，
+            // 也可能改变循环看得到什么（没有失效传播时，每轮全量重看相当于把丢失的重查触发补回来）。
+            let note = format!(
+                "同一 H1 开关内比较重算口径：两边用同一条输入投影规则，差异只能归因于「要不要复算」。本组：调用 {} vs {}、输入 {} 字节 vs {} 字节、判断节点 {} vs {}、验收 {} vs {}、恢复 {} vs {}、旧依据承诺 {} vs {}——全量重算每轮把全部问题重看一遍，因此该差异可能只体现在成本上（复算量与输入量），也可能改变循环看得到什么（没有失效传播时把「输入变了要重查」的触发补回来）。",
+                left_reading.calls,
+                right_reading.calls,
+                left_reading.input_bytes,
+                right_reading.input_bytes,
+                left_reading.judged_nodes,
+                right_reading.judged_nodes,
+                left_reading.acceptance,
+                right_reading.acceptance,
+                left_reading.recovered,
+                right_reading.recovered,
+                left_reading.stale_basis_commitments,
+                right_reading.stale_basis_commitments,
+            );
             pairings.push(PairingReading {
                 dimension: "h2".to_owned(),
                 fixed: format!("h1={}", if propagation { "on" } else { "off" }),
                 judge: judge.clone(),
-                left: reading(left),
-                right: reading(right),
-                note: "同一 H1 开关内比较重算口径：两边用同一条输入投影规则，差异只能归因于「要不要复算」；质量读数由判定器决定，成本读数由调度决定。"
-                    .to_owned(),
+                left: left_reading,
+                right: right_reading,
+                note,
             });
         }
     }
@@ -645,7 +689,7 @@ fn declared_notes() -> Vec<String> {
             .to_owned(),
         "判断失败如实计入失败数并写进调用记录（不丢弃、不静默重试）；失败的问题是「没答上来的问题」，下一轮按同一调度规则再请求。"
             .to_owned(),
-        "轨迹与证据日志逐任务落盘，报告里的 traces_dir / evidence_dir / calls_log 是绝对路径；command 字段带本次运行的非保密环境前缀，judge_environment 记模型与端点（key 只记是否设置）。"
+        "轨迹与证据日志逐任务落盘，报告里的 traces_dir / evidence_dir / calls_log 是绝对路径；command 字段带本报告用到判定器的非保密环境前缀，report_environment 记**写报告时**的模型与端点（`recorded_at` 标出是 `run` 还是 `regenerate`，key 只记是否设置）——运行时打到的模型与端点看轨迹（每条判断的 version 与 judge_endpoint）。"
             .to_owned(),
         "结论按 `pairings` 里的配对读：h1 配对固定 H2 口径、h2 配对固定 H1 开关。跨配对读会把交互作用当成主效应——例如「关掉失效传播就恢复不了」只可能在某个重算口径下成立，换口径要重新看那一组配对。"
             .to_owned(),
@@ -716,6 +760,7 @@ pub async fn run_single(
         channel: name,
         arm,
         run: run.to_owned(),
+        endpoint: endpoint_for(name),
         calls: &mut calls,
     };
     run_task(&mut context, task, &evidence_path).await
@@ -1336,12 +1381,13 @@ impl CompareReport {
             ));
         }
         lines.push(format!(
-            "环境：OPENAI_MODEL={}｜OPENAI_BASE_URL={}｜OPENAI_API_KEY={}｜TYPESAFE_API_KEY={}｜Jev pin={}",
-            self.judge_environment.openai_model.as_deref().unwrap_or("—"),
-            self.judge_environment.openai_base_url.as_deref().unwrap_or("—"),
-            if self.judge_environment.openai_api_key_set { "已设置" } else { "未设置" },
-            if self.judge_environment.typesafe_api_key_set { "已设置" } else { "未设置" },
-            self.judge_environment.jev_model,
+            "写报告时的环境（recorded_at={}）：OPENAI_MODEL={}｜OPENAI_BASE_URL={}｜OPENAI_API_KEY={}｜TYPESAFE_API_KEY={}｜Jev pin={}",
+            self.report_environment.recorded_at,
+            self.report_environment.openai_model.as_deref().unwrap_or("—"),
+            self.report_environment.openai_base_url.as_deref().unwrap_or("—"),
+            if self.report_environment.openai_api_key_set { "已设置" } else { "未设置" },
+            if self.report_environment.typesafe_api_key_set { "已设置" } else { "未设置" },
+            self.report_environment.jev_model,
         ));
         lines.push(format!("轨迹：{}", self.traces_dir));
         lines.push(format!("证据：{}", self.evidence_dir));
@@ -1438,14 +1484,14 @@ pub fn regenerate(family: &FamilyA, options: &RegenerateOptions) -> Result<Compa
             metric_definitions: CompareMetricDefinitions::declared(),
             arms: reports,
             pairings,
-            judge_environment: judge_environment(),
+            report_environment: report_environment("regenerate"),
             traces_dir: absolute(&traces_dir),
             evidence_dir: absolute(&evidence_dir),
             calls_log: absolute(&options.calls_path),
             notes: {
                 let mut notes = declared_notes();
                 notes.push(format!(
-                    "本报告由 `compare --regenerate` 从 {} 里的轨迹重建（判定器一次都没调用）：读数与那次运行的调用记录一一对应，notes 与字段取当前代码。",
+                    "本报告由 `compare --regenerate` 从 {} 里的轨迹重建（判定器一次都没调用）：读数与那次运行的调用记录一一对应，notes 与字段取当前代码；`report_environment.recorded_at = regenerate` 说明它的取值只是**重建时刻**的 shell 环境，那次运行真正用的模型与端点看轨迹（每条判断的 version 是模型，judge_endpoint 是端点；早期轨迹没有 judge_endpoint 字段时会为空）。",
                     absolute(&traces_dir)
                 ));
                 notes

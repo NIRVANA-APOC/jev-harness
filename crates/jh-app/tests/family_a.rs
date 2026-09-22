@@ -348,6 +348,7 @@ async fn a_failing_judge_lands_in_the_call_log_and_the_node_evaluation() {
             channel: JudgeName::Jev,
             arm: Arm::ALL[0],
             run: "run-failure".to_owned(),
+            endpoint: Some("https://example.invalid".to_owned()),
             calls: &mut calls,
         };
         run_task(&mut context, task, &dir.join("evidence.jsonl"))
@@ -402,7 +403,10 @@ async fn a_failing_judge_lands_in_the_call_log_and_the_node_evaluation() {
     );
 }
 
-/// 迟到结果的落记录时机：一轮里的每条判断看到的是同一份输入快照，提问后扰动一起把它们标成过期。
+/// 迟到结果的落记录时机（语义版）：一轮里的每条判断看到的是同一份输入快照。
+///
+/// 注意：A4 第 0 轮只有一个读取组，所以「发完这一组 → 注入扰动 → 落记录」的旧实现同样会绿——
+/// 判别这处修复的是 [`a_late_perturbation_does_not_leak_into_later_request_groups`]。
 #[tokio::test]
 async fn a_late_perturbation_marks_every_judgment_of_the_round() {
     let family = FamilyA::load().expect("内嵌任务族 A 应自洽");
@@ -447,4 +451,77 @@ async fn a_late_perturbation_marks_every_judgment_of_the_round() {
             .iter()
             .all(|judgment| judgment.phase < drift.phase)
     );
+}
+
+/// 迟到结果的落记录时机（判别版）：一轮里有多个读取组时，提问后扰动不得漏进后面的组。
+///
+/// 全量臂下 A5 第 1 轮会把两个读取组（`app.log`+`config`、`runtime.metrics`+`config`）都问一遍，
+/// 撤回提在两组之间注入。修复前的实现是「发一组 → 注入 → 落记录」，第二组因此是在扰动之后才装配与
+/// 记录的（它的 ask/judgment 相位等于扰动相位）；修复后两组共用同一个提问相位，材料都取扰动前版本。
+/// 本测试在 `e337f8e` 之前的代码上会失败（第二组相位 = 扰动相位）。
+#[tokio::test]
+async fn a_late_perturbation_does_not_leak_into_later_request_groups() {
+    let family = FamilyA::load().expect("内嵌任务族 A 应自洽");
+    let task = family.task("A5").expect("A5 是撤回证据那条");
+    let dir = TempDir::new("family-a-late-groups");
+
+    let trace = compare::run_single(
+        &family,
+        task,
+        JudgeName::Rule,
+        Arm::ALL[2], // 全量臂：这一轮会把全部跟踪问题重问一遍（两个读取组）
+        "run-late-groups",
+        &dir.join("calls.jsonl"),
+        dir.path(),
+    )
+    .await
+    .expect("离线单任务运行应能跑完");
+
+    let retraction = trace
+        .steps
+        .iter()
+        .find(|step| step.when == StepWhen::AfterAsk && step.change.object().as_str() == "app.log")
+        .expect("A5 有撤回扰动");
+    let round = retraction.round;
+    let ask_phase = task.ask_phase(round);
+
+    let asks: Vec<&jh_app::matching::AskTrace> =
+        trace.asks.iter().filter(|ask| ask.round == round).collect();
+    assert!(
+        asks.len() >= 2,
+        "全量臂这一轮应当有多个读取组：{:?}",
+        asks.iter().map(|ask| ask.scope.clone()).collect::<Vec<_>>()
+    );
+    for ask in &asks {
+        assert_eq!(
+            ask.phase, ask_phase,
+            "本轮每组请求都应当在同一个提问相位发出：{:?}",
+            ask.scope
+        );
+        assert!(
+            ask.phase < retraction.phase,
+            "提问必须早于提问后的扰动：{:?}",
+            ask.scope
+        );
+    }
+
+    // 第二个读取组（runtime.metrics）的判断同样落在提问相位上——旧实现下它会等于扰动相位。
+    let metrics = jh_core::QuestionId::from("metrics_within_baseline");
+    let late = trace
+        .judgments
+        .iter()
+        .find(|judgment| judgment.round == round && judgment.question == metrics)
+        .expect("全量臂这一轮会问指标一问");
+    assert_eq!(late.phase, ask_phase);
+    assert!(late.phase < retraction.phase);
+
+    // 撤回只波及读了 app.log 的那一组：它落成待重查，指标一问不受影响。
+    let cause = jh_core::QuestionId::from("cause_primary");
+    let touched = trace
+        .judgments
+        .iter()
+        .find(|judgment| judgment.round == round && judgment.question == cause)
+        .expect("全量臂这一轮会问原因一问");
+    assert!(touched.drift, "读了被撤回对象的判断要落成待重查");
+    assert!(!late.drift, "读别的对象的判断不受这次撤回影响");
 }

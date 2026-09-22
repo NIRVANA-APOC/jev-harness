@@ -299,6 +299,11 @@ pub struct TaskTrace {
     pub arm: String,
     /// 任务标识。
     pub task: String,
+    /// 真实通道的端点（运行当时由调用方给出，不含 key）；本地判定器为空。
+    ///
+    /// 早期轨迹没有这个字段：按 `None` 读。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_endpoint: Option<String>,
     /// 轮数。
     pub rounds: usize,
     /// 本次任务运行的开始时刻，Unix 毫秒（恢复延迟在「没有可起算的破坏性事件」时的起点）。
@@ -362,6 +367,11 @@ pub struct LoopContext<'a> {
     pub arm: Arm,
     /// 运行标识。
     pub run: String,
+    /// 真实通道的端点（由调用方从环境变量给出，不含 key）；本地判定器为 `None`。
+    ///
+    /// 写进轨迹，让「这次真实调用打到了哪个端点」有运行时的原始记录，而不是只能从写报告时的
+    /// shell 环境去猜。
+    pub endpoint: Option<String>,
     /// 调用记录（JSONL，追加）。
     pub calls: &'a mut CallLog,
 }
@@ -384,6 +394,7 @@ pub async fn run_task(
         channel: context.channel.cli_name().to_owned(),
         arm: context.arm.label().to_owned(),
         task: task.id.clone(),
+        judge_endpoint: context.endpoint.clone(),
         rounds: task.rounds,
         started_at_unix_ms: unix_ms(),
         asks: Vec::new(),
@@ -1067,6 +1078,7 @@ mod tests {
             channel: JudgeName::Rule,
             arm,
             run: name.to_owned(),
+            endpoint: None,
             calls: &mut calls,
         };
         run_task(
