@@ -28,7 +28,9 @@ use jh_core::{
 use super::derived_confidence;
 
 /// 规则表版本；改规则表必须改这里。
-pub const VERSION: &str = "rules-v1";
+///
+/// `rules-v2`：补上任务族 A（M1 固定问题集）的四道题，v1 只覆盖 M0 初始任务集。
+pub const VERSION: &str = "rules-v2";
 
 /// 命中规则时给该标签的名义概率质量，其余标签均分剩下的质量。
 ///
@@ -117,6 +119,96 @@ pub const RULES: &[Rule] = &[
         question: "needs_new_observation",
         markers: &[],
         verdict: Verdict::Noul(0.9),
+    },
+    // 任务族 A（M1 固定问题集）：同样「首个命中生效」，因此把更具体的标记排在前面。
+    // `cause_primary`
+    Rule {
+        question: "cause_primary",
+        markers: &["候选集之外"],
+        verdict: Verdict::Choice("other"),
+    },
+    Rule {
+        question: "cause_primary",
+        markers: &["写入已被回滚"],
+        verdict: Verdict::Choice("other"),
+    },
+    Rule {
+        question: "cause_primary",
+        markers: &["取消确认落库", "缓存写入"],
+        verdict: Verdict::Choice("write_after_cancel"),
+    },
+    Rule {
+        question: "cause_primary",
+        markers: &["配置在故障窗口内被替换"],
+        verdict: Verdict::Choice("config_drift"),
+    },
+    Rule {
+        question: "cause_primary",
+        markers: &["连接池耗尽"],
+        verdict: Verdict::Choice("resource_exhaustion"),
+    },
+    Rule {
+        question: "cause_primary",
+        markers: &[],
+        verdict: Verdict::Choice("other"),
+    },
+    // `premise_holds`：「原因已确认、补救仍适用」才给高值；被推翻或查不出原因时给低值。
+    Rule {
+        question: "premise_holds",
+        markers: &["写入已被回滚"],
+        verdict: Verdict::Noul(0.1),
+    },
+    Rule {
+        question: "premise_holds",
+        markers: &["候选集之外"],
+        verdict: Verdict::Noul(0.9),
+    },
+    Rule {
+        question: "premise_holds",
+        markers: &["连接池耗尽"],
+        verdict: Verdict::Noul(0.9),
+    },
+    Rule {
+        question: "premise_holds",
+        markers: &["配置在故障窗口内被替换"],
+        verdict: Verdict::Noul(0.9),
+    },
+    Rule {
+        question: "premise_holds",
+        markers: &["取消确认落库", "缓存写入"],
+        verdict: Verdict::Noul(0.9),
+    },
+    Rule {
+        question: "premise_holds",
+        markers: &[],
+        verdict: Verdict::Noul(0.2),
+    },
+    // `metrics_within_baseline`
+    Rule {
+        question: "metrics_within_baseline",
+        markers: &["p99 超阈值"],
+        verdict: Verdict::Noul(0.1),
+    },
+    Rule {
+        question: "metrics_within_baseline",
+        markers: &["指标正常"],
+        verdict: Verdict::Noul(0.9),
+    },
+    Rule {
+        question: "metrics_within_baseline",
+        markers: &[],
+        verdict: Verdict::Noul(0.9),
+    },
+    // `deliverable_ready`
+    Rule {
+        question: "deliverable_ready",
+        markers: &["交付物已产出"],
+        verdict: Verdict::Noul(0.9),
+    },
+    Rule {
+        question: "deliverable_ready",
+        markers: &[],
+        verdict: Verdict::Noul(0.1),
     },
 ];
 
