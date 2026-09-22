@@ -42,8 +42,9 @@ impl fmt::Display for QuestionId {
 /// 问题定义的版本号。
 ///
 /// 同一个 ID 的问题一旦改变含义就必须升版本：判断记录绑定「ID + 版本」，这样旧记录不会被改写后的
-/// 问题解释错（`docs/RESEARCH_GOALS.md` §5.2）。版本号规则未定（`docs/roadmap-1.0.md` §12 未确定项 5），
-/// 1.0 用单调递增的整数。
+/// 问题解释错（`docs/RESEARCH_GOALS.md` §5.2）。版本号规则已定（M18；`docs/roadmap-1.0.md` §12
+/// 未确定项 5 的落点，待文档回写）：每个 ID 各自从 1 开始的单调递增整数，由问题库分配
+/// （[`QuestionLibrary`](crate::QuestionLibrary)）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct QuestionVersion(pub u32);

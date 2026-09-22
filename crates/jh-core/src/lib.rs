@@ -32,13 +32,27 @@
 //! - [`SemanticState`]：判断节点、[`EvaluationStatus`] 与 [`Validity`] 两个维度、失效传播，以及行动
 //!   发出前的前提复核（[`SemanticState::check_action`]）。
 //!
+//! # 反例与问题库
+//!
+//! 研究目标 §6 那条慢回路由两组对象承载：
+//!
+//! - [`Counterexample`] / [`CounterexampleLog`]：失败的原始现场（失败来源、当时的证据、问题版本、
+//!   候选动作、控制规则），以及 §6.1 四类候选归因；只记录，不自动判定归因；
+//! - [`QuestionLibrary`]：新问题的最小契约（§6.3 八字段；证据需求在 1.0 只表达来源与字段）、
+//!   生命周期（候选 → 影子评估 → 启用 → 停用 / 被替代）与版本号规则（见 [`QuestionLibrary`] 的模块
+//!   文档）；改当前定义的 [adopt](QuestionLibrary::adopt) / [publish](QuestionLibrary::publish) /
+//!   [retire](QuestionLibrary::retire) 都直接联动 [`SemanticState::invalidate_question`]，
+//!   旧版本一律保留，可比较、可回退。
+//!
 //! # 本 crate 刻意不做的事
 //!
 //! - 不依赖 `jh-jev` / `jh-openai`：对象模型不绑死在某个判断器上，通道 wire 类型在适配层转换；
 //! - 不重试、不降级、不缓存、不判阈值：阈值折成行动是消费方的事，本 crate 只保存原值与所用阈值；
+//! - 不判定反例归因、不判晋升标准：反例只记 §6.1 的四类可能，晋升阈值属于实验层；
 //! - 不发动作、不回滚副作用：[`SemanticState`] 只回答「现在能不能发」，怎么发、发完怎么补偿由
 //!   `jh-app` 决定；
-//! - 不读时钟、不生成版本号：证据的时间与对象版本由调用方给出；
+//! - 不读时钟：证据与反例的时间、对象版本由调用方给出；问题库的版本号由库按定案规则分配
+//!   （见 [`QuestionLibrary`]）；
 //! - 判断记录的落盘形态仍由 `jh-app` 决定（`var/calls.jsonl`，`docs/roadmap-1.0.md` §12 未确定项 2）；
 //! - 不引入异步运行时：判断器接口返回装箱 future，由调用方自己的 executor 驱动。
 //!
@@ -86,11 +100,13 @@
 #![warn(missing_docs)]
 
 mod answer;
+mod counterexample;
 mod error;
 mod evidence;
 mod graph;
 mod hash;
 mod judge;
+mod library;
 mod projection;
 mod question;
 mod record;
@@ -98,6 +114,10 @@ mod runtime;
 mod state;
 
 pub use answer::{Answer, ChoiceAnswer, NoulAnswer, ScoreAnswer, Usage};
+pub use counterexample::{
+    Attribution, Counterexample, CounterexampleId, CounterexampleLog, FailureSource,
+    JsonlCounterexampleLog, MemoryCounterexampleLog, NewCounterexample,
+};
 pub use error::Error;
 pub use evidence::{
     Evidence, EvidenceId, EvidenceLog, JsonlEvidenceLog, LogRow, MemoryEvidenceLog, NewEvidence,
@@ -109,6 +129,10 @@ pub use graph::{
 };
 pub use hash::ContentHash;
 pub use judge::{Judge, JudgeRequest, JudgeResponse};
+pub use library::{
+    Lifecycle, LifecycleRecord, NewQuestion, QuestionEntry, QuestionLibrary, ValidationKind,
+    ValidationRecord,
+};
 pub use projection::{
     Drift, FieldSelection, InputProjection, ObjectRead, SnapshotCheck, verify_snapshot,
 };
