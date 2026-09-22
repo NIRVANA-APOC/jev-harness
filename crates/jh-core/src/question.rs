@@ -5,6 +5,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::Error;
+
 /// 问题的稳定标识。
 ///
 /// 用于把请求与答案对回来、并作为判断记录的键；不发送给模型、不参与判定。
@@ -69,6 +71,115 @@ pub struct QuestionSpec {
 /// 一个请求放 1 个还是 N 个问题由调用方决定——「一次多问」与「逐问」用的是同一个接口
 /// （`docs/roadmap-1.0.md` §3.2）。
 pub type Questions = BTreeMap<QuestionId, QuestionSpec>;
+
+/// 同一 ID 两个版本之间的关系。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionComparison {
+    /// 含义未变：同一个定义被重复登记。
+    Same,
+    /// 含义已变：按新版本使用，旧版本与绑在旧版本上的判断都不被改写。
+    Changed,
+}
+
+/// 问题版本表：同一 ID 的历次定义各占一个版本，旧版本不会被覆盖。
+///
+/// 研究目标 §5.2：「问题定义及版本；同一 ID 的问题改变含义时，必须产生新版本。」这里的规则是：
+///
+/// - [`QuestionRegistry::register`] 只能补充新版本；同一 ID + 同一版本上想换成别的含义会被显式
+///   拒绝（[`Error::QuestionVersionConflict`]），改含义必须走 [`QuestionRegistry::revise`]；
+/// - 重复登记完全相同的定义是幂等的，方便回放；
+/// - 版本号是单调递增整数（[`QuestionVersion`]），`revise` 取当前最大版本 +1。
+///
+/// 与失效的联动——问题升版之后旧判断怎么处理——属于 M2 的问题集合精化流程
+/// （`docs/roadmap-1.0.md` §5 M2），不在本模块：这里只保证版本本身不被覆盖、可查可比较。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QuestionRegistry {
+    versions: BTreeMap<QuestionId, BTreeMap<QuestionVersion, Question>>,
+}
+
+impl QuestionRegistry {
+    /// 登记一个带版本的问题定义。
+    ///
+    /// 返回显式错误只有一种情况：该 ID + 该版本上已经记着含义不同的另一份定义。
+    pub fn register(&mut self, id: &QuestionId, spec: &QuestionSpec) -> Result<(), Error> {
+        match self
+            .versions
+            .get(id)
+            .and_then(|history| history.get(&spec.version))
+        {
+            Some(existing) if *existing == spec.question => Ok(()),
+            Some(_) => Err(Error::QuestionVersionConflict(id.clone())),
+            None => {
+                self.versions
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(spec.version, spec.question.clone());
+                Ok(())
+            }
+        }
+    }
+
+    /// 登记一个新版本：版本号取该 ID 当前最大版本 +1（首次登记为 1）。
+    pub fn revise(&mut self, id: &QuestionId, question: Question) -> QuestionVersion {
+        let history = self.versions.entry(id.clone()).or_default();
+        let next = history
+            .keys()
+            .next_back()
+            .map_or(QuestionVersion(1), |latest| QuestionVersion(latest.0 + 1));
+        history.insert(next, question);
+        next
+    }
+
+    /// 按 ID + 版本取问题定义。
+    pub fn at(&self, id: &QuestionId, version: QuestionVersion) -> Option<&Question> {
+        self.versions.get(id)?.get(&version)
+    }
+
+    /// 该 ID 当前的版本与定义：版本号最大的那个。
+    pub fn current(&self, id: &QuestionId) -> Option<(QuestionVersion, &Question)> {
+        self.versions
+            .get(id)?
+            .iter()
+            .next_back()
+            .map(|(version, question)| (*version, question))
+    }
+
+    /// 该 ID 的版本历史（按版本号升序）。
+    pub fn history(&self, id: &QuestionId) -> Vec<(QuestionVersion, &Question)> {
+        self.versions
+            .get(id)
+            .map(|history| {
+                history
+                    .iter()
+                    .map(|(version, question)| (*version, question))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 比较同一 ID 的两个版本；任一侧没登记时为 `None`。
+    pub fn compare(
+        &self,
+        id: &QuestionId,
+        left: QuestionVersion,
+        right: QuestionVersion,
+    ) -> Option<VersionComparison> {
+        let history = self.versions.get(id)?;
+        let left = history.get(&left)?;
+        let right = history.get(&right)?;
+        Some(if left == right {
+            VersionComparison::Same
+        } else {
+            VersionComparison::Changed
+        })
+    }
+
+    /// 已登记的问题 ID（按标识排序）。
+    pub fn ids(&self) -> impl Iterator<Item = &QuestionId> {
+        self.versions.keys()
+    }
+}
 
 /// 类型化问题：`type` 字段即判别标签，与三类原语一一对应。
 ///
@@ -194,6 +305,89 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Questions>(wire).unwrap(),
             questions
+        );
+    }
+
+    fn noul(instructions: &str) -> Question {
+        Question::Noul(NoulQuestion {
+            instructions: instructions.to_owned(),
+            criteria: None,
+        })
+    }
+
+    #[test]
+    fn a_question_id_that_changes_meaning_gets_a_new_version() {
+        let mut registry = QuestionRegistry::default();
+        let id = QuestionId::from("cache_written_after_cancel");
+        let first = QuestionSpec {
+            version: QuestionVersion(1),
+            question: noul("取消确认之后是否还有写入？"),
+        };
+        registry.register(&id, &first).expect("首次登记");
+
+        // 同一 ID + 同一版本换含义：显式拒绝，旧版本不可被覆盖。
+        let error = registry
+            .register(
+                &id,
+                &QuestionSpec {
+                    version: QuestionVersion(1),
+                    question: noul("换一个含义"),
+                },
+            )
+            .expect_err("同一版本上不能换含义");
+        assert!(
+            matches!(error, Error::QuestionVersionConflict(_)),
+            "{error}"
+        );
+        assert_eq!(registry.at(&id, QuestionVersion(1)), Some(&first.question));
+
+        // 重复登记同一份定义是幂等的。
+        registry.register(&id, &first).expect("重复登记同一份定义");
+
+        let version = registry.revise(&id, noul("取消确认之后是否还有跨任务的写入？"));
+        assert_eq!(version, QuestionVersion(2));
+        assert_eq!(
+            registry.current(&id).map(|(version, _)| version),
+            Some(QuestionVersion(2))
+        );
+        assert_eq!(
+            registry.at(&id, QuestionVersion(1)),
+            Some(&first.question),
+            "旧版本原样留着"
+        );
+
+        // 按版本查询与比较。
+        assert_eq!(registry.history(&id).len(), 2);
+        assert_eq!(
+            registry.compare(&id, QuestionVersion(1), QuestionVersion(2)),
+            Some(VersionComparison::Changed)
+        );
+        assert_eq!(
+            registry.compare(&id, QuestionVersion(2), QuestionVersion(2)),
+            Some(VersionComparison::Same)
+        );
+        assert_eq!(
+            registry.compare(&id, QuestionVersion(1), QuestionVersion(9)),
+            None
+        );
+        assert_eq!(
+            registry.at(&QuestionId::from("never_registered"), QuestionVersion(1)),
+            None
+        );
+        assert_eq!(registry.ids().count(), 1);
+
+        // 另一个 ID 从 1 开始，不共享版本号。
+        let other = QuestionId::from("cache_enabled");
+        assert_eq!(registry.revise(&other, noul("？")), QuestionVersion(1));
+
+        let wire = serde_json::to_value(&registry).unwrap();
+        assert_eq!(
+            wire["versions"]["cache_written_after_cancel"]["2"]["type"],
+            json!("noul")
+        );
+        assert_eq!(
+            serde_json::from_value::<QuestionRegistry>(wire).unwrap(),
+            registry
         );
     }
 }
