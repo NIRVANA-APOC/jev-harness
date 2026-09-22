@@ -465,6 +465,8 @@ fn declared_notes() -> Vec<String> {
             .to_owned(),
         "行动前提门只用 `cause_primary`（真实模型答得稳的那一问）；`premise_holds`（材料是否已确认原因）照常判定与判分，作为判定质量的诊断读数报告，不参与行动前提——真实模型的读数已在批次里如实记录。"
             .to_owned(),
+        "真调复现（key 只在环境变量里，不进报告、日志与提交）：`TYPESAFE_API_KEY=… cargo run -p jh-app -- compare --judge jev`；`OPENAI_API_KEY=$DEEPSEEK_API_KEY OPENAI_BASE_URL=https://api.deepseek.com OPENAI_MODEL=deepseek-flash cargo run -p jh-app -- compare --judge llm`；两个判定器一起跑就并排给出四组臂。离线复现把 `--judge` 换成 `rule`（或 `replay --replay var/calls.jsonl`）。"
+            .to_owned(),
     ]
 }
 
