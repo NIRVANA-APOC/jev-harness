@@ -43,6 +43,11 @@ pub enum Error {
     /// 引用了一个不存在的行动。
     #[error("行动不存在：{0}")]
     UnknownAction(ActionId),
+    /// 想往一个已撤回的判断节点里写结果。
+    ///
+    /// 撤销黏着到显式重新授权：要重新判断就声明一个新节点（判断节点本来就不可改写）。
+    #[error("判断节点已撤销：{0}")]
+    RetractedNode(NodeId),
     /// 问题版本冲突：同一 ID + 版本上已经记着另一份含义不同的定义。
     ///
     /// 改含义必须走 [`QuestionRegistry::revise`](crate::QuestionRegistry::revise) 产生新版本，
@@ -77,6 +82,11 @@ mod tests {
                 .contains("evidence-3")
         );
         assert!(Error::UnknownNode(NodeId(7)).to_string().contains("node-7"));
+        assert!(
+            Error::RetractedNode(NodeId(7))
+                .to_string()
+                .contains("node-7")
+        );
         assert!(
             Error::UnknownAction(ActionId::from("restart-cache"))
                 .to_string()

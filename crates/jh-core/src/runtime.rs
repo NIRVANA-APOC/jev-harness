@@ -14,17 +14,35 @@
 //!
 //! # 传播规则
 //!
-//! 读取范围按对象记录（保守：不猜测模型只用了其中哪几项，§5.3），版本用来精确制导：
+//! 失效传播按**对象**保守判定，不猜测某个判断究竟看了对象的哪一版记录（§5.3「不能在返回后猜测模型
+//! 只使用了其中某几项」）。**依赖图是传播的唯一依据**：只要有一条「对象 → 判断」的读取边
+//! （[`SemanticState::declare_node`] 按输入投影登记的，或调用方经 [`SemanticState::graph_mut`]
+//! 手工加的，两种来源一视同仁），这条判断就算读过该对象。
 //!
 //! | 起因 | 谁受影响 |
 //! | --- | --- |
-//! | 追加证据 `(对象, v)` | 读了该对象、读到的版本 ≤ v 的判断——它们没看到新记录 |
-//! | 撤回证据 `(对象, v)` | 读了该对象、读到的版本恰好是 v 的判断——它们读的正是被撤回的记录 |
+//! | 追加了一条属于对象 `O` 的证据 | 所有读过 `O` 的判断——它们没看到这条新记录 |
+//! | 撤回了一条属于对象 `O` 的证据 | 所有读过 `O` 的判断——被撤回的记录可能就在它们的材料里 |
 //! | 撤销判断 | 由它支持的下游判断、以它为前提的行动 |
 //! | 全量重查 | 所有当前有效的判断与行动（保守出口，不沿路径） |
 //!
 //! 冲突候选是对称关系，两种情形都不传播（见 [`DependencyGraph::cycles`](crate::DependencyGraph)）。
-//! 模型提出的额外读取依赖（[`EdgeOrigin::Proposed`]）没有版本信息，一律保守地算受影响。
+//! 这样选的代价是误失效：撤回一条早被新版本取代的旧记录，也会波及只读了新版本的判断。方向是刻意的
+//! ——漏失效会让运行时拿着作废的依据继续行动，误失效只是多查几次；两者都要在实验里分别统计
+//! （§5.4、§10.2）。
+//!
+//! # 请求 state 与读取版本
+//!
+//! 输入投影里的**版本只用于登记时的快照校验**（[`SemanticState::verify`] 与
+//! [`SemanticState::record_judgment`]：读到的版本必须仍是当前版本、且该版本上没有已撤回的记录），
+//! **不参与传播筛选**。因此装配 state 时即使混进了同一对象的旧版本记录，也不会出现「撤回了一条
+//! 判断其实读过、但投影没写的记录，判断静默保持当前有效」的漏失效——对象级传播兜住。
+//!
+//! 仍然推荐只把 [`current_evidence`](crate::EvidenceLog::current_evidence) 装进 state：
+//!
+//! - 装旧版本会让模型看到已被取代的材料，答案本身就是过期的；
+//! - 投影里写下的版本应当是这份 state 的读取版本——装了当前版本，就写
+//!   [`current_version`](crate::EvidenceLog::current_version) 给出的那个。
 //!
 //! # 示例
 //!
@@ -369,12 +387,19 @@ impl SemanticState {
 
     /// 写入一次判断：把该问题在这次调用里的答案绑到节点上，并把评估状态置为成功。
     ///
+    /// 已撤回的节点不接受写入（[`Error::RetractedNode`]）：撤销黏着到显式重新授权，要重新判断就
+    /// 声明一个新节点——判断节点本来就不可改写。待重查的节点可以写，输入没动就回到当前有效，
+    /// 这就是重查清账的姿势。
+    ///
     /// 若投影读到的输入在请求期间变化了（对象出了新版本，或读到的版本被撤回），记录仍然留下作为
     /// 审计，但依据有效性直接落成待重查——它不能作为当前行动依据（研究目标 §5.3）。
     pub fn record_judgment(&mut self, id: NodeId, record: JudgmentRecord) -> Result<(), Error> {
         let Some(node) = self.nodes.get(&id) else {
             return Err(Error::UnknownNode(id));
         };
+        if node.validity == Validity::Retracted {
+            return Err(Error::RetractedNode(id));
+        }
         let question = node.question.clone();
         let version = node.question_version;
         let projection = node.projection.clone();
@@ -409,23 +434,13 @@ impl SemanticState {
 
     /// 追加一条新证据，并传播它引起的失效。
     ///
-    /// 读了该对象、读到的版本不晚于新版本的判断会变成待重查——它们没看到这条新记录。
-    /// 返回新记录与传播结果。
+    /// **所有读过该对象的判断**都会变成待重查——它们没看到这条新记录。返回新记录与传播结果。
     pub fn append_evidence(
         &mut self,
         evidence: NewEvidence,
     ) -> Result<(Evidence, Invalidation), Error> {
         let entry = self.evidence.append(evidence)?;
-        let mut affected = self.proposed_readers(&entry.object);
-        for node in self.nodes.values() {
-            if node
-                .projection
-                .version_of(&entry.object)
-                .is_some_and(|read| read <= entry.version)
-            {
-                affected.insert(NodeRef::Judgment(node.id));
-            }
-        }
+        let affected = self.readers_of(&entry.object);
         let cause = InvalidationCause::EvidenceAppended(entry.id);
         let origin = NodeRef::Object(entry.object.clone());
         let invalidation = self.propagate(cause, origin, affected);
@@ -434,24 +449,18 @@ impl SemanticState {
 
     /// 撤回一条证据，并传播它引起的失效。
     ///
-    /// 读到这一版该对象的判断会变成待重查——它们读的正是被撤回的记录。撤回不改写任何记录，
-    /// 已撤回过的再撤回是幂等的。
+    /// **所有读过该对象的判断**都会变成待重查：被撤回的记录可能就在它们的材料里，本 crate 不猜测谁
+    /// 究竟看了哪一版——宁可误失效，不留漏失效。撤回不改写任何记录，已撤回过的再撤回是幂等的。
     pub fn retract_evidence(&mut self, id: EvidenceId) -> Result<Invalidation, Error> {
-        let (object, version) = {
-            let evidence = self
-                .evidence
-                .evidence(id)
-                .ok_or(Error::UnknownEvidence(id))?;
-            (evidence.object.clone(), evidence.version)
-        };
+        let object = self
+            .evidence
+            .evidence(id)
+            .ok_or(Error::UnknownEvidence(id))?
+            .object
+            .clone();
         self.evidence.retract(id)?;
 
-        let mut affected = self.proposed_readers(&object);
-        for node in self.nodes.values() {
-            if node.projection.version_of(&object) == Some(version) {
-                affected.insert(NodeRef::Judgment(node.id));
-            }
-        }
+        let affected = self.readers_of(&object);
         Ok(self.propagate(
             InvalidationCause::EvidenceRetracted(id),
             NodeRef::Object(object),
@@ -617,20 +626,23 @@ impl SemanticState {
         self.graph.cycles()
     }
 
-    /// 模型提出的额外读取依赖：没有版本信息，一律保守地算受影响。
-    fn proposed_readers(&self, object: &ObjectId) -> BTreeSet<NodeRef> {
+    /// 所有读过该对象的判断节点。
+    ///
+    /// 投影登记的确定性读取边与调用方手工加的读取边一视同仁——来源（[`EdgeOrigin`]）只进审计与
+    /// 「确定性 / 模型提出」的区分，不改变依赖关系：公共 API 收下的边不能在传播里当空操作。
+    fn readers_of(&self, object: &ObjectId) -> BTreeSet<NodeRef> {
         self.graph
             .edges_from(&NodeRef::Object(object.clone()))
             .into_iter()
-            .filter(|edge| edge.kind == EdgeKind::Read && edge.origin == EdgeOrigin::Proposed)
+            .filter(|edge| edge.kind == EdgeKind::Read)
             .map(|edge| edge.to)
             .collect()
     }
 
     /// 沿依赖图传播失效：把受影响的目标标成待重查/待复核，并收集到它们的路径。
     ///
-    /// `affected_first` 决定起点的一跳邻居里哪些算受影响（证据类起因要按版本筛）；更远的节点一律
-    /// 沿非冲突边传播。已经失效过的节点不再重复标记，也不会重复出现在结果里。
+    /// `affected_first` 决定起点的一跳邻居里哪些算受影响（证据类起因给的就是该对象的全部读者）；
+    /// 更远的节点一律沿非冲突边传播。已经失效过的节点不再重复标记，也不会重复出现在结果里。
     fn propagate(
         &mut self,
         cause: InvalidationCause,
@@ -721,30 +733,31 @@ mod tests {
         state.declare_node(QuestionId::from(question), QuestionVersion(1), projection)
     }
 
-    fn judge(state: &mut SemanticState, node: NodeId, noul: f64) {
-        let question = state.node(node).expect("节点已声明").question.clone();
-        let question_version = state.node(node).expect("节点已声明").question_version;
-        state
-            .record_judgment(
-                node,
-                JudgmentRecord {
-                    snapshot: SnapshotId::from("case-001"),
-                    source: JudgeSource::Rule,
-                    version: "rule-v1".to_owned(),
-                    request_id: None,
-                    usage: None,
-                    latency_ms: 1,
-                    judgments: BTreeMap::from([(
-                        question,
-                        Judgment {
-                            question_version,
-                            answer: Answer::Noul(NoulAnswer { noul }),
-                            thresholds: BTreeMap::new(),
-                        },
-                    )]),
+    fn record_for(state: &SemanticState, node: NodeId, noul: f64) -> JudgmentRecord {
+        let node = state.node(node).expect("节点已声明");
+        let question = node.question.clone();
+        let question_version = node.question_version;
+        JudgmentRecord {
+            snapshot: SnapshotId::from("case-001"),
+            source: JudgeSource::Rule,
+            version: "rule-v1".to_owned(),
+            request_id: None,
+            usage: None,
+            latency_ms: 1,
+            judgments: BTreeMap::from([(
+                question,
+                Judgment {
+                    question_version,
+                    answer: Answer::Noul(NoulAnswer { noul }),
+                    thresholds: BTreeMap::new(),
                 },
-            )
-            .expect("记录与节点一致");
+            )]),
+        }
+    }
+
+    fn judge(state: &mut SemanticState, node: NodeId, noul: f64) {
+        let record = record_for(state, node, noul);
+        state.record_judgment(node, record).expect("记录与节点一致");
     }
 
     #[test]
@@ -1105,5 +1118,111 @@ mod tests {
             Some(crate::evidence::ObjectVersion(2))
         );
         assert!(!state.evidence().is_retracted(fresh.id));
+    }
+
+    #[test]
+    fn mixed_versions_in_the_request_state_cannot_hide_an_invalidation() {
+        // 装配 state 时把同一对象的两个版本都装了、投影只写读到的最新版：撤回那条「投影没写」的旧
+        // 记录也不能静默漏失效——传播按对象走。
+        let mut state = SemanticState::in_memory();
+        let older = observe(&mut state, "cache.conf", 1);
+        observe(&mut state, "cache.conf", 2);
+        let node = declare(&mut state, "cache_disabled", &[("cache.conf", 2)]);
+        let action = ActionId::from("restart-cache");
+        state.declare_action(action.clone(), [node]).unwrap();
+        judge(&mut state, node, 1.0);
+        assert_eq!(state.check_action(&action).unwrap(), PremiseCheck::Cleared);
+
+        let invalidation = state.retract_evidence(older.id).unwrap();
+
+        assert_eq!(invalidation.stale, vec![node]);
+        assert_eq!(state.node(node).unwrap().validity, Validity::NeedsRecheck);
+        assert_eq!(
+            state.check_action(&action).unwrap(),
+            PremiseCheck::Blocked {
+                premises: vec![node]
+            }
+        );
+    }
+
+    #[test]
+    fn hand_added_read_edges_count_for_propagation_whatever_their_origin() {
+        // 公共 API 收下的读取边不能在传播里当空操作；来源只区分「确定性 / 模型提出」，不改变依赖关系。
+        for origin in [EdgeOrigin::Deterministic, EdgeOrigin::Proposed] {
+            let mut state = SemanticState::in_memory();
+            let config = observe(&mut state, "cache.conf", 1);
+            observe(&mut state, "app.log", 1);
+            let node = declare(&mut state, "restart_safe", &[("app.log", 1)]);
+            judge(&mut state, node, 1.0);
+            state.graph_mut().add_edge(
+                NodeRef::Object(ObjectId::from("cache.conf")),
+                NodeRef::Judgment(node),
+                EdgeKind::Read,
+                origin,
+            );
+
+            let invalidation = state.retract_evidence(config.id).unwrap();
+
+            assert_eq!(invalidation.stale, vec![node], "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn appending_a_record_invalidates_every_reader_of_that_object() {
+        // 追加同样是对象级：迟到的一条旧版本记录也是「读过它的判断没看到」的新材料。
+        let mut state = SemanticState::in_memory();
+        observe(&mut state, "cache.conf", 2);
+        observe(&mut state, "app.log", 1);
+        let reader = declare(&mut state, "cache_disabled", &[("cache.conf", 2)]);
+        let unrelated = declare(&mut state, "cancel_observed", &[("app.log", 1)]);
+        judge(&mut state, reader, 1.0);
+        judge(&mut state, unrelated, 1.0);
+
+        let (_, invalidation) = state
+            .append_evidence(NewEvidence {
+                source: "tool:read_config".to_owned(),
+                at_unix_ms: 1_700_000_000_001,
+                object: ObjectId::from("cache.conf"),
+                version: crate::evidence::ObjectVersion(1),
+                content: json!({ "cache": "off" }),
+            })
+            .unwrap();
+
+        assert_eq!(invalidation.stale, vec![reader]);
+        assert_eq!(state.node(unrelated).unwrap().validity, Validity::Current);
+    }
+
+    #[test]
+    fn a_withdrawn_judgment_stays_withdrawn_until_a_new_node_reauthorizes_it() {
+        let mut state = SemanticState::in_memory();
+        observe(&mut state, "cache.conf", 1);
+        let node = declare(&mut state, "cache_disabled", &[("cache.conf", 1)]);
+        let action = ActionId::from("restart-cache");
+        state.declare_action(action.clone(), [node]).unwrap();
+        judge(&mut state, node, 1.0);
+        state.retract_judgment(node).unwrap();
+
+        // 迟到的结果写不进已撤回的节点：撤销黏着到显式重新授权。
+        let late = record_for(&state, node, 0.0);
+        let error = state
+            .record_judgment(node, late)
+            .expect_err("已撤回的节点不接受写入");
+        assert!(matches!(error, Error::RetractedNode(_)), "{error}");
+        assert_eq!(state.node(node).unwrap().validity, Validity::Retracted);
+        assert!(!state.node(node).unwrap().is_usable());
+        assert_eq!(
+            state.check_action(&action).unwrap(),
+            PremiseCheck::Blocked {
+                premises: vec![node]
+            }
+        );
+        assert!(!state.recheck_set().contains(&node), "已撤回的判断不重算");
+
+        // 显式重新授权：声明新节点、写新结果、把行动前提换过去；旧节点保持已撤回。
+        let fresh = declare(&mut state, "cache_disabled", &[("cache.conf", 1)]);
+        judge(&mut state, fresh, 0.0);
+        state.declare_action(action.clone(), [fresh]).unwrap();
+        assert_eq!(state.check_action(&action).unwrap(), PremiseCheck::Cleared);
+        assert_eq!(state.node(node).unwrap().validity, Validity::Retracted);
     }
 }

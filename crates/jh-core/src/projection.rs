@@ -10,9 +10,10 @@
 //! - **字段粒度先只记录、不参与失效判定**：证据撤不撤回按对象整体保守处理，字段选择进审计与
 //!   后续版本，不在 1.0 拿它缩小失效范围。
 //!
-//! 投影还带**版本**：请求时读到的是该对象的哪一版。版本有两个用处——登记判断时做一次快照校验
-//! （[`verify_snapshot`]：读到的版本必须仍是当前版本，且该版本上没有已撤回的记录），以及撤回传播时
-//! 精确筛选受影响的读者。
+//! 投影还带**版本**：请求时读到的是该对象的哪一版。版本**只用于登记时的快照校验**
+//! （[`verify_snapshot`]：读到的版本必须仍是当前版本、且该版本上没有已撤回的记录），
+//! **不参与失效传播的筛选**——传播按对象走（见 [`SemanticState`](crate::SemanticState) 的传播规则），
+//! 所以装配请求 state 时混进同一对象的旧版本记录不会造成静默漏失效。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -78,6 +79,11 @@ pub struct InputProjection {
 
 impl InputProjection {
     /// 保守投影：把列出的对象按各自的读取版本整体读入。
+    ///
+    /// 入参的版本是**这次请求读到的版本**：装了当前版本就写
+    /// [`EvidenceLog::current_version`](crate::EvidenceLog::current_version) 给出的那个（推荐只装
+    /// [`current_evidence`](crate::EvidenceLog::current_evidence)，别把同一对象的旧版本也塞进 state）。
+    /// 版本只用于登记时的快照校验，不参与传播筛选——传播按对象走，混进旧版本记录不会造成漏失效。
     pub fn covering(objects: impl IntoIterator<Item = (ObjectId, ObjectVersion)>) -> Self {
         Self {
             objects: objects
@@ -168,10 +174,15 @@ pub fn verify_snapshot(log: &dyn EvidenceLog, projection: &InputProjection) -> S
                 read: read.version,
                 current,
             }),
-            None => drifts.push(Drift::Retracted {
-                object: object.clone(),
-                version: read.version,
-            }),
+            None => {
+                // 该对象已经没有仍有效的记录：这一条已经说明了「读到的版本不可用」，
+                // 不必再走下面的「该版本上有没有被撤回的记录」判定，否则同一处漂移报两次。
+                drifts.push(Drift::Retracted {
+                    object: object.clone(),
+                    version: read.version,
+                });
+                continue;
+            }
         }
         if log.retracted_at(object, read.version) {
             drifts.push(Drift::Retracted {
@@ -314,6 +325,37 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&older).unwrap()["objects"]["cache.conf"]["fields"]["kind"],
             json!("all")
+        );
+    }
+
+    #[test]
+    fn a_fully_retracted_object_reports_its_drift_once() {
+        let mut log = MemoryEvidenceLog::default();
+        let only = log
+            .append(NewEvidence {
+                source: "tool:probe".to_owned(),
+                at_unix_ms: 1_700_000_000_000,
+                object: ObjectId::from("solo"),
+                version: ObjectVersion(1),
+                content: json!({ "x": 1 }),
+            })
+            .expect("内存日志不会失败");
+        log.retract(only.id).expect("撤回唯一一条记录");
+
+        let check = verify_snapshot(
+            &log,
+            &InputProjection::covering([(ObjectId::from("solo"), ObjectVersion(1))]),
+        );
+
+        // 「该对象已无仍有效记录」与「读到的版本被撤回」是同一处漂移，只能报一次。
+        assert_eq!(
+            check,
+            SnapshotCheck::Drifted {
+                drifts: vec![Drift::Retracted {
+                    object: ObjectId::from("solo"),
+                    version: ObjectVersion(1),
+                }],
+            }
         );
     }
 }

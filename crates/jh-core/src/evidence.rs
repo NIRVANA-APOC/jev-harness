@@ -163,8 +163,9 @@ pub trait EvidenceLog {
 
     /// 某对象当前版本上仍有效的记录。
     ///
-    /// 把这些记录装进请求 state 之后，该对象的输入投影读到的版本就是
-    /// [`Self::current_version`] 给出的那个。
+    /// 把**这些**记录装进请求 state 是推荐做法（别把同一对象的旧版本也塞进去）：该对象的输入投影
+    /// 读到的版本就是 [`Self::current_version`] 给出的那个。装旧版本不会造成漏失效（失效传播按对象
+    /// 走），但会让模型看到已被取代的材料。
     fn current_evidence(&self, object: &ObjectId) -> Vec<&Evidence> {
         let Some(version) = self.current_version(object) else {
             return Vec::new();
