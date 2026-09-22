@@ -46,20 +46,52 @@ pub enum CallEntry {
         /// 判断器的错误文本；通道侧的请求 id 若在错误里，会随文本一起留下。
         error: String,
     },
+    /// 非判断用途的模型调用（候选问题生成等）：**没有**判断记录，也没有答案。
+    ///
+    /// 生成与验证也走真实模型，调用数、token、延迟与失败同样要记账（研究目标 §6.5：收益须扣除
+    /// 生成、验证、后续评估与维护成本），因此这里的字段与判断调用同一套位置。
+    ModelCall {
+        /// 本次运行标识。
+        run: String,
+        /// 用途标签（`generation` / `validation` / …）。
+        purpose: String,
+        /// 调用标识（同一个用途下的第几次调用）。
+        case: String,
+        /// 该通道声明的来源标签。
+        source: JudgeSource,
+        /// 执行者版本（通道响应的模型 ID）。
+        version: Option<String>,
+        /// 通道侧请求 id。
+        request_id: Option<String>,
+        /// 上报的 token 用量。
+        usage: Option<jh_core::Usage>,
+        /// 输入字符数（生成类调用没有输入 token 口径时的原始读数）。
+        input_bytes: u64,
+        /// 输出字符数。
+        output_bytes: u64,
+        /// 本次调用耗时，毫秒。
+        latency_ms: u64,
+        /// 错误文本；成功时为 `None`。
+        error: Option<String>,
+    },
 }
 
 impl CallEntry {
     /// 本次运行标识。
     pub fn run(&self) -> &str {
         match self {
-            Self::Judgment { run, .. } | Self::Failure { run, .. } => run,
+            Self::Judgment { run, .. }
+            | Self::Failure { run, .. }
+            | Self::ModelCall { run, .. } => run,
         }
     }
 
     /// 样本标识。
     pub fn case(&self) -> &str {
         match self {
-            Self::Judgment { case, .. } | Self::Failure { case, .. } => case,
+            Self::Judgment { case, .. }
+            | Self::Failure { case, .. }
+            | Self::ModelCall { case, .. } => case,
         }
     }
 }

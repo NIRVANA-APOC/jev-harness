@@ -443,7 +443,7 @@ pub struct TaskSummary {
 }
 
 /// 真实通道的端点（不含 key）：优先取环境变量覆盖，其次取通道的官方缺省；本地判定器给 `None`。
-fn endpoint_for(name: JudgeName) -> Option<String> {
+pub(crate) fn endpoint_for(name: JudgeName) -> Option<String> {
     let from_env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
     match name {
         JudgeName::Llm => {
@@ -501,6 +501,7 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
                     arm: *arm,
                     run: options.run.clone(),
                     endpoint: endpoint.clone(),
+                    shadow: None,
                     calls: &mut calls,
                 };
                 let trace = run_task(&mut context, task, &evidence_path).await?;
@@ -720,8 +721,8 @@ fn unavailable_report(name: JudgeName, arm: Arm, error: &Error) -> ArmReport {
 /// 按名字构造判定器。
 ///
 /// 与 M0 的 [`judge::build`] 分开：任务族 A 的隐藏真值按相位组织，模拟真值判定器在这里没有定义，
-/// 因此显式拒绝（研究目标 §9.2 也要求它不参展）。
-fn build_judge(name: JudgeName, replay_path: &Path) -> Result<Box<dyn Judge>, Error> {
+/// 因此显式拒绝（研究目标 §9.2 也要求它不参展）。任务族 B 的 H3 对照复用这一份构造。
+pub(crate) fn build_judge(name: JudgeName, replay_path: &Path) -> Result<Box<dyn Judge>, Error> {
     Ok(match name {
         JudgeName::SimulatedTruth => {
             return Err(Error::TaskSet(
@@ -761,6 +762,7 @@ pub async fn run_single(
         arm,
         run: run.to_owned(),
         endpoint: endpoint_for(name),
+        shadow: None,
         calls: &mut calls,
     };
     run_task(&mut context, task, &evidence_path).await
@@ -1418,6 +1420,19 @@ pub fn logged_calls(path: &Path, run: &str) -> Result<usize, Error> {
         .filter(|entry| entry.run() == run)
         .collect();
     Ok(entries.len())
+}
+
+/// 调用记录里「本运行」的行数：run 标识等于 `run`，或以 `{run}-` 开头的那些。
+///
+/// 与 [`logged_calls`] 的精确匹配不同：`jev h3` 的运行标识带阶段后缀（`-dev` / `-validation` /
+/// `-fixed` / …），用精确匹配去核对会得到 0，读起来像「一条调用记录都没有」。报告的复现核对用它。
+pub fn logged_calls_of_run(path: &Path, run: &str) -> Result<usize, Error> {
+    let prefix = format!("{run}-");
+    let entries = crate::calls::read_entries(path)?;
+    Ok(entries
+        .iter()
+        .filter(|entry| entry.run() == run || entry.run().starts_with(&prefix))
+        .count())
 }
 
 /// 从已有轨迹重建报告（`jev compare --regenerate`）。

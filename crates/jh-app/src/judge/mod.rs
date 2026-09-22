@@ -20,7 +20,7 @@ use crate::error::Error;
 use crate::tasks::TaskSet;
 
 mod jev;
-mod llm;
+pub(crate) mod llm;
 mod replay;
 mod rule;
 mod simulated;

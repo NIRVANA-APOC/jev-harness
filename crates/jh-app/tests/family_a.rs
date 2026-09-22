@@ -74,7 +74,7 @@ async fn the_four_arms_show_the_declared_differences_without_missed_invalidation
     // 判定器来源与验证状态：本地判定器标「模拟」，不冒充真实读数。
     assert_eq!(on_inc.verification.status, VerificationStatus::Simulated);
     assert!(!on_inc.live);
-    assert_eq!(on_inc.versions, vec!["rules-v2".to_owned()]);
+    assert_eq!(on_inc.versions, vec!["rules-v3".to_owned()]);
 
     // H1：开启臂六个任务全部通过独立验收，也不基于失效前提发出动作。
     assert_eq!(on_inc.acceptance.passed, 6);
@@ -231,7 +231,7 @@ async fn the_report_carries_definitions_sources_and_the_raw_data_locations() {
     assert_eq!(wire["arms"][0]["live"], serde_json::json!(false));
     assert_eq!(
         wire["arms"][0]["versions"][0],
-        serde_json::json!("rules-v2")
+        serde_json::json!("rules-v3")
     );
     assert!(wire["arms"][0]["calls"]["attempted"].as_u64().unwrap() > 0);
     assert!(wire["command"].as_str().unwrap().contains("compare"));
@@ -349,6 +349,7 @@ async fn a_failing_judge_lands_in_the_call_log_and_the_node_evaluation() {
             arm: Arm::ALL[0],
             run: "run-failure".to_owned(),
             endpoint: Some("https://example.invalid".to_owned()),
+            shadow: None,
             calls: &mut calls,
         };
         run_task(&mut context, task, &dir.join("evidence.jsonl"))

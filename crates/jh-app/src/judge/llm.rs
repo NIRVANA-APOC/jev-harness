@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jh_core::{
     Answer, ChoiceAnswer, Error, Judge, JudgeRequest, JudgeResponse, JudgeSource, NoulAnswer,
@@ -73,25 +73,94 @@ impl LlmJudge {
     /// 走的是 DeepSeek；只给模型不给端点会把 key 发到不是本人配置的端点上，所以宁可显式失败。
     /// 自建兼容端点写成不带尾斜杠的形式（例如 `https://api.deepseek.com`）。
     pub fn from_env() -> Result<Self, Error> {
-        let model = std::env::var("OPENAI_MODEL").map_err(|_| {
-            Error::Unavailable("缺少 OPENAI_MODEL：LLM 判断必须显式给出模型 ID".to_owned())
-        })?;
-        let base_url = std::env::var("OPENAI_BASE_URL").map_err(|_| {
-            Error::Unavailable(
-                "缺少 OPENAI_BASE_URL：LLM 判断必须显式给出端点，\
-                 否则 key 会被发往 jh-openai 的官方缺省端点"
-                    .to_owned(),
-            )
-        })?;
-
-        let client = jh_openai::Client::builder()
-            .model(model)
-            .base_url(base_url)
-            .timeout(DEFAULT_TIMEOUT)
-            .build()
-            .map_err(map_error)?;
-        Ok(Self { client })
+        Ok(Self {
+            client: from_env_client()?,
+        })
     }
+}
+
+/// 一次「单提示词 → 单段文本」的通道调用结果。
+pub(crate) struct Completion {
+    /// 模型输出的文本。
+    pub text: String,
+    /// 执行者版本（通道响应的模型 ID）。
+    pub model: String,
+    /// 通道侧请求 id。
+    pub request_id: String,
+    /// 上报的 token 用量。
+    pub usage: Option<Usage>,
+    /// 本次调用耗时。
+    pub latency: Duration,
+}
+
+/// 从环境变量构造 `jh-openai` 客户端：`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 三者都必填。
+///
+/// 结构化判断与候选问题生成（M19 的生成步骤）共用这一份构造：两条路都走同一个模型、同一个端点、
+/// 同一套「缺配置就显式失败」的口径。
+pub(crate) fn from_env_client() -> Result<jh_openai::Client, Error> {
+    let model = std::env::var("OPENAI_MODEL").map_err(|_| {
+        Error::Unavailable("缺少 OPENAI_MODEL：LLM 通道必须显式给出模型 ID".to_owned())
+    })?;
+    let base_url = std::env::var("OPENAI_BASE_URL").map_err(|_| {
+        Error::Unavailable(
+            "缺少 OPENAI_BASE_URL：LLM 通道必须显式给出端点，\
+             否则 key 会被发往 jh-openai 的官方缺省端点"
+                .to_owned(),
+        )
+    })?;
+
+    jh_openai::Client::builder()
+        .model(model)
+        .base_url(base_url)
+        .timeout(DEFAULT_TIMEOUT)
+        .build()
+        .map_err(map_error)
+}
+
+/// 发一次单提示词请求并取回文本：失败响应、非 `completed` 状态都在这里显式失败。
+///
+/// 被判定的材料与输出契约**全部放在用户消息里**（理由见模块文档）；耗时从发请求前开始计。
+pub(crate) async fn complete(
+    client: &jh_openai::Client,
+    prompt: String,
+) -> Result<Completion, Error> {
+    let body = ResponsesRequest::new(vec![InputItem::user_text(prompt)])
+        .max_output_tokens(DEFAULT_MAX_OUTPUT_TOKENS);
+    let started = Instant::now();
+    let response = client.create(&body).await.map_err(map_error)?;
+    let latency = started.elapsed();
+
+    if let Some(error) = &response.error {
+        let detail = error
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("{error:?}"));
+        return Err(Error::CallFailed(format!("通道返回失败响应：{detail}")));
+    }
+    if response.status != ResponseStatus::Completed {
+        // 截断原因随错误一起落进报告：只写「状态不是 completed」时，
+        // 报告本身分不清是预算被 reasoning 吃光还是内容过滤，还得回头重跑才知道。
+        let reason = response
+            .incomplete_details
+            .as_ref()
+            .map(|details| format!("，incomplete_details.reason={:?}", details.reason))
+            .unwrap_or_default();
+        return Err(Error::InvalidResponse(format!(
+            "响应状态是 {:?}{reason}，不是 completed",
+            response.status
+        )));
+    }
+
+    Ok(Completion {
+        text: response.output_text(),
+        model: response.model.clone(),
+        request_id: response.id.clone(),
+        usage: response.usage.as_ref().map(|usage| Usage {
+            input_tokens: Some(usage.input_tokens),
+            output_tokens: Some(usage.output_tokens),
+        }),
+        latency,
+    })
 }
 
 impl Judge for LlmJudge {
@@ -100,40 +169,13 @@ impl Judge for LlmJudge {
         request: &'a JudgeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<JudgeResponse, Error>> + Send + 'a>> {
         Box::pin(async move {
-            let body = ResponsesRequest::new(vec![InputItem::user_text(prompt(request)?)])
-                .max_output_tokens(DEFAULT_MAX_OUTPUT_TOKENS);
-
-            let response = self.client.create(&body).await.map_err(map_error)?;
-            if let Some(error) = &response.error {
-                let detail = error
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| format!("{error:?}"));
-                return Err(Error::CallFailed(format!("通道返回失败响应：{detail}")));
-            }
-            if response.status != ResponseStatus::Completed {
-                // 截断原因随错误一起落进报告：只写「状态不是 completed」时，
-                // 报告本身分不清是预算被 reasoning 吃光还是内容过滤，还得回头重跑才知道。
-                let reason = response
-                    .incomplete_details
-                    .as_ref()
-                    .map(|details| format!("，incomplete_details.reason={:?}", details.reason))
-                    .unwrap_or_default();
-                return Err(Error::InvalidResponse(format!(
-                    "响应状态是 {:?}{reason}，不是 completed",
-                    response.status
-                )));
-            }
-
+            let completion = complete(&self.client, prompt(request)?).await?;
             Ok(JudgeResponse {
                 source: JudgeSource::Llm,
-                version: response.model.clone(),
-                answers: parse_answers(&response.output_text(), &request.questions)?,
-                usage: response.usage.as_ref().map(|usage| Usage {
-                    input_tokens: Some(usage.input_tokens),
-                    output_tokens: Some(usage.output_tokens),
-                }),
-                request_id: Some(response.id.clone()),
+                version: completion.model,
+                answers: parse_answers(&completion.text, &request.questions)?,
+                usage: completion.usage,
+                request_id: Some(completion.request_id),
             })
         })
     }

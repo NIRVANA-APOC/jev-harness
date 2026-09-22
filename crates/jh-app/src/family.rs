@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::tasks::Truth;
+pub use crate::tasks::Truth;
 
 /// 任务族 A 的内嵌 JSON 原文：编译期内嵌，运行时不依赖工作目录。
 pub const FAMILY_A_JSON: &str = include_str!("../tasks/family_a.json");
@@ -149,6 +149,41 @@ pub struct ActionSpec {
     pub cost_units: f64,
     /// 前提门：全部成立才能发出。
     pub requires: Vec<Gate>,
+    /// 动作发出后追加的证据（观察类动作的产出）；`None` 表示这个动作不产出证据。
+    ///
+    /// 观察动作靠这个字段把「取得关键证据」变成**计费动作的执行效果**：任务族 B 的 B2 子集里，
+    /// 关键证据不在初始快照里，只有真的发出观察动作才会进证据日志（研究目标 §9.3：
+    /// 「观察须计费，防止永远读取全部信息成为无代价策略」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<ActionEffect>,
+}
+
+/// 动作发出后追加的一条证据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionEffect {
+    /// 来源（工具名）。
+    pub source: String,
+    /// 对象。
+    pub object: ObjectId,
+    /// 该对象的新版本。
+    pub version: ObjectVersion,
+    /// 原始内容。
+    pub content: Value,
+    /// 这条产出在场景里意味着什么（可复核说明，不进判断请求）。
+    pub note: String,
+}
+
+/// 材料充分性判据：某道题的关键证据对象不在它的输入投影里时，正确读法是什么。
+///
+/// 「材料是否足够」按**这道题的输入投影**判定，不按证据库里有什么：问题声明的读取范围就是它
+/// 作答的全部依据（研究目标 §5.3），所以读不到关键对象时，正确的读法是声明的兜底标签
+/// （任务族 B 里是 `other`），而不是猜一个候选集内的标签。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterialGate {
+    /// 关键证据对象。
+    pub key_object: ObjectId,
+    /// 该对象不在输入投影里时的正确读法标签。
+    pub absent_label: String,
 }
 
 /// 一条前提门：某个问题的答案要满足的条件。
@@ -173,16 +208,26 @@ pub struct Gate {
 ///
 /// `required` 是相对口径：**以本任务声明的候选动作集为全集**，列出该相位下应当发出的动作；
 /// 为空表示候选集里没有该发的动作。
+///
+/// `truth` 是**通用**真值表（问题 → 真值），任务族 B 用它；任务族 A 用下面四个按题的固定字段，
+/// `truth` 为空。两边都不进判断请求，只进判分与验收侧。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Phase {
-    /// 首要原因的隐藏真值（`cause_primary` 的标签）。
+    /// 首要原因的隐藏真值（任务族 A 的 `cause_primary` 标签）。
+    #[serde(default)]
     pub cause: String,
-    /// 「补救动作前提成立」的隐藏真值。
+    /// 「补救动作前提成立」的隐藏真值（任务族 A）。
+    #[serde(default)]
     pub premise_holds: bool,
-    /// 「指标仍在基线」的隐藏真值。
+    /// 「指标仍在基线」的隐藏真值（任务族 A）。
+    #[serde(default)]
     pub metrics_within_baseline: bool,
-    /// 「交付物已产出」的隐藏真值。
+    /// 「交付物已产出」的隐藏真值（任务族 A）。
+    #[serde(default)]
     pub deliverable_ready: bool,
+    /// 通用真值表：问题 ID → 该相位上的隐藏真值（任务族 B 用）。
+    #[serde(default)]
+    pub truth: BTreeMap<QuestionId, Truth>,
     /// 该相位下应当发出的动作。
     pub required: Vec<ActionId>,
 }
@@ -219,6 +264,11 @@ pub struct FamilyTask {
     pub phases: Vec<Phase>,
     /// 验收是否要求完成声明绑定交付物当前版本的证据。
     pub bind_deliverable: bool,
+    /// 材料充分性判据（问题 → 关键证据对象与兜底读法）；任务族 A 为空。
+    ///
+    /// 关键对象不在该问题的输入投影里时，真值取兜底标签：问题读不到的材料不算它的材料。
+    #[serde(default)]
+    pub material_gate: BTreeMap<QuestionId, MaterialGate>,
 }
 
 /// 一条模型建议的额外依赖。
@@ -290,9 +340,15 @@ impl FamilyTask {
             .is_some_and(|first| round >= first)
     }
 
-    /// 该问题在某相位上的隐藏真值（固定问题集的四个问题）。
+    /// 该问题在某相位上的隐藏真值。
+    ///
+    /// 先查相位的通用真值表（任务族 B），再落到任务族 A 的四个固定问题。**不看材料**——
+    /// 判分时用 [`FamilyTask::truth_for`] 把材料充分性一并算进去。
     pub fn truth_at(&self, phase: usize, question: &QuestionId) -> Option<Truth> {
         let phase = self.phases.get(phase)?;
+        if let Some(truth) = phase.truth.get(question) {
+            return Some(truth.clone());
+        }
         match question.as_str() {
             CAUSE_QUESTION => Some(Truth::Choice {
                 label: phase.cause.clone(),
@@ -307,6 +363,25 @@ impl FamilyTask {
                 yes: phase.deliverable_ready,
             }),
             _ => None,
+        }
+    }
+
+    /// 给定材料（该问题这次实际读到的对象）时该问题的正确读法。
+    ///
+    /// 声明了材料充分性判据的问题（[`FamilyTask::material_gate`]）：关键证据对象**不在它这次读到的
+    /// 投影里**时，正确读法是兜底标签——问题读不到的材料不算它的材料（研究目标 §5.3 的输入投影口径）。
+    pub fn truth_for(
+        &self,
+        phase: usize,
+        question: &QuestionId,
+        reads: impl Fn(&ObjectId) -> bool,
+    ) -> Option<Truth> {
+        let truth = self.truth_at(phase, question)?;
+        match self.material_gate.get(question) {
+            Some(gate) if !reads(&gate.key_object) => Some(Truth::Choice {
+                label: gate.absent_label.clone(),
+            }),
+            _ => Some(truth),
         }
     }
 
@@ -470,6 +545,31 @@ impl FamilyA {
     }
 }
 
+/// 一个问题集视图：判断循环只需要「问题定义 + 读取范围」两件事。
+///
+/// 任务族 A 用自己的固定问题集实现它；任务族 B 的视图由问题库的**当前启用版本**实现——H3 的固定臂
+/// 与精化臂因此共用同一段循环代码与同一套前提门，差别只在库里启用的是哪个版本（研究目标 §6.4 的
+/// 「新判断通过统一字段进入同一个决策器，不修改消费者代码、决策器提示、权重或控制规则」）。
+///
+/// 两个方法返回自持的值（而不是借出引用），因为「当前启用版本」是运行期会变的事实：精化臂在发布
+/// 新版本之后，同一个问题 ID 的答案来源就换了一份定义。
+pub trait QuestionSet {
+    /// 该问题当前的启用定义（含版本）；不在问题集里时为 `None`。
+    fn enabled_question(&self, question: &QuestionId) -> Option<QuestionSpec>;
+    /// 该问题当前声明的读取对象；不在问题集里时为 `None`。
+    fn reads(&self, question: &QuestionId) -> Option<Vec<ObjectId>>;
+}
+
+impl QuestionSet for FamilyA {
+    fn enabled_question(&self, question: &QuestionId) -> Option<QuestionSpec> {
+        self.question(question).cloned()
+    }
+
+    fn reads(&self, question: &QuestionId) -> Option<Vec<ObjectId>> {
+        self.scope(question).map(|objects| objects.to_vec())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct FamilyFile {
     name: String,
@@ -489,33 +589,38 @@ struct QuestionEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TaskEntry {
-    id: String,
+pub(crate) struct TaskEntry {
+    pub(crate) id: String,
     #[serde(default)]
-    notes: String,
-    rounds: usize,
-    initial: Vec<EvidenceEntry>,
-    tracked: Vec<TrackedQuestion>,
+    pub(crate) notes: String,
+    pub(crate) rounds: usize,
+    pub(crate) initial: Vec<EvidenceEntry>,
+    pub(crate) tracked: Vec<TrackedQuestion>,
     #[serde(default)]
-    extra_dependencies: Vec<TrackedDependency>,
-    steps: Vec<Step>,
-    actions: Vec<ActionSpec>,
-    phases: Vec<Phase>,
-    acceptance: AcceptanceEntry,
+    pub(crate) extra_dependencies: Vec<TrackedDependency>,
+    #[serde(default)]
+    pub(crate) steps: Vec<Step>,
+    pub(crate) actions: Vec<ActionSpec>,
+    pub(crate) phases: Vec<Phase>,
+    #[serde(default)]
+    pub(crate) acceptance: AcceptanceEntry,
+    #[serde(default)]
+    pub(crate) material_gate: BTreeMap<QuestionId, MaterialGate>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct EvidenceEntry {
-    source: String,
-    at_unix_ms: u64,
-    object: ObjectId,
-    version: ObjectVersion,
-    content: Value,
+pub(crate) struct EvidenceEntry {
+    pub(crate) source: String,
+    pub(crate) at_unix_ms: u64,
+    pub(crate) object: ObjectId,
+    pub(crate) version: ObjectVersion,
+    pub(crate) content: Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct AcceptanceEntry {
-    bind_deliverable: bool,
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AcceptanceEntry {
+    #[serde(default)]
+    pub(crate) bind_deliverable: bool,
 }
 
 fn invalid(detail: &str) -> Error {
@@ -523,7 +628,9 @@ fn invalid(detail: &str) -> Error {
 }
 
 /// 校验单个任务并把 JSON 形态转成运行形态。
-fn validate_task(
+///
+/// 任务族 A 与任务族 B 共用这一套校验（族 B 额外声明材料充分性判据与观察动作的产出）。
+pub(crate) fn validate_task(
     task: TaskEntry,
     questions: &BTreeMap<QuestionId, QuestionSpec>,
     scopes: &BTreeMap<QuestionId, Vec<ObjectId>>,
@@ -586,6 +693,14 @@ fn validate_task(
                 )));
             }
         }
+        if let Some(effect) = &action.effect
+            && effect.version.0 == 0
+        {
+            return Err(fail(format!(
+                "候选动作 `{}` 的产出证据版本必须从 1 起",
+                action.id
+            )));
+        }
     }
     for tracked in &task.tracked {
         if !questions.contains_key(&tracked.question) {
@@ -620,16 +735,18 @@ fn validate_task(
             )));
         }
     }
-    let options: Vec<String> = match questions.get(&QuestionId::from(CAUSE_QUESTION)) {
+    // 任务族 A 的相位真值里有 `cause` 一项；任务族 B 用相位的通用真值表，没有 `cause_primary`。
+    let cause_options: Option<Vec<String>> = match questions.get(&QuestionId::from(CAUSE_QUESTION))
+    {
         Some(spec) => match &spec.question {
-            Question::Choice(choice) => choice.criteria.keys().cloned().collect(),
+            Question::Choice(choice) => Some(choice.criteria.keys().cloned().collect()),
             other => {
                 return Err(fail(format!(
                     "`{CAUSE_QUESTION}` 必须是选择类问题，实际是 {other:?}"
                 )));
             }
         },
-        None => return Err(fail(format!("问题集里没有 `{CAUSE_QUESTION}`"))),
+        None => None,
     };
     for (index, phase) in task.phases.iter().enumerate() {
         for action in &phase.required {
@@ -637,11 +754,72 @@ fn validate_task(
                 return Err(fail(format!("相位 {index} 要求了未声明的动作 `{action}`")));
             }
         }
-        if !options.contains(&phase.cause) {
+        if let Some(options) = &cause_options
+            && !options.contains(&phase.cause)
+        {
             return Err(fail(format!(
                 "相位 {index} 的真值 `{}` 不在 `{CAUSE_QUESTION}` 的选项集里",
                 phase.cause
             )));
+        }
+        for (question, truth) in &phase.truth {
+            let Some(spec) = questions.get(question) else {
+                return Err(fail(format!(
+                    "相位 {index} 给未知问题 `{question}` 写了真值"
+                )));
+            };
+            truth.render(&spec.question).map_err(|error| {
+                fail(format!(
+                    "相位 {index} 的问题 `{question}` 真值不合法：{error}"
+                ))
+            })?;
+        }
+    }
+    // 本任务跟踪的每个问题在**每个相位**上都要有真值，否则那些判断无法判分（缺真值不静默跳过）。
+    for tracked in &task.tracked {
+        for (index, phase) in task.phases.iter().enumerate() {
+            let truth = phase.truth.get(&tracked.question).cloned().or_else(|| {
+                match tracked.question.as_str() {
+                    CAUSE_QUESTION => Some(Truth::Choice {
+                        label: phase.cause.clone(),
+                    }),
+                    PREMISE_QUESTION => Some(Truth::Noul {
+                        yes: phase.premise_holds,
+                    }),
+                    METRICS_QUESTION => Some(Truth::Noul {
+                        yes: phase.metrics_within_baseline,
+                    }),
+                    DELIVERABLE_QUESTION => Some(Truth::Noul {
+                        yes: phase.deliverable_ready,
+                    }),
+                    _ => None,
+                }
+            });
+            if truth.is_none() {
+                return Err(fail(format!(
+                    "相位 {index} 没有给跟踪中的问题 `{}` 真值",
+                    tracked.question
+                )));
+            }
+        }
+    }
+    for (question, gate) in &task.material_gate {
+        let Some(spec) = questions.get(question) else {
+            return Err(fail(format!("材料充分性判据引用了未知问题 `{question}`")));
+        };
+        match &spec.question {
+            Question::Choice(choice) if !choice.criteria.contains_key(&gate.absent_label) => {
+                return Err(fail(format!(
+                    "问题 `{question}` 的材料不足兜底标签 `{}` 不在选项集里",
+                    gate.absent_label
+                )));
+            }
+            Question::Choice(_) => {}
+            other => {
+                return Err(fail(format!(
+                    "材料充分性判据只定义了选择类问题的兜底读法，`{question}` 是 {other:?}"
+                )));
+            }
         }
     }
     if task.acceptance.bind_deliverable
@@ -676,6 +854,7 @@ fn validate_task(
         actions: task.actions,
         phases: task.phases,
         bind_deliverable: task.acceptance.bind_deliverable,
+        material_gate: task.material_gate,
     })
 }
 

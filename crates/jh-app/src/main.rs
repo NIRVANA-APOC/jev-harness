@@ -1,5 +1,5 @@
 //! `jev` 命令：`chat` / `ask` 未接线；`run` 跑一个任务族 A 任务的匹配循环；`exp` 跑 M0 初始任务集
-//! 的 JSON 基线；`compare` 跑 H1/H2 四组臂对照。
+//! 的 JSON 基线；`compare` 跑 H1/H2 四组臂对照；`h3` 跑任务族 B 的 H3 对照（固定问题集合 vs 允许精化）。
 //!
 //! ```text
 //! cargo run -p jh-app -- exp                       # 离线默认：规则 + 模拟真值
@@ -7,12 +7,8 @@
 //! cargo run -p jh-app -- compare --judge rule              # 四组臂离线对照
 //! TYPESAFE_API_KEY=... cargo run -p jh-app -- compare --judge jev
 //! OPENAI_API_KEY=... OPENAI_MODEL=deepseek-flash OPENAI_BASE_URL=https://api.deepseek.com \
-//!   cargo run -p jh-app -- compare --judge llm
+//!   cargo run -p jh-app -- h3 --judge jev --judge llm      # H3：一条命令出 JSON 报告
 //! ```
-//!
-//! 真实通道的环境变量都必填（`TYPESAFE_API_KEY`；`OPENAI_API_KEY` + `OPENAI_MODEL` +
-//! `OPENAI_BASE_URL`）：缺任何一项该判定器整段标「未验证」，不会拿别的判定器的结果顶替，
-//! 也不会把 key 发往不是本人配置的端点。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +17,8 @@ use clap::{Args, Parser, Subcommand};
 use jh_app::compare::{self, CompareOptions};
 use jh_app::exp::{self, RunOptions};
 use jh_app::family::FamilyA;
+use jh_app::family_b::FamilyB;
+use jh_app::h3::{self, CandidateSource, H3Options};
 use jh_app::judge::JudgeName;
 use jh_app::matching::Arm;
 use jh_app::report;
@@ -49,6 +47,37 @@ enum Command {
     Exp(ExpArgs),
     /// 对照：H1（依赖失效传播开 / 关）× H2（增量 / 全量）四组臂跑任务族 A
     Compare(CompareArgs),
+    /// H3：固定问题集合 vs 允许精化（任务族 B），一条命令出 JSON 报告
+    H3(H3Args),
+}
+
+#[derive(Args)]
+struct H3Args {
+    /// 判定器，可重复给出；第一个同时用作精化循环（开发案例、验证、影子）的判定器；缺省用离线组合 rule
+    #[arg(long = "judge", value_enum, value_name = "NAME")]
+    judge: Vec<JudgeName>,
+    /// 只跑前 N 个未见变体（缺省全部）
+    #[arg(long = "max-tasks", value_name = "N")]
+    max_tasks: Option<usize>,
+    /// 复用已落盘的候选产物（不重发生成调用）
+    #[arg(long = "candidates", value_name = "FILE")]
+    candidates: Option<PathBuf>,
+    /// 调用记录落盘路径（JSONL，追加写）
+    #[arg(long = "calls", default_value = "var/calls.jsonl", value_name = "FILE")]
+    calls: PathBuf,
+    /// 录制回放读取的记录文件
+    #[arg(
+        long = "replay",
+        default_value = "var/calls.jsonl",
+        value_name = "FILE"
+    )]
+    replay: PathBuf,
+    /// 运行产物目录（轨迹、证据、候选产物）；缺省 var/h3/<run>
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    /// 报告输出路径；缺省 var/h3/<run>.json
+    #[arg(long = "out", value_name = "FILE")]
+    out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -137,6 +166,71 @@ async fn main() -> ExitCode {
         Command::Run(args) => run_task(args).await,
         Command::Exp(args) => run_exp(args).await,
         Command::Compare(args) => run_compare(args).await,
+        Command::H3(args) => run_h3(args).await,
+    }
+}
+
+/// `jev h3`：任务族 B 的 H3 对照，落 JSON 报告。
+async fn run_h3(args: H3Args) -> ExitCode {
+    let family = match FamilyB::load() {
+        Ok(family) => family,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+    let judges = if args.judge.is_empty() {
+        vec![JudgeName::Rule]
+    } else {
+        args.judge.clone()
+    };
+
+    let run = h3::new_run_id();
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("var/h3/{run}")));
+    let command = compare::reproduction_command(&std::env::args().collect::<Vec<_>>(), &judges);
+    let options = H3Options {
+        judges,
+        run: run.clone(),
+        calls_path: args.calls,
+        replay_path: args.replay,
+        out_dir,
+        command,
+        max_tasks: args.max_tasks,
+        candidates: match args.candidates {
+            Some(path) => CandidateSource::File(path),
+            None => CandidateSource::Generate,
+        },
+    };
+
+    let outcome = match h3::run(&family, &options).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let out = args
+        .out
+        .unwrap_or_else(|| PathBuf::from(format!("var/h3/{run}.json")));
+    if let Err(error) = compare::write_json(&out, &outcome.report) {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
+
+    for line in outcome.report.summary_lines() {
+        println!("{line}");
+    }
+    println!("报告：{}", out.display());
+
+    if outcome.clean {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("有调用失败：见报告里的 calls.failed 与 cost（失败如实计入，不静默重试）");
+        ExitCode::from(1)
     }
 }
 
