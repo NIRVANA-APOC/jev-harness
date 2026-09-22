@@ -35,6 +35,8 @@ Jev 是 TypeSafe AI 发布的 **System One 模型**（System One model）。它�
 
 （参考资料：[TypeSafe AI: Introducing System One Models & Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev)、[LangChain: Building a Harness with Jev](https://www.langchain.com/blog/building-a-harness-with-jev)、[TypeSafe 文档 Quickstart](https://docs.typesafe.ai/introduction/quickstart)。厂商声称在分类类任务上比同类 LLM 快最多 200x、成本低 400x，属于官方口径，本项目不将其视为既定事实。）
 
+**完整调研见 `docs/jev-research.md`**（定位依据、API 契约、能力边界、评测口径与风险清单；原始专题材料在 `docs/research/jev/`）。改动 Jev 相关代码前，先读该报告第 13 节（定位建议）与第 14.3 节（验证实验清单）。
+
 ## 技术栈与架构总则
 
 - **实现语言为 Rust**。核心运行时、Agent 循环、模型调用抽象与类型定义都在 Rust 中完成。
@@ -42,7 +44,16 @@ Jev 是 TypeSafe AI 发布的 **System One 模型**（System One model）。它�
 - **决策分层**：能让 Jev 判断的，不要用 LLM；能让确定性代码判断的，两者都不必用。
 - **概率优先**：Jev 返回的概率与置信度应作为一等数据在循环内传递，不要过早塌缩成布尔值而丢掉不确定性。
 - **类型安全**：问题定义、答案结构、状态流转尽量用 Rust 类型表达，让编译期承担尽可能多的约束。
-- 具体的模块划分、依赖选型与目录结构尚未确定；需要时按上一条原则在改动中一并明确，并同步更新本文件。
+- **Jev 客户端需自建**：官方只有 Python / JS SDK，Rust 侧自行实现 HTTP 客户端；类型映射与契约边界见 `docs/jev-research.md` §10 与 §14.3 E5。
+- 具体的模块划分与依赖选型尚未确定；需要时按上一条原则在改动中一并明确，并同步更新本文件。
+
+## 项目决策（2026-09-22，项目所有者）
+
+> 以下决策优先于 `docs/jev-research.md` 第 13 节的默认建议；风险与依据见该报告。
+
+- **保持私有**：本项目不发布到 crates.io（`jev-harness` 名称已被他人占用，不影响私有使用）。
+- **接受供应商现状**：接受 TypeSafe 当前无 SLA、单一供应商、限流动态调整；**暂不实现降级与容灾路径**（已知风险，由项目承担）。
+- **关键判定允许交给 Jev**：包括不可逆动作的门控场景。报告中"提示注入可移动判定""校准未经独立验证"等风险提示保留，供后续实测复核。
 
 ## 协作与编码约定
 
