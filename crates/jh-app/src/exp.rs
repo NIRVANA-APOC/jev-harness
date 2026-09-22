@@ -7,12 +7,19 @@
 //! - 每个判断器按顺序跑完整个任务集；单次调用失败**不中断**本次运行，而是落一行失败记录并计数；
 //! - 判断器构造失败（缺凭据、回放文件不存在）时该判断器整段标成「未验证」，不换后端顶上；
 //! - 只要有任何判断器没跑通，本次运行的 `clean` 为 `false`，命令以非零码退出（错误显式可见）。
+//!
+//! # 构造顺序
+//!
+//! **全部判断器在打开调用记录之前构造**，然后才开始逐样本调用。这不是实现细节：回放在构造时
+//! 一次性读入记录并建索引，构造顺序决定了它的索引里只有本次运行**之前**已落盘的行，
+//! 因此同一次运行新写入的行（哪怕 `--calls` 与 `--replay` 是同一个文件，那也是默认值）
+//! 不会被本次回放消费——回放不是自我实现的预言（`judge/replay.rs` 的契约）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use jh_core::{JudgmentRecord, QuestionId, QuestionVersion};
+use jh_core::{Judge, JudgmentRecord, QuestionId, QuestionVersion};
 
 use crate::calls::{CallEntry, CallLog};
 use crate::error::Error;
@@ -61,27 +68,38 @@ pub fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// 一个判断器的构造结果：名字 + 构造成败（失败者照旧出「未验证」报告）。
+type PreparedJudge = (JudgeName, Result<Box<dyn Judge>, Error>);
+
 /// 跑完整任务集并汇出报告；调用记录在运行中逐行落盘。
 pub async fn run(task_set: &TaskSet, options: &RunOptions) -> Result<RunOutcome, Error> {
-    let mut log = CallLog::open(options.calls_path.clone())?;
     let context = JudgeContext {
         task_set,
         replay_path: options.replay_path.as_path(),
     };
 
-    let mut judges = Vec::with_capacity(options.judges.len());
+    // 先把全部判断器构造完，再打开调用记录。顺序是有意的：回放在构造时读入记录，
+    // 这样它的索引至多包含本次运行之前已落盘的行，同一次运行新写的行不会被自己回放。
+    let prepared: Vec<PreparedJudge> = options
+        .judges
+        .iter()
+        .map(|name| (*name, judge::build(*name, &context)))
+        .collect();
+
+    let mut log = CallLog::open(options.calls_path.clone())?;
+    let mut judges = Vec::with_capacity(prepared.len());
     let mut clean = true;
 
-    for name in &options.judges {
-        let judge = match judge::build(*name, &context) {
+    for (name, judge) in prepared {
+        let judge = match judge {
             Ok(judge) => judge,
             Err(error) => {
                 clean = false;
-                judges.push(unavailable_report(*name, &error));
+                judges.push(unavailable_report(name, &error));
                 continue;
             }
         };
-        let mut accumulator = Accumulator::new(*name);
+        let mut accumulator = Accumulator::new(name);
         for case in &task_set.cases {
             let request = task_set.request(case);
             let started = Instant::now();

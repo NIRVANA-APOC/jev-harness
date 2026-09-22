@@ -9,7 +9,7 @@ use jh_app::exp::{self, RunOptions};
 use jh_app::judge::JudgeName;
 use jh_app::report;
 use jh_app::tasks::TaskSet;
-use jh_core::JudgeSource;
+use jh_core::{Answer, JudgeSource, JudgmentRecord, NoulAnswer, QuestionId, SnapshotId};
 
 use common::TempDir;
 
@@ -181,11 +181,79 @@ async fn replay_with_a_missing_file_is_marked_not_verified_and_does_not_borrow_a
 }
 
 #[tokio::test]
+async fn replay_does_not_consume_lines_written_by_the_same_run() {
+    let dir = TempDir::new("same-run-replay");
+    let task_set = TaskSet::load_initial().expect("内嵌任务集应自洽");
+
+    // 先用规则判断器落一份记录：它是本次混排运行**之前**已存在的内容。
+    let seeded = options(&dir, "run-rule", vec![JudgeName::Rule]);
+    let first = exp::run(&task_set, &seeded)
+        .await
+        .expect("规则运行应能跑完");
+    assert!(first.clean);
+    assert_eq!(
+        read_entries(&seeded.calls_path).expect("记录应可读").len(),
+        task_set.cases.len()
+    );
+
+    // 同一次运行里 simulated-truth 排在 replay 之前，且 --calls 与 --replay 同为默认路径。
+    // 回放只准消费运行前已落盘的行，因此必须复用 rules-v1 的答案。
+    let mixed = options(
+        &dir,
+        "run-mixed",
+        vec![JudgeName::SimulatedTruth, JudgeName::Replay],
+    );
+    let outcome = exp::run(&task_set, &mixed).await.expect("混排运行应能跑完");
+    assert!(outcome.clean);
+
+    let replay = &outcome.report.judges[1];
+    assert_eq!(
+        (replay.judge.as_str(), replay.source),
+        ("replay", JudgeSource::Replay)
+    );
+    assert_eq!(
+        replay.versions,
+        vec!["rules-v1".to_owned()],
+        "回放只能消费本次运行之前已落盘的行，不能拿到本次 simulated-truth 的版本串"
+    );
+    assert_eq!(replay.quality.agreement_rate, Some(1.0));
+
+    // 版本串之外再按答案值对一次：规则给 needs_new_observation = 0.1，模拟真值给 0.0。
+    let entries = read_entries(&mixed.calls_path).expect("记录应可读");
+    let replayed: Vec<&JudgmentRecord> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            CallEntry::Judgment { run, record, .. }
+                if run == "run-mixed" && record.source == JudgeSource::Replay =>
+            {
+                Some(record.as_ref())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed.len(), task_set.cases.len());
+
+    let case = replayed
+        .iter()
+        .find(|record| record.snapshot == SnapshotId::from("case-001-cancel-then-write"))
+        .expect("第一个样本应有回放记录");
+    assert_eq!(
+        case.judgments[&QuestionId::from("needs_new_observation")].answer,
+        Answer::Noul(NoulAnswer { noul: 0.1 }),
+        "这次回放复用的是规则记录，不是本次运行新写入的模拟真值"
+    );
+}
+
+#[tokio::test]
 async fn replay_over_an_empty_log_fails_every_call_without_borrowing_answers() {
     let dir = TempDir::new("empty-log");
     let task_set = TaskSet::load_initial().expect("内嵌任务集应自洽");
-    // 调用记录与回放文件是同一个路径：CallLog 先建出空文件，回放因此没有可复用的记录。
-    let run = options(&dir, "run-empty-log", vec![JudgeName::Replay]);
+    // 回放读一份已存在的空记录，判断记录写到另一个文件：
+    // 空索引不会让构造失败，但每次调用都没有可复用的记录。
+    let empty = dir.join("empty-records.jsonl");
+    std::fs::write(&empty, "").expect("空记录文件应能创建");
+    let mut run = options(&dir, "run-empty-log", vec![JudgeName::Replay]);
+    run.replay_path = empty;
 
     let outcome = exp::run(&task_set, &run)
         .await

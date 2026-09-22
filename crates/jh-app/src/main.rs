@@ -8,9 +8,9 @@
 //!   cargo run -p jh-app -- exp --judge llm
 //! ```
 //!
-//! key 只从环境变量读，命令行与报告里都不出现 key 值。退出码：0 表示每个判断器都跑通了
-//! 任务集的每个样本；1 表示报告已写出但有判断器没跑通（真实通道缺 key 时就是这一档）；
-//! 2 表示连报告都没能产出。
+//! 真实通道的环境变量都必填（`TYPESAFE_API_KEY`；`OPENAI_API_KEY` + `OPENAI_MODEL` +
+//! `OPENAI_BASE_URL`）：缺任何一项该判断器整段标「未验证」，不会拿别的判断器的结果顶替，
+//! 也不会把 key 发往不是本人配置的端点。
 
 use std::path::PathBuf;
 use std::process::ExitCode;

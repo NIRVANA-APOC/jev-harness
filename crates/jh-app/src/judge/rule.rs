@@ -120,6 +120,28 @@ pub const RULES: &[Rule] = &[
     },
 ];
 
+/// 命中规则时的标签质量分配：命中标签取 [`TOP_MASS`]，其余标签均分剩下的质量。
+///
+/// 只有一个标签时（退化问题：单选项或单级标尺）没有「其余标签」可放剩下的质量，
+/// 此时该标签取满 1.0——分布的和必须是 1，不能留下 0.2 悬空。
+fn masses<K: Ord + Clone>(labels: Vec<K>, is_hit: impl Fn(&K) -> bool) -> BTreeMap<K, f64> {
+    let single = labels.len() < 2;
+    let hit_mass = if single { 1.0 } else { TOP_MASS };
+    let other_mass = if single {
+        0.0
+    } else {
+        (1.0 - TOP_MASS) / (labels.len() - 1) as f64
+    };
+
+    labels
+        .into_iter()
+        .map(|label| {
+            let mass = if is_hit(&label) { hit_mass } else { other_mass };
+            (label, mass)
+        })
+        .collect()
+}
+
 /// 规则判断器。
 pub struct RuleJudge {
     rules: &'static [Rule],
@@ -180,24 +202,13 @@ impl Verdict {
     pub fn render(self, question: &Question) -> Result<Answer, Error> {
         match (self, question) {
             (Verdict::Choice(option), Question::Choice(spec)) => {
-                let options: Vec<&String> = spec.criteria.keys().collect();
+                let options: Vec<String> = spec.criteria.keys().cloned().collect();
                 if !spec.criteria.contains_key(option) {
                     return Err(Error::InvalidResponse(format!(
                         "规则给出的选项 `{option}` 不在问题的选项集里"
                     )));
                 }
-                let other_mass = (1.0 - TOP_MASS) / (options.len().max(2) - 1) as f64;
-                let probabilities = options
-                    .iter()
-                    .map(|name| {
-                        let mass = if name.as_str() == option {
-                            TOP_MASS
-                        } else {
-                            other_mass
-                        };
-                        ((*name).clone(), mass)
-                    })
-                    .collect::<BTreeMap<_, _>>();
+                let probabilities = masses(options, |name| name == option);
                 let confidence =
                     derived_confidence(probabilities.values().copied(), spec.criteria.len());
                 Ok(Answer::Choice(ChoiceAnswer {
@@ -214,18 +225,7 @@ impl Verdict {
                     )));
                 }
                 let levels: Vec<u8> = (0..spec.criteria.len() as u8).collect();
-                let other_mass = (1.0 - TOP_MASS) / (levels.len().max(2) - 1) as f64;
-                let probabilities = levels
-                    .iter()
-                    .map(|candidate| {
-                        let mass = if *candidate == level {
-                            TOP_MASS
-                        } else {
-                            other_mass
-                        };
-                        (*candidate, mass)
-                    })
-                    .collect::<BTreeMap<_, _>>();
+                let probabilities = masses(levels, |candidate| *candidate == level);
                 let score = probabilities
                     .iter()
                     .map(|(candidate, mass)| f64::from(*candidate) * mass)
@@ -437,6 +437,7 @@ mod tests {
         for mass in others {
             assert!((mass - (1.0 - TOP_MASS) / 3.0).abs() < 1e-12, "{mass}");
         }
+        assert!((choice.probabilities.values().sum::<f64>() - 1.0).abs() < 1e-12);
 
         let Answer::Score(score) = Verdict::Score(3)
             .render(&score_question())
@@ -447,6 +448,7 @@ mod tests {
         assert_eq!(score.probabilities.len(), 4);
         assert!(score.score > 2.0 && score.score < 3.0);
         assert_eq!(score.legend[&3], "强");
+        assert!((score.probabilities.values().sum::<f64>() - 1.0).abs() < 1e-12);
 
         let Answer::Noul(noul) = Verdict::Noul(0.9)
             .render(&noul_question())
@@ -455,6 +457,40 @@ mod tests {
             panic!("应渲染成 noul 答案");
         };
         assert_eq!(noul.noul, 0.9);
+    }
+
+    #[test]
+    fn a_single_label_question_gets_the_whole_mass() {
+        // 退化问题：只有一个选项 / 只有一级标尺时，剩下的质量无处可放，必须给满 1。
+        let single_choice = Question::Choice(ChoiceQuestion {
+            instructions: "只有一种可能？".to_owned(),
+            criteria: BTreeMap::from([("only".to_owned(), None)]),
+        });
+        let Answer::Choice(choice) = Verdict::Choice("only")
+            .render(&single_choice)
+            .expect("唯一选项应能命中")
+        else {
+            panic!("应渲染成 choice 答案");
+        };
+        assert_eq!(
+            choice.probabilities,
+            BTreeMap::from([("only".to_owned(), 1.0)])
+        );
+        assert_eq!(choice.confidence, 1.0);
+
+        let single_level = Question::Score(ScoreQuestion {
+            instructions: "只有一级？".to_owned(),
+            criteria: vec!["唯一级".to_owned()],
+        });
+        let Answer::Score(score) = Verdict::Score(0)
+            .render(&single_level)
+            .expect("唯一级号应能命中")
+        else {
+            panic!("应渲染成 score 答案");
+        };
+        assert_eq!(score.probabilities, BTreeMap::from([(0, 1.0)]));
+        assert_eq!(score.score, 0.0);
+        assert_eq!(score.confidence, 1.0);
     }
 
     #[test]

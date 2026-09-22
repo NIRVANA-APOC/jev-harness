@@ -107,7 +107,7 @@ async fn jev_judge_sends_one_real_request() {
     smoke(JudgeName::Jev).await;
 }
 
-/// LLM 真调 smoke：`OPENAI_API_KEY` + `OPENAI_MODEL`（+ `OPENAI_BASE_URL`）。
+/// LLM 真调 smoke：`OPENAI_API_KEY` + `OPENAI_MODEL` + `OPENAI_BASE_URL`（三者都必填）。
 #[tokio::test]
 #[ignore = "需要 OPENAI_API_KEY / OPENAI_MODEL 与真实网络：cargo test -p jh-app --test live_smoke -- --ignored"]
 async fn llm_judge_sends_one_real_request() {

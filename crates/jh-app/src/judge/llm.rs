@@ -54,22 +54,29 @@ pub struct LlmJudge {
 }
 
 impl LlmJudge {
-    /// 从环境变量构造：`OPENAI_API_KEY` 与 `OPENAI_MODEL` 必填，`OPENAI_BASE_URL` 可选。
+    /// 从环境变量构造：`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 三者都必填。
     ///
-    /// 模型与端点必须显式给出：仓库不为它们设默认值，避免把请求发到不是本人配置的端点上。
-    /// 自建兼容端点（例如 DeepSeek 的 `https://api.deepseek.com`）写成不带尾斜杠的形式。
+    /// 端点不设默认值：`jh-openai` 的缺省端点是官方 `https://api.openai.com/v1`，而本项目 LLM 侧
+    /// 走的是 DeepSeek；只给模型不给端点会把 key 发到不是本人配置的端点上，所以宁可显式失败。
+    /// 自建兼容端点写成不带尾斜杠的形式（例如 `https://api.deepseek.com`）。
     pub fn from_env() -> Result<Self, Error> {
         let model = std::env::var("OPENAI_MODEL").map_err(|_| {
             Error::Unavailable("缺少 OPENAI_MODEL：LLM 判断必须显式给出模型 ID".to_owned())
         })?;
+        let base_url = std::env::var("OPENAI_BASE_URL").map_err(|_| {
+            Error::Unavailable(
+                "缺少 OPENAI_BASE_URL：LLM 判断必须显式给出端点，\
+                 否则 key 会被发往 jh-openai 的官方缺省端点"
+                    .to_owned(),
+            )
+        })?;
 
-        let mut builder = jh_openai::Client::builder()
+        let client = jh_openai::Client::builder()
             .model(model)
-            .timeout(DEFAULT_TIMEOUT);
-        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-            builder = builder.base_url(base_url);
-        }
-        let client = builder.build().map_err(map_error)?;
+            .base_url(base_url)
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(map_error)?;
         Ok(Self { client })
     }
 }

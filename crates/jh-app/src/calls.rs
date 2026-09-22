@@ -66,7 +66,6 @@ impl CallEntry {
 
 /// 追加写的调用记录文件。
 pub struct CallLog {
-    path: PathBuf,
     file: File,
 }
 
@@ -81,7 +80,7 @@ impl CallLog {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { path, file })
+        Ok(Self { file })
     }
 
     /// 追加一行调用记录并立即 flush：中断也不会丢已完成的调用。
@@ -91,11 +90,6 @@ impl CallLog {
         self.file.write_all(b"\n")?;
         self.file.flush()?;
         Ok(())
-    }
-
-    /// 调用记录文件路径。
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 
