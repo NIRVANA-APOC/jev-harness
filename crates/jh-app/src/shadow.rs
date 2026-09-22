@@ -156,7 +156,9 @@ pub async fn run(
             shadow: Some(plan),
             calls,
         };
-        let trace = run_task(&mut context, &entry.task, &evidence_path).await?;
+        let mut trace = run_task(&mut context, &entry.task, &evidence_path).await?;
+        // 影子运行的轨迹同样自证身份（控制路径 v1 + 影子候选版本）。
+        trace.arm = format!("shadow({})", trace.arm);
         crate::compare::write_json(&trace_path, &trace)?;
         readings.push(reading_of(
             family,

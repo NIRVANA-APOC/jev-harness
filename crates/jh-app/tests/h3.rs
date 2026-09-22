@@ -234,10 +234,44 @@ async fn h3_runs_the_whole_chain_and_the_refined_arm_wins_on_unseen_variants() {
     assert!(report.raw.candidates_file.contains("candidates.json"));
 
     // 报告里写明两臂、统一字段、边界与预声明标准（复核要看得见口径）。
-    assert_eq!(report.protocol.arms.len(), 2);
+    assert_eq!(report.protocol.arms.len(), 4, "两臂 + 两条结构性声明");
+    assert!(report.protocol.arms[2].contains("读取范围"));
     assert!(report.protocol.consumption_protocol.contains("统一字段"));
     assert_eq!(report.protocol.boundaries.len(), 4);
     assert!(!report.protocol.promotion_criteria.is_empty());
+    // 复用候选产物时，生成那一笔按产物读数归成 generation_reused 进成本账与收益扣减。
+    assert_eq!(report.generation.source, "file");
+    assert_eq!(report.generation.calls, 0);
+    let reuse = report.generation.reused.as_ref().expect("有复用读数");
+    assert_eq!(reuse.calls, 3, "三个候选各一次生成调用");
+    assert!(
+        report
+            .cost
+            .by_purpose
+            .iter()
+            .any(|purpose| purpose.purpose == "generation_reused" && purpose.reused),
+        "成本账要有 generation_reused"
+    );
+    let gains = &report.gains.per_judge[0];
+    let purpose_calls = |name: &str| {
+        report
+            .cost
+            .by_purpose
+            .iter()
+            .find(|purpose| purpose.purpose == name)
+            .map(|purpose| purpose.calls)
+            .unwrap_or(0)
+    };
+    assert!(
+        gains.refinement_calls
+            >= purpose_calls("generation_reused")
+                + purpose_calls("validation")
+                + purpose_calls("shadow"),
+        "精化循环调用数要含生成那一笔"
+    );
+    assert!(gains.generation_reused);
+    assert_eq!(gains.generation_calls, reuse.calls);
+    assert_eq!(gains.subsets.len(), 2, "收益要逐子集分列");
     assert!(
         report
             .protocol

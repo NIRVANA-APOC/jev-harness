@@ -38,7 +38,7 @@ use jh_core::{
     FailureSource, JsonlCounterexampleLog, Judge, JudgeSource, NewCounterexample, ObjectId,
     QuestionId, QuestionLibrary, QuestionVersion, SemanticState,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::calls::{CallEntry, CallLog};
 use crate::compare::{
@@ -204,10 +204,29 @@ pub struct GenerationSection {
     pub counterexamples: u32,
     /// 逐对的生成结果。
     pub per_pair: Vec<GenerationEntry>,
-    /// 生成调用数。
+    /// 本次运行里真实发生的生成调用数（`--candidates` 复用候选时为 0）。
     pub calls: u32,
+    /// 复用候选产物时，从产物里读回的生成调用读数（不重复落调用记录，只进成本账）。
+    pub reused: Option<GenerationReuse>,
     /// 失败的生成调用数。
     pub failures: u32,
+}
+
+/// 复用候选产物时读回的生成调用读数（候选文件里记着生成当时的模型、usage 与延迟）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenerationReuse {
+    /// 产物里记着的生成调用数（每个候选一次）。
+    pub calls: u32,
+    /// 实时生成它们的运行标识（候选产物里的 `call` 属于哪一次生成）。
+    pub source_run: String,
+    /// 输入 token 合计（通道上报；缺报时为 `None`）。
+    pub input_tokens: Option<u64>,
+    /// 输出 token 合计。
+    pub output_tokens: Option<u64>,
+    /// 每次生成的延迟（升序）。
+    pub latencies_ms: Vec<u64>,
+    /// 逐候选的模型标识。
+    pub versions: Vec<String>,
 }
 
 /// 一对场景上的生成结果。
@@ -230,8 +249,17 @@ pub struct GenerationEntry {
 pub struct ValidationSection {
     /// 逐对的验证读数。
     pub per_pair: Vec<ValidationEntry>,
-    /// 固定版本在开发案例上的判别一致率（对照读数）。
-    pub fixed_development_rate: Option<f64>,
+    /// 固定版本在开发案例上的**按材料调整后**的一致率（读不到关键证据时正确读法就是 `other`，
+    /// 因此固定版本在这里可以很高）。
+    ///
+    /// 这与晋升判据 4 的**区分率**是两个量：区分率只数「材料足够的判断里读出正确一侧」的比例
+    /// （见 [`GainReading`] 与 `promotion.decisions[].criteria[development_discrimination]`），
+    /// 固定版本在那里必然是 0。两个读数都在报告里，名字不同、口径见 [`ValidationSection::note`]。
+    pub fixed_material_adjusted_agreement_rate: Option<f64>,
+    /// 固定版本在开发案例上的**区分率**（材料足够的判断里读出正确一侧的比例）。
+    pub fixed_discrimination_rate: Option<f64>,
+    /// 口径说明。
+    pub note: String,
 }
 
 /// 一对场景上的验证结果。
@@ -252,6 +280,8 @@ pub struct ValidationEntry {
 pub struct ShadowSection {
     /// 逐对影子读数。
     pub per_pair: Vec<ShadowReadings>,
+    /// 口径与成本说明。
+    pub note: String,
 }
 
 /// 晋升与回退的报告段。
@@ -474,7 +504,7 @@ pub struct GainsSection {
 pub struct GainReading {
     /// 判定器。
     pub judge: String,
-    /// 验收通过与任务数：固定 → 精化。
+    /// 验收通过与任务数（全部未见变体）：固定 → 精化。
     pub acceptance: String,
     /// 验收通过数之差。
     pub acceptance_delta: i32,
@@ -488,12 +518,41 @@ pub struct GainReading {
     pub observation_cost_units: (f64, f64),
     /// 判断调用数：固定 → 精化。
     pub calls: (u32, u32),
-    /// 精化循环本身的调用数（生成 + 验证 + 影子）。
+    /// 精化循环本身的调用数（生成 / 复用生成产物 + 验证 + 影子）。
     pub refinement_calls: u32,
-    /// 精化循环本身的 token（通道上报，缺报时为 `None`）。
+    /// 其中生成那一笔的调用数（复用候选产物时为产物里记着的调用数）。
+    pub generation_calls: u32,
+    /// 生成那一笔的 token（通道上报，缺报时为 `None`）。
+    pub generation_tokens: Option<u64>,
+    /// 生成那一笔的读数是不是从已落盘的候选产物里读回来的。
+    pub generation_reused: bool,
+    /// 精化循环本身的 token（生成 + 验证 + 影子，通道上报，缺报时为 `None`）。
     pub refinement_tokens: Option<u64>,
+    /// B1 / B2 分列的读数（§9.3 要求两子集分别报告）。
+    pub subsets: Vec<SubsetGain>,
     /// 净读数（文字）：收益是什么、代价是什么、哪一条读不出。
     pub net: String,
+}
+
+/// 一个子集上的收益读数（精化臂 − 固定臂）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SubsetGain {
+    /// 子集标签（B1 / B2）。
+    pub subset: String,
+    /// 子集说明。
+    pub description: String,
+    /// 验收通过与任务数：固定 → 精化。
+    pub acceptance: String,
+    /// 验收通过数之差。
+    pub acceptance_delta: i32,
+    /// 不该发出的动作数：固定 → 精化。
+    pub wrong_actions: (u32, u32),
+    /// 恢复的必需动作：固定 → 精化。
+    pub recovered: (String, String),
+    /// 观察动作计价成本：固定 → 精化。
+    pub observation_cost_units: (f64, f64),
+    /// 判断调用数：固定 → 精化。
+    pub calls: (u32, u32),
 }
 
 /// 原始数据位置。
@@ -535,8 +594,11 @@ pub struct CostSection {
 /// 一个用途的调用读数。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PurposeCost {
-    /// 用途（生成 / 验证 / 影子 / 开发案例 / 固定臂 / 精化臂）。
+    /// 用途（生成 / 复用生成产物 / 验证 / 影子 / 开发案例 / 固定臂 / 精化臂）。
     pub purpose: String,
+    /// 这些调用是不是从已落盘的产物里读回来的（`--candidates` 复用生成产物时，生成那一笔为真）：
+    /// 读数来自产物里记着的 usage 与延迟，不重复落调用记录。
+    pub reused: bool,
     /// 调用次数。
     pub calls: u32,
     /// 成功次数。
@@ -551,6 +613,16 @@ pub struct PurposeCost {
     pub latency_p50_ms: Option<u64>,
 }
 
+impl PurposeCost {
+    /// token 合计（缺报时为 `None`）。
+    pub fn total_tokens(&self) -> Option<u64> {
+        match (self.input_tokens, self.output_tokens) {
+            (None, None) => None,
+            (input, output) => Some(input.unwrap_or(0) + output.unwrap_or(0)),
+        }
+    }
+}
+
 /// 空读数（判定器构造失败时用）。
 fn empty_totals() -> ArmTotals {
     ArmTotals::default()
@@ -558,7 +630,6 @@ fn empty_totals() -> ArmTotals {
 
 /// 跑完一次 H3：开发失败 → 生成 → 验证 → 影子 → 晋升 → 两臂对照 → 报告。
 pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Error> {
-    let started = unix_ms();
     let cycle_judge = options.judges[0];
     let traces_root = options.out_dir.join("traces");
     let dev_dir = traces_root.join("development");
@@ -613,7 +684,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
     }
 
     // ---- 2. 候选生成 --------------------------------------------------------------
-    let (generated, generation_calls, generation_source) = match &options.candidates {
+    let (generated, generation_source, generation_reuse) = match &options.candidates {
         CandidateSource::Generate => {
             let generator = Generator::from_env()?;
             let requests: Vec<GenerationRequest<'_>> = family
@@ -634,7 +705,6 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
                 })
                 .collect();
             let produced = generator.generate(family, &requests).await?;
-            let generation_calls = produced.len() as u32;
             for entry in &produced {
                 calls.append(&CallEntry::ModelCall {
                     run: format!("{}-generation", options.run),
@@ -653,21 +723,19 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
                     clean = false;
                 }
             }
-            (produced, generation_calls, "generate".to_owned())
+            (produced, "generate".to_owned(), None)
         }
         CandidateSource::File(path) => {
             let text = std::fs::read_to_string(path).map_err(|error| {
                 Error::TaskSet(format!("候选产物 {} 不可读：{error}", absolute(path)))
             })?;
-            let mut parsed: Vec<GeneratedCandidate> =
-                serde_json::from_str(&text).map_err(|error| {
-                    Error::TaskSet(format!("候选产物 {} 无法解析：{error}", absolute(path)))
-                })?;
-            for entry in &mut parsed {
-                entry.call.error = None;
-            }
-            let generation_calls = parsed.len() as u32;
-            (parsed, generation_calls, "file".to_owned())
+            let parsed: Vec<GeneratedCandidate> = serde_json::from_str(&text).map_err(|error| {
+                Error::TaskSet(format!("候选产物 {} 无法解析：{error}", absolute(path)))
+            })?;
+            // 复用候选产物：生成这一次没发生，但当初生成它们的调用读数在产物里——
+            // 归成 `generation_reused` 进成本账（§6.5 要求收益扣除生成成本），不重复落调用记录。
+            let reuse = generation_reuse(&parsed, &absolute(path));
+            (parsed, "file".to_owned(), Some(reuse))
         }
     };
 
@@ -1146,8 +1214,8 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
     }
 
     // ---- 6. 成本账与报告 -----------------------------------------------------------
-    let cost = cost_section(&calls_path, &options.run, generation_calls)?;
-    let gains = gains_section(&arms, &options.judges, &cost);
+    let cost = cost_section(&calls_path, &options.run, generation_reuse.as_ref())?;
+    let gains = gains_section(&arms, &options.judges, &cost, generation_source == "file");
     let mut protocols = Vec::new();
     for pair in &family.pairs {
         protocols.push(format!(
@@ -1164,6 +1232,8 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
             arms: vec![
                 "fixed：只启用固定问题集（v1）；生成产物停在候选 / 影子状态，不进控制".to_owned(),
                 "refined：达标的候选被发布为 v2 启用，循环读它的定义与读取范围".to_owned(),
+                "结构性声明（读 H3 数字前请先读这一条）：族 B 的固定版本 v1 只读 app.log，而 app.log 的措辞对两侧刻意相容；材料充分性判据（MaterialGate）把「关键对象不在该次投影里」的正确读法定为 other。于是固定臂在未见变体上的判断会全部答对（按材料调整后的真值），但前提门要的是侧标签，补救动作一次也发不出；B2 的观察动作由 other 把关，所以固定臂唯一能发出的必需动作就是那几次观察。固定臂 0/6 与「恢复 = 观察次数」是读取范围与这条判据的**推论**，不是经验性的能力差距；H3 的差值口径因此等价于「启用的读取范围是否包含决定性对象」（§9.3 的 B1 正是检验这一点，§9.2 的消融行是「固定问题集合、保留观察与生成模型」）。".to_owned(),
+                "精化臂能走通还有第二个机制成分：matching 的「证据需求未满足就重问」——问题声明的读取对象里，有哪个现在有当前版本、而手上的答案当时没读到它，那份答案就是在材料不齐时给出的，必须重问（B2 的观察产出靠它接进下一轮判断）。这条规则两臂都生效，只有精化臂的读取范围里包含关键对象，才会被它触发。".to_owned(),
             ],
             consumption_protocol: "两臂共用同一段循环代码、同一套前提门判据（jh_app::matching 的同一函数）、同一批任务、初始证据、判定器配置与决策时机；差别只有问题库当前启用的版本（研究目标 §6.4：新判断通过统一字段进入同一个决策器，不修改消费者代码、决策器提示、权重或控制规则）".to_owned(),
             change_record: "每次晋升记录问题（定义是否变）、输入投影（读取范围是否变）、消费者（标签集合是否变）、策略（控制规则是否变）四路".to_owned(),
@@ -1250,7 +1320,12 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
                 .map(|entries| entries.len() as u32)
                 .sum(),
             per_pair: generation_entries,
-            calls: generation_calls,
+            calls: if generation_reuse.is_some() {
+                0
+            } else {
+                generated.len() as u32
+            },
+            reused: generation_reuse.clone(),
             failures: generated
                 .iter()
                 .filter(|entry| entry.call.error.is_some())
@@ -1258,7 +1333,7 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
         },
         validation: ValidationSection {
             per_pair: validation_entries,
-            fixed_development_rate: {
+            fixed_material_adjusted_agreement_rate: {
                 let rates: Vec<f64> = dev_run
                     .tasks
                     .iter()
@@ -1266,9 +1341,29 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
                     .collect();
                 (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
             },
+            fixed_discrimination_rate: {
+                let rates: Vec<f64> = dev_run
+                    .tasks
+                    .iter()
+                    .map(|summary| {
+                        let entry = family
+                            .task(&summary.task)
+                            .expect("开发案例在族里");
+                        let pair = family.pair(&entry.pair).expect("对存在");
+                        side_rate_of(
+                            Path::new(&summary.trace),
+                            &entry.side,
+                            &pair.key_object,
+                        )
+                    })
+                    .collect();
+                (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
+            },
+            note: "两个「固定版本在开发案例上的率」口径不同：按材料调整后的一致率（fixed_material_adjusted_agreement_rate）把「读不到关键对象时正确读法就是 other」算作答对，固定版本因此可以很高；区分率（fixed_discrimination_rate）只数「材料足够的判断里读出正确一侧」的比例，固定版本一次都没读过关键对象，按 0 记。晋升判据用的是后者。".to_owned(),
         },
         shadow: ShadowSection {
             per_pair: shadow_entries,
+            note: "影子运行的成本记在 `cost.by_purpose[shadow]` 下，其中含同一次运行里控制路径（固定版本 v1）的判断请求：影子判断是每个开发案例每轮额外一次，控制路径请求照常发生，因此那一笔调用数大于影子判断条数。影子判断的条数见 `per_pair[].stats.shadow_judgments`。".to_owned(),
         },
         promotion: PromotionSection {
             decisions,
@@ -1293,8 +1388,40 @@ pub async fn run(family: &FamilyB, options: &H3Options) -> Result<H3Outcome, Err
         notes: declared_notes(),
     };
 
-    let _ = started;
     Ok(H3Outcome { report, clean })
+}
+
+/// 复用候选产物时的生成读数（从产物里读回，不重复落调用记录）。
+fn generation_reuse(parsed: &[GeneratedCandidate], path: &str) -> GenerationReuse {
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut usage_seen = false;
+    let mut latencies = Vec::new();
+    let mut versions = Vec::new();
+    for entry in parsed {
+        if let Some(usage) = &entry.call.usage {
+            usage_seen = true;
+            input_tokens += usage.input_tokens.unwrap_or(0);
+            output_tokens += usage.output_tokens.unwrap_or(0);
+        }
+        latencies.push(entry.call.latency_ms);
+        versions.push(
+            entry
+                .call
+                .version
+                .clone()
+                .unwrap_or_else(|| "未记录".to_owned()),
+        );
+    }
+    latencies.sort_unstable();
+    GenerationReuse {
+        calls: parsed.len() as u32,
+        source_run: path.to_owned(),
+        input_tokens: usage_seen.then_some(input_tokens),
+        output_tokens: usage_seen.then_some(output_tokens),
+        latencies_ms: latencies,
+        versions,
+    }
 }
 
 /// 一臂的跑批结果（内部用）。
@@ -1350,7 +1477,10 @@ async fn run_arm(
             shadow: None,
             calls,
         };
-        let trace = run_task(&mut context, &entry.task, &evidence_path).await?;
+        let mut trace = run_task(&mut context, &entry.task, &evidence_path).await?;
+        // 轨迹的 `arm` 字段写上真实的 H3 臂名（H1/H2 口径留作后缀）：两臂的轨迹要能自证身份，
+        // 不能只在文件名与目录里区分。
+        trace.arm = format!("{arm}({})", trace.arm);
         write_json(&trace_path, &trace)?;
         absorb(
             &mut outcome,
@@ -1468,24 +1598,28 @@ fn summary_of(
             )
         })
         .collect();
-    let observation_cost_units: f64 = trace
-        .decisions
-        .iter()
-        .filter(|decision| decision.outcome == DecisionOutcome::Executed)
-        .filter(|decision| {
-            entry
-                .task
-                .action(&decision.action)
-                .is_some_and(|spec| spec.effect.is_some())
-        })
-        .map(|decision| decision.cost_units)
-        .sum();
-    let action_cost_units: f64 = trace
-        .decisions
-        .iter()
-        .filter(|decision| decision.outcome == DecisionOutcome::Executed)
-        .map(|decision| decision.cost_units)
-        .sum();
+    let observation_cost_units = normalize_zero(
+        trace
+            .decisions
+            .iter()
+            .filter(|decision| decision.outcome == DecisionOutcome::Executed)
+            .filter(|decision| {
+                entry
+                    .task
+                    .action(&decision.action)
+                    .is_some_and(|spec| spec.effect.is_some())
+            })
+            .map(|decision| decision.cost_units)
+            .sum::<f64>(),
+    );
+    let action_cost_units = normalize_zero(
+        trace
+            .decisions
+            .iter()
+            .filter(|decision| decision.outcome == DecisionOutcome::Executed)
+            .map(|decision| decision.cost_units)
+            .sum::<f64>(),
+    );
 
     let acceptance = trace.acceptance.clone().unwrap_or_else(|| {
         accept(
@@ -1563,8 +1697,16 @@ fn totals_of(tasks: &[TaskSummary]) -> ArmTotals {
         totals.action_cost_units += task.action_cost_units;
         totals.wrong_actions += task.wrong_actions.len() as u32;
     }
+    // 空和的 `-0.0` 归一成 `0.0`：报告里不该出现负零的计价值。
+    totals.observation_cost_units = normalize_zero(totals.observation_cost_units);
+    totals.action_cost_units = normalize_zero(totals.action_cost_units);
     totals.recovered = format!("{}/{}", totals.recovered_actions, totals.required_actions);
     totals
+}
+
+/// 把 `-0.0` 归一成 `0.0`（`-0.0 + 0.0 = +0.0`，其他值不变）。
+fn normalize_zero(value: f64) -> f64 {
+    value + 0.0
 }
 
 fn subset_reports(tasks: &[TaskSummary]) -> Vec<SubsetReport> {
@@ -1906,43 +2048,45 @@ fn dev_answer(run: &ArmRun, task: &str, question: &QuestionId) -> Option<Answer>
 }
 
 /// 精化收益：两臂之差与精化循环的成本并排（§10.1、§6.5）。
-fn gains_section(arms: &[ArmReport], judges: &[JudgeName], cost: &CostSection) -> GainsSection {
+fn gains_section(
+    arms: &[ArmReport],
+    judges: &[JudgeName],
+    cost: &CostSection,
+    generation_reused: bool,
+) -> GainsSection {
+    // 精化循环的成本：生成（或复用生成产物）+ 验证 + 影子。生成那一笔在复用候选时来自产物读数。
+    let is_refinement_cost = |purpose: &str| {
+        matches!(
+            purpose,
+            "generation" | "generation_reused" | "validation" | "shadow"
+        )
+    };
     let refinement_calls: u32 = cost
         .by_purpose
         .iter()
-        .filter(|purpose| {
-            matches!(
-                purpose.purpose.as_str(),
-                "generation" | "validation" | "shadow"
-            )
-        })
+        .filter(|purpose| is_refinement_cost(&purpose.purpose))
         .map(|purpose| purpose.calls)
         .sum();
     let refinement_tokens: Option<u64> = {
-        let input: u64 = cost
+        let tokens: u64 = cost
             .by_purpose
             .iter()
-            .filter(|purpose| {
-                matches!(
-                    purpose.purpose.as_str(),
-                    "generation" | "validation" | "shadow"
-                )
-            })
-            .filter_map(|purpose| purpose.input_tokens)
+            .filter(|purpose| is_refinement_cost(&purpose.purpose))
+            .filter_map(|purpose| purpose.total_tokens())
             .sum();
-        let output: u64 = cost
-            .by_purpose
-            .iter()
-            .filter(|purpose| {
-                matches!(
-                    purpose.purpose.as_str(),
-                    "generation" | "validation" | "shadow"
-                )
-            })
-            .filter_map(|purpose| purpose.output_tokens)
-            .sum();
-        (input + output > 0).then_some(input + output)
+        (tokens > 0).then_some(tokens)
     };
+    let generation_purpose = if generation_reused {
+        "generation_reused"
+    } else {
+        "generation"
+    };
+    let generation_cost = cost
+        .by_purpose
+        .iter()
+        .find(|purpose| purpose.purpose == generation_purpose);
+    let generation_calls = generation_cost.map(|purpose| purpose.calls).unwrap_or(0);
+    let generation_tokens = generation_cost.and_then(|purpose| purpose.total_tokens());
 
     let mut per_judge = Vec::new();
     for name in judges {
@@ -1963,15 +2107,29 @@ fn gains_section(arms: &[ArmReport], judges: &[JudgeName], cost: &CostSection) -
         let acceptance_delta = acceptance_of(refined) - acceptance_of(fixed);
         let wrong_actions_delta =
             refined.totals.wrong_actions as i32 - fixed.totals.wrong_actions as i32;
+        let generation_note = if generation_reused {
+            format!("生成（复用候选产物里记着的 {generation_calls} 次调用）")
+        } else {
+            format!("生成 {generation_calls} 次")
+        };
         let net = format!(
-            "收益：验收 {} → {}（{:+} 个任务）、不该发出的动作 {} → {}（{:+}）；代价：精化循环 {} 次调用（生成 + 验证 + 影子）{}、两臂判断调用 {} vs {}、观察计价 {} vs {} 单位。读数只记原值：不做「收益大于成本」的自动判定，货币成本本项目不虚构。",
+            "收益：验收 {} → {}（{:+} 个任务）、不该发出的动作 {} → {}（{:+}）；代价：精化循环 {refinement_calls} 次调用（{generation_note} + 验证 {} + 影子 {}）{}、两臂判断调用 {} vs {}、观察计价 {} vs {} 单位。成本已含生成、验证与影子（后续评估）三笔；读数只记原值：不做「收益大于成本」的自动判定，货币成本本项目不虚构。",
             fixed.totals.acceptance,
             refined.totals.acceptance,
             acceptance_delta,
             fixed.totals.wrong_actions,
             refined.totals.wrong_actions,
             wrong_actions_delta,
-            refinement_calls,
+            cost.by_purpose
+                .iter()
+                .find(|purpose| purpose.purpose == "validation")
+                .map(|purpose| purpose.calls)
+                .unwrap_or(0),
+            cost.by_purpose
+                .iter()
+                .find(|purpose| purpose.purpose == "shadow")
+                .map(|purpose| purpose.calls)
+                .unwrap_or(0),
             refinement_tokens
                 .map(|tokens| format!("（{tokens} token）"))
                 .unwrap_or_else(|| "（token 未上报）".to_owned()),
@@ -1980,6 +2138,40 @@ fn gains_section(arms: &[ArmReport], judges: &[JudgeName], cost: &CostSection) -
             fixed.totals.observation_cost_units,
             refined.totals.observation_cost_units,
         );
+        let subsets = fixed
+            .subsets
+            .iter()
+            .filter_map(|fixed_subset| {
+                let refined_subset = refined
+                    .subsets
+                    .iter()
+                    .find(|subset| subset.subset == fixed_subset.subset)?;
+                Some(SubsetGain {
+                    subset: fixed_subset.subset.clone(),
+                    description: fixed_subset.description.clone(),
+                    acceptance: format!(
+                        "{} → {}",
+                        fixed_subset.totals.acceptance, refined_subset.totals.acceptance
+                    ),
+                    acceptance_delta: acceptance_of_subset(&refined_subset.totals)
+                        - acceptance_of_subset(&fixed_subset.totals),
+                    wrong_actions: (
+                        fixed_subset.totals.wrong_actions,
+                        refined_subset.totals.wrong_actions,
+                    ),
+                    recovered: (
+                        fixed_subset.totals.recovered.clone(),
+                        refined_subset.totals.recovered.clone(),
+                    ),
+                    observation_cost_units: (
+                        fixed_subset.totals.observation_cost_units,
+                        refined_subset.totals.observation_cost_units,
+                    ),
+                    calls: (fixed_subset.totals.asks, refined_subset.totals.asks),
+                })
+            })
+            .collect();
+
         per_judge.push(GainReading {
             judge: name.cli_name().to_owned(),
             acceptance: format!(
@@ -1999,19 +2191,36 @@ fn gains_section(arms: &[ArmReport], judges: &[JudgeName], cost: &CostSection) -
             ),
             calls: (fixed.calls.attempted, refined.calls.attempted),
             refinement_calls,
+            generation_calls,
+            generation_tokens,
+            generation_reused,
             refinement_tokens,
+            subsets,
             net,
         });
     }
 
     GainsSection {
         per_judge,
-        note: "精化收益按判定器分别给出：差值是精化臂 − 固定臂，两臂共享任务集、初始证据、判定器配置与决策时机，差别只有问题库启用的版本。成本侧包含生成、验证、影子（后续评估）与两臂判断调用；维护成本的一等表达是问题库的版本数与停用/替代记录（见 promotion.library）。".to_owned(),
+        note: "精化收益按判定器分别给出，并逐子集（B1 / B2）分列：差值是精化臂 − 固定臂，两臂共享任务集、初始证据、判定器配置与决策时机，差别只有问题库启用的版本。成本侧包含生成（复用候选产物时取产物里记着的调用读数）、验证、影子（后续评估）与两臂判断调用；维护成本的一等表达是问题库的版本数与替代/回退记录（见 promotion.library）。差值口径的限定见 protocol.metric_definitions.refinement_gain。".to_owned(),
     }
 }
 
+/// 某个合计里的验收通过数。
+fn acceptance_of_subset(totals: &ArmTotals) -> i32 {
+    totals
+        .acceptance
+        .split_once('/')
+        .and_then(|(passed, _)| passed.parse::<u32>().ok())
+        .unwrap_or(0) as i32
+}
+
 /// 成本账：从调用记录里按 `run` 标识统计每个用途的调用读数。
-fn cost_section(calls_path: &Path, run: &str, generation_calls: u32) -> Result<CostSection, Error> {
+fn cost_section(
+    calls_path: &Path,
+    run: &str,
+    generation_reuse: Option<&GenerationReuse>,
+) -> Result<CostSection, Error> {
     let entries = crate::calls::read_entries(calls_path)?;
     let purposes = [
         ("generation", format!("{run}-generation")),
@@ -2079,6 +2288,25 @@ fn cost_section(calls_path: &Path, run: &str, generation_calls: u32) -> Result<C
         total.failed += stats.failed;
         by_purpose.push(stats);
     }
+
+    // 复用候选产物时，生成这一次没发生：把产物里记着的调用读数归成 `generation_reused`
+    // （不重复落调用记录，但成本账与收益扣减都要算上它——§6.5）。
+    if let Some(reuse) = generation_reuse {
+        let stats = PurposeCost {
+            purpose: "generation_reused".to_owned(),
+            reused: true,
+            calls: reuse.calls,
+            succeeded: reuse.calls,
+            failed: 0,
+            input_tokens: reuse.input_tokens,
+            output_tokens: reuse.output_tokens,
+            latency_p50_ms: metrics::percentile(&reuse.latencies_ms, 0.5),
+        };
+        total.calls += stats.calls;
+        total.succeeded += stats.succeeded;
+        by_purpose.push(stats);
+    }
+
     total.input_tokens = by_purpose
         .iter()
         .filter_map(|entry| entry.input_tokens)
@@ -2101,11 +2329,20 @@ fn cost_section(calls_path: &Path, run: &str, generation_calls: u32) -> Result<C
     };
 
     let logged = logged_calls(calls_path, run)?;
+    let generation_note = match generation_reuse {
+        Some(reuse) => format!(
+            "本次运行没有重新生成候选：候选产物 {} 里记着当初 {} 次生成调用（模型 {}），这一笔按原值归成 generation_reused 计入成本与收益扣减，不重复落调用记录",
+            reuse.source_run,
+            reuse.calls,
+            reuse.versions.join("、")
+        ),
+        None => "生成调用按本次运行的调用记录统计（purpose=generation）".to_owned(),
+    };
     Ok(CostSection {
         by_purpose,
         total,
         note: format!(
-            "成本只记可核的量：调用次数、token（通道上报）、延迟中位数；本项目不虚构货币价格。生成调用 {generation_calls} 次（本运行标识下共记 {logged} 条调用记录）；观察动作的计价成本按任务族自定单位单独记在动作成本里。"
+            "成本只记可核的量：调用次数、token（通道上报）、延迟中位数；本项目不虚构货币价格。{generation_note}；本运行标识（{run}）下共记 {logged} 条调用记录；观察动作的计价成本按任务族自定单位单独记在动作成本里。"
         ),
     })
 }
@@ -2127,7 +2364,11 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ),
         (
             "refinement_gain".to_owned(),
-            "未见变体上的精化收益 = 精化臂 − 固定臂（验收通过数、不该发出的动作数、恢复的必需动作数、观察成本），逐判定器与逐子集分别读。".to_owned(),
+            "未见变体上的精化收益 = 精化臂 − 固定臂（验收通过数、不该发出的动作数、恢复的必需动作数、观察成本、判断调用数），逐判定器给出、并逐子集（B1 / B2）分列（gains.per_judge[].subsets）。差值口径的限定：族 B 的固定版本读不到关键证据，0/6 是读取范围的推论（见 protocol.arms 与 notes），所以这个差值等价于「启用的读取范围是否包含决定性对象」，不能当作「精化一般有价值」的证据；精化臂在 B2 上还依赖「证据需求未满足就重问」。".to_owned(),
+        ),
+        (
+            "discrimination".to_owned(),
+            "区分率 = 材料足够的判断里读出正确一侧的比例（材料足够 = 关键证据在该判断的输入投影里）；一次都没读到关键证据时记 0。它与「按材料调整后的一致率」不同：后者把「读不到就答 other」算作正确（读法正确但拿不到决定性材料）。报告里两个量分开命名：validation.fixed_discrimination_rate 与 validation.fixed_material_adjusted_agreement_rate、晋升判据 4 用前者。".to_owned(),
         ),
         (
             "cost".to_owned(),
@@ -2164,7 +2405,9 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
 fn declared_notes() -> Vec<String> {
     vec![
         "两臂共享任务集、初始证据、判定器配置与决策时机；差别只有问题库当前启用的版本。".to_owned(),
-        "生成、验证、影子、开发案例与两臂的真实调用全部记账（调用记录 JSONL，按 run 标识分组），报告里的 cost 段是收益读数的成本侧。".to_owned(),
+        "固定臂在族 B 未见变体上的失败是读取范围的推论：v1 只读 app.log（两侧措辞相容），而「关键对象不在该题投影里」的正确读法是 other —— 判断按材料调整后的真值全对，但前提门要侧标签，补救动作发不出；B2 的观察动作由 other 把关，因此固定臂的「恢复」只剩观察动作那几次。见 protocol.arms 的结构性声明。".to_owned(),
+        "H3 的差值口径 = 启用的读取范围是否包含决定性对象；它不是「精化一般有价值」的证据，也不能外推到其它任务族。精化臂在 B2 上还依赖 matching 的「证据需求未满足就重问」把观察产出接进下一轮。".to_owned(),
+        "生成、验证、影子（后续评估）、开发案例与两臂的真实调用全部记账（调用记录 JSONL，按 run 标识分组）；复用候选产物时生成那一笔按产物里记着的 usage 与延迟归成 generation_reused 计入成本与收益扣减。报告里的 cost 与 gains 是收益读数的成本侧。".to_owned(),
         "模拟真值不参与本对照（研究目标 §9.2）：它没有资格出现在任务族 B 的两臂里，构造被显式拒绝。".to_owned(),
         "开发案例（development）只用于反例提取、候选验证与晋升判据；H3 的对照读数只在未见变体上采集。".to_owned(),
         "看不到的读数就说看不到：判定器缺凭据、生成失败、候选未达标都如实记，不用别的来源顶替。".to_owned(),
@@ -2267,7 +2510,7 @@ impl H3Report {
         }
         for reading in &self.gains.per_judge {
             lines.push(format!(
-                "精化收益（{}）：验收 {}（{:+}）｜错动作 {} → {}｜恢复 {} → {}｜调用 {} vs {}｜精化循环 {} 次",
+                "精化收益（{}）：验收 {}（{:+}）｜错动作 {} → {}｜恢复 {} → {}｜调用 {} vs {}｜精化循环 {} 次（生成 {} 笔{} + 验证 + 影子）",
                 reading.judge,
                 reading.acceptance,
                 reading.acceptance_delta,
@@ -2278,7 +2521,23 @@ impl H3Report {
                 reading.calls.0,
                 reading.calls.1,
                 reading.refinement_calls,
+                reading.generation_calls,
+                if reading.generation_reused { "，复用产物" } else { "" },
             ));
+            for subset in &reading.subsets {
+                lines.push(format!(
+                    "   {}：验收 {}（{:+}）｜错动作 {} → {}｜恢复 {} → {}｜调用 {} vs {}",
+                    subset.subset,
+                    subset.acceptance,
+                    subset.acceptance_delta,
+                    subset.wrong_actions.0,
+                    subset.wrong_actions.1,
+                    subset.recovered.0,
+                    subset.recovered.1,
+                    subset.calls.0,
+                    subset.calls.1,
+                ));
+            }
         }
         for purpose in &self.cost.by_purpose {
             lines.push(format!(

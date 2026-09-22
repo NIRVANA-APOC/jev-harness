@@ -832,6 +832,46 @@ mod tests {
         assert!(!outcomes[7].passed);
     }
 
+    /// 行为型拒绝：候选读得到关键证据（材料足够）却答成兜底读法时，正例一致率会掉下来，
+    /// 判据「正例一致率」必须把它拒掉——这是与契约型拒绝（refines/标签/消费者/证据对象）不同的一条路。
+    #[test]
+    fn reading_based_criteria_reject_a_candidate_that_answers_wrong_on_sufficient_material() {
+        let thresholds = declared_thresholds();
+        let input = CriteriaInput {
+            // 契约与协议全部通过：候选确实精化了门控问题、读到了关键证据。
+            contract_passed: true,
+            contract_failures: Vec::new(),
+            development_rate: Some(0.0),
+            development_rate_fixed: Some(0.0),
+            // 正例全错（材料足够却答 other）、反例全对。
+            positive_rate: Some(0.0),
+            negative_rate: Some(1.0),
+            unseen_rate: Some(0.0),
+            toward_justified: 0,
+            toward_unjustified: 0,
+            shadow_failures: 0,
+        };
+
+        let outcomes = evaluate(&input, &thresholds);
+        assert!(
+            !outcomes.iter().all(|item| item.passed),
+            "读得到关键证据却答错侧的候选不能晋升"
+        );
+        let failed: Vec<&str> = outcomes
+            .iter()
+            .filter(|item| !item.passed)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert!(failed.contains(&"positive_cases"), "{failed:?}");
+        assert!(
+            failed.contains(&"development_discrimination")
+                && failed.contains(&"shadow_branch_change"),
+            "{failed:?}"
+        );
+        // 契约与协议三条仍是通过的：拒绝的理由是读数，不是形状。
+        assert!(outcomes[0].passed && outcomes[1].passed && outcomes[2].passed);
+    }
+
     #[test]
     fn promoting_and_rolling_back_invalidate_and_keep_the_old_version() {
         let family = FamilyB::load().unwrap();

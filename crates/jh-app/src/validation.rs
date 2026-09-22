@@ -412,4 +412,97 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// 行为型拒绝：候选**读得到**关键证据（材料足够），却仍答成兜底读法——正例全错，
+    /// 判据「正例一致率」会把它拒掉；这不是契约型拒绝（契约一切正常）。
+    #[tokio::test]
+    async fn a_candidate_that_reads_the_key_evidence_but_answers_other_fails_the_positives() {
+        let family = FamilyB::load().unwrap();
+        let judge = AlwaysOther;
+        let dir = std::env::temp_dir().join(format!(
+            "jh-app-validation-wrongside-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut calls = CallLog::open(dir.join("calls.jsonl")).unwrap();
+        let question = QuestionId::from("b_pair_cause_p1");
+        let spec = QuestionSpec {
+            version: jh_core::QuestionVersion(2),
+            question: family.question(&question).unwrap().question.clone(),
+        };
+        let reads = [
+            ObjectId::from("app.log"),
+            ObjectId::from("credential.audit"),
+        ];
+
+        let run = run(
+            &family,
+            &spec,
+            &question,
+            &reads,
+            &judge,
+            JudgeName::Rule,
+            "validation-wrongside",
+            &mut calls,
+        )
+        .await
+        .expect("本地判定器不会失败");
+
+        // 材料是够的（读取范围含关键证据），答案却是兜底读法：正例 0、反例 1。
+        assert_eq!(run.reads, reads.to_vec());
+        assert_eq!(run.rate_of(CaseKind::Positive), Some(0.0));
+        assert_eq!(run.rate_of(CaseKind::Negative), Some(1.0));
+        assert_eq!(run.stats.failed, 0, "判定本身没有失败，是答案错");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 一律答 `other` 的判定器（行为型拒绝的对照）。
+    struct AlwaysOther;
+
+    impl Judge for AlwaysOther {
+        fn judge<'a>(
+            &'a self,
+            request: &'a JudgeRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<jh_core::JudgeResponse, jh_core::Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let mut answers = BTreeMap::new();
+                for (id, spec) in &request.questions {
+                    let answer = match &spec.question {
+                        jh_core::Question::Choice(choice) => {
+                            if !choice.criteria.contains_key("other") {
+                                return Err(jh_core::Error::Unavailable(
+                                    "这道题没有 other 选项".to_owned(),
+                                ));
+                            }
+                            jh_core::Answer::Choice(jh_core::ChoiceAnswer {
+                                choice: "other".to_owned(),
+                                probabilities: BTreeMap::from([("other".to_owned(), 1.0)]),
+                                confidence: 1.0,
+                            })
+                        }
+                        other => {
+                            return Err(jh_core::Error::Unavailable(format!(
+                                "只支持选择类：{other:?}"
+                            )));
+                        }
+                    };
+                    answers.insert(id.clone(), answer);
+                }
+                Ok(jh_core::JudgeResponse {
+                    source: jh_core::JudgeSource::Rule,
+                    version: "always-other-v1".to_owned(),
+                    answers,
+                    usage: None,
+                    request_id: None,
+                })
+            })
+        }
+    }
 }
