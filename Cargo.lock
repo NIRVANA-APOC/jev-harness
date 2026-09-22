@@ -1147,6 +1147,22 @@ name = "jh-app"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "jh-core",
+ "jh-jev",
+ "jh-openai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "jh-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
