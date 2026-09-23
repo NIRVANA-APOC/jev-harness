@@ -1518,10 +1518,10 @@ async fn run_channel_cell(
             Structure::Maintained => case.channel.clone(),
         };
         let Some(material) = material else {
-            // 通道没建起来（契约被拒或检验没过）：这一臂在这个族上没有材料，判读标失败态。
+            // 通道没建起来（契约被拒或检验没过）：这一臂在这个族上没有材料，判读记失败态
+            // （既不折成「成立」也不算「违反」），用例照常进分母、另按失败计数。
             let verdict = c_measure::Verdict::failed("观察通道未启用：没有可用材料");
             counts.score(&case.hidden, &verdict);
-            counts.cases -= 1; // 上面已经把失败态记进分母了，这里只保留「无材料」的读数
             counts.failures += 1;
             by_implementation
                 .entry(case.implementation.id().to_owned())
@@ -2818,11 +2818,34 @@ struct RawRepeat {
 /// 一个格的原始运行结果（报告组装前）。
 struct RawCell {
     purpose: String,
+    /// 报告里的四个标签（臂 / 结构 / 通道 / 循环开关）；`None` 时按 [`Arm`] 推。
+    label: Option<CellLabel>,
     key: OwnedCellKey,
     repeats: Vec<RawRepeat>,
     traces: Vec<String>,
     evidence_files: Vec<String>,
     verification: Verification,
+}
+
+/// 报告里的标签覆盖：原生基线臂不是 2×2 里的任何一格，标签要如实写开。
+#[derive(Debug, Clone)]
+struct CellLabel {
+    arm: String,
+    structure: String,
+    judge: String,
+    loop_arm: String,
+}
+
+impl CellLabel {
+    /// 原生基线臂的标签。
+    fn native() -> Self {
+        Self {
+            arm: "native-llm".to_owned(),
+            structure: "native".to_owned(),
+            judge: "llm".to_owned(),
+            loop_arm: "n/a（单循环，不用依赖维护）".to_owned(),
+        }
+    }
 }
 
 impl RawCell {
@@ -2868,17 +2891,30 @@ impl RawCell {
                     .collect::<Vec<f64>>(),
             ),
         };
-        LoopCell {
-            purpose: self.purpose.clone(),
+        let mut verification = self.verification.clone();
+        if verification.status == VerificationStatus::Verified {
+            verification.detail = format!(
+                "真实通道调用 {} 次，失败 {} 次",
+                bucket.calls.attempted, bucket.calls.failed
+            );
+        }
+        let label = self.label.clone().unwrap_or_else(|| CellLabel {
             arm: self.key.arm.label(),
             structure: self.key.arm.structure.label().to_owned(),
             judge: self.key.arm.judge.label().to_owned(),
+            loop_arm: self.key.arm.loop_arm().label().to_owned(),
+        });
+        LoopCell {
+            purpose: self.purpose.clone(),
+            arm: label.arm,
+            structure: label.structure,
+            judge: label.judge,
             family: self.key.family.clone(),
             evidence: self.key.evidence.label().to_owned(),
             cadence: self.key.cadence.label(),
             scale: self.key.scale,
-            loop_arm: self.key.arm.loop_arm().label().to_owned(),
-            verification: self.verification.clone(),
+            loop_arm: label.loop_arm,
+            verification,
             repeats: self.repeats.len(),
             per_repeat,
             variance,
@@ -2893,11 +2929,13 @@ impl RawCell {
 }
 
 /// 判定器的验证状态（真实通道 vs 本地判定器）。
-fn verification_for(name: JudgeName, calls: u32, failures: u32) -> Verification {
+///
+/// 真实通道的调用次数在报告组装阶段从调用记录回填（[`RawCell::loop_cell`]），因为这一刻还没跑。
+fn verification_for(name: JudgeName) -> Verification {
     if name.live() {
         Verification {
             status: VerificationStatus::Verified,
-            detail: format!("真实通道调用 {calls} 次，失败 {failures} 次"),
+            detail: "真实通道（调用次数见调用记录）".to_owned(),
         }
     } else {
         Verification {
@@ -2974,6 +3012,7 @@ pub async fn run(options: &M4Options) -> Result<M4Outcome, Error> {
                 let (name, judge) = &built[arm.judge.label()];
                 let mut raw = RawCell {
                     purpose: purpose.to_owned(),
+                    label: None,
                     key: OwnedCellKey {
                         arm: *arm,
                         evidence,
@@ -2985,7 +3024,7 @@ pub async fn run(options: &M4Options) -> Result<M4Outcome, Error> {
                     traces: Vec::new(),
                     evidence_files: Vec::new(),
                     verification: match judge {
-                        Ok(_) => verification_for(*name, 0, 0),
+                        Ok(_) => verification_for(*name),
                         Err(detail) => unavailable_verification(*name, detail),
                     },
                 };
@@ -3031,6 +3070,7 @@ pub async fn run(options: &M4Options) -> Result<M4Outcome, Error> {
             Ok(client) => {
                 let mut raw = RawCell {
                     purpose: "native".to_owned(),
+                    label: Some(CellLabel::native()),
                     key: OwnedCellKey {
                         arm: Arm {
                             structure: Structure::Loop,
@@ -3074,6 +3114,7 @@ pub async fn run(options: &M4Options) -> Result<M4Outcome, Error> {
                 judge_failures += 1;
                 native_raw = Some(RawCell {
                     purpose: "native".to_owned(),
+                    label: Some(CellLabel::native()),
                     key: OwnedCellKey {
                         arm: Arm {
                             structure: Structure::Loop,
@@ -4059,6 +4100,22 @@ mod tests {
         assert_eq!(counts.inconclusive_on_clean, 1);
         assert_eq!(counts.cases, 6, "隐藏检查失败的用例不进计数");
         assert!(matches!(failed.verdict, ObserverVerdict::Failed(_)));
+    }
+
+    #[test]
+    fn the_native_cell_labels_itself_apart_from_the_two_by_two() {
+        // 先导批次的报告里原生臂的 `arm` 字段一度被写成 `loop-llm`（两处都用同一套标签推导），
+        // 这里把标签钉住：原生臂不是 2×2 里的任何一格。
+        let label = CellLabel::native();
+        assert_eq!(label.arm, "native-llm");
+        assert_eq!(label.structure, "native");
+        assert_eq!(label.judge, "llm");
+        assert!(label.loop_arm.starts_with("n/a"));
+        assert!(
+            Arm::ALL
+                .iter()
+                .all(|arm| arm.label() != label.arm && arm.structure.label() != label.structure)
+        );
     }
 
     #[test]
