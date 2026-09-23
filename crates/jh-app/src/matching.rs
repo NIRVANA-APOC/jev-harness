@@ -87,6 +87,41 @@ impl Recompute {
     }
 }
 
+/// 重查的触发方式：M4 的 H5 消融（研究目标 §9.2 第 7 行「固定频率检查」）。
+///
+/// 这是 [`schedule`] 里除了 H1/H2 之外的第三个开关，但它**不进 [`Arm`]**：臂是「结构」维度，
+/// 节奏是「什么时候查」这一独立维度，M4 拿它做密度扫描（研究目标 §9.4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cadence {
+    /// 依赖触发：失效标记或「证据需求没满足」触发重查（M1–M3 的既有行为）。
+    Triggered,
+    /// 固定频率：每 `k` 轮（轮号从 0 起）把本任务跟踪的全部问题重查一遍，与失效标记无关。
+    ///
+    /// 「证据需求没满足就重问」这条独立于臂的规则仍然生效——它是问题集契约的一部分
+    /// （问题声明的读取对象里出现了当前版本、而手上的答案没读到它），不是失效驱动的调度。
+    FixedEvery(u32),
+}
+
+impl Cadence {
+    /// 报告里的标签。
+    pub fn label(self) -> String {
+        match self {
+            Self::Triggered => "triggered".to_owned(),
+            Self::FixedEvery(every) => format!("every-{every}"),
+        }
+    }
+
+    /// 从标签解析（CLI 与密度扫描共用一处拼法）。
+    pub fn parse(label: &str) -> Option<Self> {
+        if label == "triggered" {
+            return Some(Self::Triggered);
+        }
+        let every: u32 = label.strip_prefix("every-")?.parse().ok()?;
+        (every > 0).then_some(Self::FixedEvery(every))
+    }
+}
+
 /// 一组对照臂：H1（依赖失效传播开/关）× H2（增量/全量）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Arm {
@@ -369,6 +404,8 @@ pub struct LoopContext<'a> {
     pub channel: JudgeName,
     /// 对照臂。
     pub arm: Arm,
+    /// 重查节奏（M4 的 H5 消融；M1–M3 一律 [`Cadence::Triggered`]）。
+    pub cadence: Cadence,
     /// 运行标识。
     pub run: String,
     /// 真实通道的端点（由调用方从环境变量给出，不含 key）；本地判定器为 `None`。
@@ -487,7 +524,14 @@ pub async fn run_task(
             .extend(environment.apply_round(round, StepWhen::BeforeAsk, &mut state)?);
 
         // 2. 发请求：按臂的调度决定问什么、按读取范围分组；本步只发不收。
-        let (asks, reuses) = schedule(context.arm, context.family, task, round, &state)?;
+        let (asks, reuses) = schedule(
+            context.arm,
+            context.cadence,
+            context.family,
+            task,
+            round,
+            &state,
+        )?;
         trace.reuses.extend(reuses);
         let mut sent = Vec::with_capacity(asks.len());
         for ask in asks {
@@ -580,11 +624,15 @@ struct Ask {
 ///
 /// **H1 开关的唯一分叉点之一**：关闭臂只问「从没答上来的问题」，不看失效标记。
 ///
-/// 不在这条分叉里的另一条规则（两臂、两个族都适用）：**证据需求没满足就重问**——问题声明的读取
+/// **H5 开关的第二处分叉**（M4 的固定频率消融）：[`Cadence::FixedEvery`] 直接把「要不要查」改写
+/// 成「这一轮轮号是不是 k 的倍数」，与失效标记无关；[`Cadence::Triggered`] 走下面原来的规则。
+///
+/// 不在这条分叉里的另一条规则（两臂、两个族、任何节奏都适用）：**证据需求没满足就重问**——问题声明的读取
 /// 对象里，有哪个现在有当前版本、而手上的答案当时没读到它，那份答案就是在材料不齐时给出的。
 /// 任务族 B 的 B2 靠它把观察动作的产出接进下一轮判断（研究目标 §6.3 的「触发条件」）。
 fn schedule(
     arm: Arm,
+    cadence: Cadence,
     family: &dyn QuestionSet,
     task: &FamilyTask,
     round: usize,
@@ -608,8 +656,14 @@ fn schedule(
                         && !node.projection.reads(object)
                 })
         });
-        let ask = requirement_unmet
-            || match arm.recompute() {
+        let triggered = match cadence {
+            // 固定频率：轮号是 k 的倍数就全查一遍，与失效标记无关；从没答上来的问题仍然每轮都要问
+            // （与下面的增量口径同一条规则：手上没有答案就没有可复用的东西）。
+            Cadence::FixedEvery(every) => match latest {
+                None => true,
+                Some(_) => every > 0 && round.is_multiple_of(every as usize),
+            },
+            Cadence::Triggered => match arm.recompute() {
                 Recompute::Full => true,
                 Recompute::Incremental => match latest {
                     None => true,
@@ -622,7 +676,9 @@ fn schedule(
                         _ => true,
                     },
                 },
-            };
+            },
+        };
+        let ask = requirement_unmet || triggered;
 
         if ask {
             needed.push(tracked.question.clone());
@@ -1446,6 +1502,7 @@ mod tests {
             judge: &judge,
             channel: JudgeName::Rule,
             arm,
+            cadence: Cadence::Triggered,
             run: name.to_owned(),
             endpoint: None,
             shadow: None,

@@ -52,7 +52,9 @@ use crate::generation::{
     CandidateQuestion, GeneratedCandidate, GenerationRequest, Generator, check_contract,
 };
 use crate::judge::JudgeName;
-use crate::matching::{ASK_SUCCEEDED, Arm, DecisionOutcome, LoopContext, TaskTrace, run_task};
+use crate::matching::{
+    ASK_SUCCEEDED, Arm, Cadence, DecisionOutcome, LoopContext, TaskTrace, run_task,
+};
 use crate::metrics;
 use crate::promotion;
 use crate::report::{CallStats, LatencyStats, UsageStats, Verification, VerificationStatus};
@@ -1503,6 +1505,7 @@ async fn run_arm(
             judge,
             channel: judge_name,
             arm: Arm::ALL[0],
+            cadence: Cadence::Triggered,
             run: run_id.to_owned(),
             endpoint: endpoint_for(judge_name),
             shadow: None,

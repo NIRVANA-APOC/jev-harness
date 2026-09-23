@@ -25,7 +25,8 @@ use jh_app::family_b::FamilyB;
 use jh_app::h3::{self, CandidateSource, H3Options};
 use jh_app::h4::{self, H4Options};
 use jh_app::judge::JudgeName;
-use jh_app::matching::Arm;
+use jh_app::m4::{self, M4Options};
+use jh_app::matching::{Arm, Cadence};
 use jh_app::report;
 use jh_app::tasks::TaskSet;
 
@@ -56,6 +57,51 @@ enum Command {
     H3(H3Args),
     /// H4：任务族 C 的三臂对照（固定测试 / 通用测试生成 / 建设观测器），一条命令出 JSON 报告
     H4(H4Args),
+    /// M4：主对照 2×2（循环式控制/依赖维护 × LLM/Jev）+ 诊断对照 + 原生基线 + 两条残余消融 + 密度扫描
+    M4(M4Args),
+}
+
+#[derive(Args)]
+struct M4Args {
+    /// 只跑这些臂（可重复）；缺省四组全跑
+    #[arg(long = "arm", value_name = "ARM")]
+    arm: Vec<String>,
+    /// 主对照与诊断对照的重复次数（每格配对重复）
+    #[arg(long = "repeats", default_value_t = 3, value_name = "N")]
+    repeats: usize,
+    /// 每族（A / B）只跑前 N 个任务
+    #[arg(long = "max-tasks", value_name = "N")]
+    max_tasks: Option<usize>,
+    /// 族 C 每族只跑前 N 条调度
+    #[arg(long = "max-schedules", value_name = "N")]
+    max_schedules: Option<usize>,
+    /// 密度扫描的检查节奏（可重复，取值 triggered / every-K，K 为正整数）；缺省 triggered 与 every-3 / every-2 / every-1
+    #[arg(long = "cadence", value_name = "CADENCE")]
+    cadence: Vec<String>,
+    /// 密度扫描的规模轴（每族任务数，可重复）；缺省 3 与 6
+    #[arg(long = "scale", value_name = "N")]
+    scale: Vec<usize>,
+    /// 不跑原生基线臂
+    #[arg(long = "no-native")]
+    no_native: bool,
+    /// 不跑跨任务复用消融
+    #[arg(long = "no-reuse-ablation")]
+    no_reuse_ablation: bool,
+    /// 复用已落盘的契约产物（不重发生成调用）
+    #[arg(long = "contracts", value_name = "FILE")]
+    contracts: Option<PathBuf>,
+    /// 用本地判定器替代两个判断通道（离线复跑；报告里如实标本地判定器）
+    #[arg(long = "offline-judge", value_enum, value_name = "NAME")]
+    offline_judge: Option<JudgeName>,
+    /// 调用记录落盘路径（JSONL，追加写）
+    #[arg(long = "calls", default_value = "var/calls.jsonl", value_name = "FILE")]
+    calls: PathBuf,
+    /// 运行产物目录；缺省 var/m4/<run>
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    /// 报告输出路径；缺省 var/m4/<run>.json
+    #[arg(long = "out", value_name = "FILE")]
+    out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -197,6 +243,106 @@ async fn main() -> ExitCode {
         Command::Compare(args) => run_compare(args).await,
         Command::H3(args) => run_h3(args).await,
         Command::H4(args) => run_h4(args).await,
+        Command::M4(args) => run_m4(args).await,
+    }
+}
+
+/// `jev m4`：主对照 2×2 + 诊断对照 + 原生基线 + 两条残余消融 + 密度扫描，落 JSON 报告。
+async fn run_m4(args: M4Args) -> ExitCode {
+    let run = m4::new_run_id();
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("var/m4/{run}")));
+    // 两个判断通道都要出现在复现命令里（key 只写变量名）。
+    let command =
+        compare::reproduction_command(&std::env::args().collect::<Vec<_>>(), &m4::JUDGE_CHANNELS);
+
+    let mut arms = Vec::new();
+    for label in &args.arm {
+        match m4::Arm::from_label(label) {
+            Some(arm) => arms.push(arm),
+            None => {
+                eprintln!(
+                    "臂 `{label}` 不存在（可用：loop-llm / loop-jev / maintained-llm / maintained-jev）"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let mut cadences = Vec::new();
+    for label in &args.cadence {
+        match Cadence::parse(label) {
+            Some(cadence) => cadences.push(cadence),
+            None => {
+                eprintln!("节奏 `{label}` 不存在（可用：triggered / every-K）");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if cadences.is_empty() {
+        cadences = vec![
+            Cadence::Triggered,
+            Cadence::FixedEvery(3),
+            Cadence::FixedEvery(2),
+            Cadence::FixedEvery(1),
+        ];
+    }
+    if args.repeats == 0 {
+        eprintln!("重复次数至少为 1");
+        return ExitCode::from(2);
+    }
+
+    let options = M4Options {
+        run: run.clone(),
+        calls_path: args.calls,
+        out_dir: out_dir.clone(),
+        command,
+        arms,
+        repeats: args.repeats,
+        max_tasks: args.max_tasks,
+        max_schedules: args.max_schedules,
+        cadences,
+        scales: if args.scale.is_empty() {
+            vec![3, 6]
+        } else {
+            args.scale.clone()
+        },
+        native: !args.no_native,
+        ablate_reuse: !args.no_reuse_ablation,
+        channel_override: args.offline_judge,
+        contracts: args.contracts,
+    };
+
+    let outcome = match m4::run(&options).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let out = args
+        .out
+        .unwrap_or_else(|| PathBuf::from(format!("var/m4/{run}.json")));
+    if let Err(error) = compare::write_json(&out, &outcome.report) {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
+
+    for line in outcome.report.summary_lines() {
+        println!("{line}");
+    }
+    println!("报告：{}", out.display());
+
+    if outcome.clean {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "有失败调用／被拒契约：见报告里的 calls.failed、channel_setup 与各格的 verification（如实计入，不重试）"
+        );
+        ExitCode::from(1)
     }
 }
 
