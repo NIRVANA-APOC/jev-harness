@@ -13,7 +13,7 @@ use jh_app::calls::{CallLog, read_entries};
 use jh_app::compare::{self, CompareOptions};
 use jh_app::family::{FamilyA, StepWhen};
 use jh_app::judge::JudgeName;
-use jh_app::matching::{Arm, DecisionOutcome, LoopContext, run_task};
+use jh_app::matching::{Arm, Cadence, DecisionOutcome, LoopContext, run_task};
 use jh_app::report::VerificationStatus;
 use jh_core::{Error as CoreError, Judge, JudgeRequest, JudgeResponse};
 
@@ -347,6 +347,7 @@ async fn a_failing_judge_lands_in_the_call_log_and_the_node_evaluation() {
             judge: &judge,
             channel: JudgeName::Jev,
             arm: Arm::ALL[0],
+            cadence: Cadence::Triggered,
             run: "run-failure".to_owned(),
             endpoint: Some("https://example.invalid".to_owned()),
             shadow: None,

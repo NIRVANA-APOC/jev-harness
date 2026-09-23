@@ -49,7 +49,7 @@ use crate::exp::unix_ms;
 use crate::family::{FamilyA, FamilyTask};
 use crate::judge::JudgeName;
 use crate::matching::{
-    ASK_SUCCEEDED, Arm, DecisionOutcome, LoopContext, Recompute, TaskTrace, run_task,
+    ASK_SUCCEEDED, Arm, Cadence, DecisionOutcome, LoopContext, Recompute, TaskTrace, run_task,
 };
 use crate::report::{
     CallStats, LatencyStats, QualityStats, QuestionQuality, UsageStats, Verification,
@@ -499,6 +499,7 @@ pub async fn run(family: &FamilyA, options: &CompareOptions) -> Result<CompareOu
                     judge: judge.as_ref(),
                     channel: *name,
                     arm: *arm,
+                    cadence: Cadence::Triggered,
                     run: options.run.clone(),
                     endpoint: endpoint.clone(),
                     shadow: None,
@@ -760,6 +761,7 @@ pub async fn run_single(
         judge: judge.as_ref(),
         channel: name,
         arm,
+        cadence: Cadence::Triggered,
         run: run.to_owned(),
         endpoint: endpoint_for(name),
         shadow: None,

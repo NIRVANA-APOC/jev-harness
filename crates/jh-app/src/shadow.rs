@@ -19,8 +19,8 @@ use crate::error::Error;
 use crate::family_b::{ABSENT_LABEL, FamilyB, FamilyBQuestions, FamilyBTask};
 use crate::judge::JudgeName;
 use crate::matching::{
-    Arm, BranchChange, DecisionOutcome, LoopContext, ShadowPlan, ShadowQuestion, TaskTrace,
-    run_task,
+    Arm, BranchChange, Cadence, DecisionOutcome, LoopContext, ShadowPlan, ShadowQuestion,
+    TaskTrace, run_task,
 };
 
 /// 构造影子计划：一条候选版本的问题。
@@ -151,6 +151,7 @@ pub async fn run(
             judge,
             channel,
             arm: Arm::ALL[0],
+            cadence: Cadence::Triggered,
             run: run_id.to_owned(),
             endpoint: endpoint.clone(),
             shadow: Some(plan),
@@ -367,6 +368,7 @@ mod tests {
             judge: &judge,
             channel: JudgeName::Rule,
             arm: Arm::ALL[0],
+            cadence: Cadence::Triggered,
             run: "shadow-off".to_owned(),
             endpoint: None,
             shadow: None,
