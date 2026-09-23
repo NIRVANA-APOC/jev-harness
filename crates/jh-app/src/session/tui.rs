@@ -357,6 +357,65 @@ mod tests {
         render::screen_lines(terminal.backend().buffer()).join("\n")
     }
 
+    /// 让会话忙起来：提交一句并推进到模型在途（真 prompt 的守卫要有忙的会话才测得到）。
+    fn busy_agent() -> (Agent, crate::session::test_support::TempDir) {
+        use crate::calls::CallLog;
+        use crate::session::agent::AgentConfig;
+        use crate::session::test_support::{Scripted, TempDir, turn};
+        use jh_core::SemanticState;
+
+        let dir = TempDir::new("session-tui");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("建工作区");
+        let calls = CallLog::open(dir.join("calls.jsonl")).expect("调用记录");
+        let mut agent = Agent::new(AgentConfig {
+            workspace,
+            judge_name: crate::judge::JudgeName::Jev,
+            judge: None,
+            model: Some(Scripted::new(vec![turn("回复", Vec::new())])),
+            model_label: "stub-model".to_owned(),
+            run: "tui-test".to_owned(),
+            state: SemanticState::in_memory(),
+            calls,
+            debounce: std::time::Duration::from_secs(30),
+            max_rounds: 4,
+        })
+        .expect("建会话");
+        agent.submit("第一句".to_owned());
+        let (step, _) = agent.advance(Instant::now());
+        assert!(matches!(step, Step::Model(_)), "先让模型在途");
+        assert!(agent.busy());
+        (agent, dir)
+    }
+
+    /// 宿主侧的忙碌守卫：一轮在途时按 Enter，话要退回输入框并如实说明，不开第二轮。
+    #[test]
+    fn submitting_while_busy_puts_the_text_back_and_says_so() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut agent, _dir) = busy_agent();
+        let mut app = app();
+        app.prompt_mut().insert_str("第二句");
+        let mut step_requested = false;
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!handle_event(
+            &mut app,
+            &mut agent,
+            enter,
+            &mut step_requested
+        ));
+
+        assert_eq!(agent.stats().turns, 1, "忙碌中不开第二轮");
+        assert!(
+            app.prompt().text().contains("第二句"),
+            "话要退回输入框：{:?}",
+            app.prompt().text()
+        );
+        let screen = screen(&mut app);
+        assert!(screen.contains("还在跑"), "{screen}");
+        assert!(screen.contains("第二句"), "{screen}");
+    }
+
     /// P1-1 的回归：宿主必须喂 `TickDemand`，否则 `poll_timeout()` 永远是空闲长睡，
     /// 转轮停在第一帧、收尾那一帧要等下一次按键才上屏。
     #[test]

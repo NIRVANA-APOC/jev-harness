@@ -6,8 +6,10 @@
 //!
 //! 边界：
 //!
-//! - 三个只读工具的路径一律解析到工作区内（`canonicalize` 之后再比对前缀，符号链接同样拦下），
-//!   越界显式失败；`bash` 以工作区为工作目录，但**不**限制它能读写什么——它的边界由审批卡划定，
+//! - 三个只读工具的路径一律解析到工作区内（`canonicalize` 之后再比对前缀，指到工作区外的软链接
+//!   同样拦下），越界显式失败；`search` 遍历时**逐个**解析并比对前缀，且**不跟随目录软链接**
+//!   （`self_link -> .` 这类自环会让遍历永不结束），跳过的项在结果里如实计数；
+//! - `bash` 以工作区为工作目录，但**不**限制它能读写什么——它的边界由审批卡划定，
 //!   不靠代码假装兜住（`AGENTS.md`「禁止过度防御性编程」）。
 //! - 工具执行失败**不是**宿主错误：失败原文作为结果回给模型（它要据此改主意），
 //!   所以 [`Tools::execute`] 返回 [`ToolOutcome`] 而不是 `Result`。
@@ -311,11 +313,15 @@ impl Tools {
             .min(SEARCH_MAX_HITS);
 
         let mut hits: Vec<String> = Vec::new();
-        let mut visited = 0usize;
+        let mut examined = 0usize;
         let mut skipped = 0usize;
         let mut outside = 0usize;
+        let mut links = 0usize;
         let mut queue = VecDeque::from([start]);
         while let Some(directory) = queue.pop_front() {
+            if examined >= SEARCH_MAX_FILES || hits.len() >= max_hits {
+                break;
+            }
             let Ok(entries) = std::fs::read_dir(&directory) else {
                 skipped += 1;
                 continue;
@@ -323,6 +329,11 @@ impl Tools {
             let mut entries: Vec<_> = entries.flatten().collect();
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries {
+                // 上限按**项**算（文件与目录一起），否则目录不入队就等于没有上限。
+                if examined >= SEARCH_MAX_FILES || hits.len() >= max_hits {
+                    break;
+                }
+                examined += 1;
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 // 逐个解析再比对前缀：工作区里的符号链接同样拦下（只解析起点是不够的，
@@ -334,16 +345,23 @@ impl Tools {
                     outside += 1;
                     continue;
                 }
+                let is_link = entry
+                    .file_type()
+                    .map(|kind| kind.is_symlink())
+                    .unwrap_or(false);
                 if real.is_dir() {
+                    // **不跟随目录软链接**：`self_link -> .` 这种自环会让遍历永不结束
+                    // （同步阻塞，Esc 都丢不掉），而目录软链接对「在文本文件里找子串」
+                    // 没有别的用处——r1 定的口径本来就是「不跟随符号链接」。
+                    if is_link {
+                        links += 1;
+                        continue;
+                    }
                     if !SKIPPED_DIRS.contains(&name.as_str()) {
                         queue.push_back(real);
                     }
                     continue;
                 }
-                if visited >= SEARCH_MAX_FILES || hits.len() >= max_hits {
-                    break;
-                }
-                visited += 1;
                 // 非 UTF-8（二进制）文件跳过：这里搜的是文本，不假装能搜二进制。
                 let Ok(text) = std::fs::read_to_string(&real) else {
                     continue;
@@ -366,8 +384,8 @@ impl Tools {
 
         if hits.is_empty() {
             return ToolOutcome::ok(format!(
-                "没有命中（子串 `{pattern}`，看了 {visited} 个文件{note}）",
-                note = skip_note(skipped, outside)
+                "没有命中（子串 `{pattern}`，看了 {examined} 项{note}）",
+                note = skip_note(skipped, outside, links, examined)
             ));
         }
         let count = hits.len();
@@ -379,7 +397,7 @@ impl Tools {
         let mut text = format!(
             "命中 {count} 条{capped}：\n{}{}",
             hits.join("\n"),
-            skip_note(skipped, outside)
+            skip_note(skipped, outside, links, examined)
         );
         truncate(&mut text);
         ToolOutcome::ok(text)
@@ -454,15 +472,21 @@ fn truncate(text: &mut String) {
     *text = format!("{head}\n…（已截断 {dropped} 个字符）");
 }
 
-/// 搜内容时跳过的东西：不可读目录与越出工作区的路径（含符号链接指向的外面）。
-/// 有跳过就如实说，没跳过就什么都不写。
-fn skip_note(skipped: usize, outside: usize) -> String {
+/// 搜内容时跳过的东西：不可读目录、越出工作区的路径（含指向外面的软链接）、
+/// 不跟随的目录软链接、以及走到遍历上限的情况。有跳过就如实说，没有就什么都不写。
+fn skip_note(skipped: usize, outside: usize, links: usize, examined: usize) -> String {
     let mut parts = Vec::new();
     if skipped > 0 {
         parts.push(format!("跳过 {skipped} 个不可读目录"));
     }
     if outside > 0 {
         parts.push(format!("跳过 {outside} 个越出工作区的路径"));
+    }
+    if links > 0 {
+        parts.push(format!("跳过 {links} 个目录软链接（不跟随）"));
+    }
+    if examined >= SEARCH_MAX_FILES {
+        parts.push(format!("已到遍历上限 {SEARCH_MAX_FILES} 项"));
     }
     if parts.is_empty() {
         String::new()
@@ -586,6 +610,31 @@ mod tests {
             tools.execute(&call(SEARCH, serde_json::json!({"pattern": "8080"}))),
         );
         assert!(inside.text.contains("src/main.rs:2:"), "{}", inside.text);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_terminates_on_a_directory_symlink_loop() {
+        let (tools, _dir) = tools();
+        // 自环与指向祖先的环：`self_link -> .`、`sub/up_link -> 工作区根`。
+        std::os::unix::fs::symlink(tools.root(), tools.root().join("self_link")).expect("建软链接");
+        std::fs::create_dir_all(tools.root().join("sub")).expect("建目录");
+        std::os::unix::fs::symlink(tools.root(), tools.root().join("sub/up_link"))
+            .expect("建软链接");
+
+        let outcome = crate::session::test_support::block_on(
+            tools.execute(&call(SEARCH, serde_json::json!({"pattern": "8080"}))),
+        );
+        // 能返回（自环没有把遍历拖死），同一条命中只算一次，跳过的软链接如实报出来。
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(
+            outcome.text.matches("src/main.rs:2:").count(),
+            1,
+            "{}",
+            outcome.text
+        );
+        assert!(outcome.text.contains("目录软链接"), "{}", outcome.text);
+        assert!(!outcome.text.contains("遍历上限"), "{}", outcome.text);
     }
 
     #[test]
