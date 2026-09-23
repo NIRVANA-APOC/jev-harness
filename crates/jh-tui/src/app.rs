@@ -471,12 +471,19 @@ impl App {
         if let Some(action) = self.keymap.lookup(owner, chord) {
             return self.apply(action);
         }
+        // 能走到这里说明键位表没有认这一拍——剩下的就是「打字」。
+        // Shift 是**打字用的**修饰键：ASCII 大写的 Shift 已被 [`KeyChord::new`] 归一化进字符
+        // 本身（`actions.rs`），需要 Shift 的符号（`!`、`?`）也带着它，所以这里先把它减掉；
+        // 减完还剩下 Control/Alt/Super 的，是没绑定的组合键，不往提示框里塞字符。
+        //
+        // 基线 `3ddd519` 只减了后三个，于是「大写字母」与「Ctrl+小写字母」都在这条路径上被
+        // 静默吃掉（批次四的真调与评审暴露，见 `docs/tui-design.md` §10 的修正记录）。
         if owner == KeyOwner::Prompt
             && let KeyCode::Char(c) = chord.code
+            && !c.is_control()
         {
-            let modifiers =
-                chord.modifiers - KeyModifiers::CONTROL - KeyModifiers::ALT - KeyModifiers::SUPER;
-            if modifiers.is_empty() && !c.is_control() {
+            let modifiers = chord.modifiers - KeyModifiers::SHIFT;
+            if modifiers.is_empty() {
                 self.prompt.insert_char(c);
                 self.gate.mark_dirty();
             }
@@ -708,6 +715,28 @@ mod tests {
             Some(Effect::Submit("h".to_owned()))
         );
         assert_eq!(app.screen(), Screen::Agent, "首屏提交即进入会话");
+    }
+
+    #[test]
+    fn uppercase_and_shifted_characters_are_typed_not_swallowed() {
+        let mut app = app();
+        // 终端报大写字符的两种形态（有的带 SHIFT、有的不带）归一化后都该能打进去。
+        app.handle_key(KeyChord::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        app.handle_key(KeyChord::new(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        app.handle_key(KeyChord::plain(KeyCode::Char('F')));
+        // 需要 Shift 的符号同理（`!` 这类不是字母，归一化不动它，SHIFT 会一路带进来）。
+        app.handle_key(KeyChord::new(KeyCode::Char('!'), KeyModifiers::SHIFT));
+        assert_eq!(app.prompt().text(), "DEF!");
+    }
+
+    #[test]
+    fn unbound_combinations_do_not_leak_characters_into_the_prompt() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('a'));
+        app.handle_key(KeyChord::ctrl(KeyCode::Char('q')));
+        app.handle_key(KeyChord::alt(KeyCode::Char('x')));
+        app.handle_key(KeyChord::ctrl(KeyCode::Char('z')));
+        assert_eq!(app.prompt().text(), "a", "没绑定的组合键不该塞字符进来");
     }
 
     #[test]

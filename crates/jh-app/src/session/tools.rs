@@ -382,10 +382,13 @@ impl Tools {
             }
         }
 
+        let skipped_parts = skip_parts(skipped, outside, links, examined);
         if hits.is_empty() {
+            let note = skipped_parts
+                .map(|parts| format!("；{parts}"))
+                .unwrap_or_default();
             return ToolOutcome::ok(format!(
-                "没有命中（子串 `{pattern}`，看了 {examined} 项{note}）",
-                note = skip_note(skipped, outside, links, examined)
+                "没有命中（子串 `{pattern}`，看了 {examined} 项{note}）"
             ));
         }
         let count = hits.len();
@@ -394,11 +397,12 @@ impl Tools {
         } else {
             ""
         };
-        let mut text = format!(
-            "命中 {count} 条{capped}：\n{}{}",
-            hits.join("\n"),
-            skip_note(skipped, outside, links, examined)
-        );
+        let mut text = format!("命中 {count} 条{capped}：\n{}", hits.join("\n"));
+        // 脚注另起一行：粘在最后一条命中后面会被当成命中内容读。
+        if let Some(parts) = skipped_parts {
+            text.push('\n');
+            text.push_str(&parts);
+        }
         truncate(&mut text);
         ToolOutcome::ok(text)
     }
@@ -473,8 +477,8 @@ fn truncate(text: &mut String) {
 }
 
 /// 搜内容时跳过的东西：不可读目录、越出工作区的路径（含指向外面的软链接）、
-/// 不跟随的目录软链接、以及走到遍历上限的情况。有跳过就如实说，没有就什么都不写。
-fn skip_note(skipped: usize, outside: usize, links: usize, examined: usize) -> String {
+/// 不跟随的目录软链接、以及走到遍历上限的情况。有跳过就如实列出来，没有就是 `None`。
+fn skip_parts(skipped: usize, outside: usize, links: usize, examined: usize) -> Option<String> {
     let mut parts = Vec::new();
     if skipped > 0 {
         parts.push(format!("跳过 {skipped} 个不可读目录"));
@@ -489,9 +493,9 @@ fn skip_note(skipped: usize, outside: usize, links: usize, examined: usize) -> S
         parts.push(format!("已到遍历上限 {SEARCH_MAX_FILES} 项"));
     }
     if parts.is_empty() {
-        String::new()
+        None
     } else {
-        format!("，{}", parts.join("、"))
+        Some(parts.join("、"))
     }
 }
 
@@ -635,6 +639,9 @@ mod tests {
         );
         assert!(outcome.text.contains("目录软链接"), "{}", outcome.text);
         assert!(!outcome.text.contains("遍历上限"), "{}", outcome.text);
+        // 脚注另起一行，不粘在最后一条命中后面（不然会被当成命中内容读）。
+        let last = outcome.text.lines().last().unwrap_or_default();
+        assert!(last.starts_with("跳过"), "{:?}", outcome.text);
     }
 
     #[test]
