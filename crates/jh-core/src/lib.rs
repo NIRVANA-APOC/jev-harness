@@ -44,6 +44,21 @@
 //!   [retire](QuestionLibrary::retire) 都直接联动 [`SemanticState::invalidate_question`]，
 //!   旧版本一律保留，可比较、可回退。
 //!
+//! # 观测能力建设与行为分类
+//!
+//! 研究目标 §7 那条能力在本 crate 里的这一层是**契约与生命周期**，不是观测器的实现：
+//!
+//! - [`Behavior`]：`Execute` / `Observe` / `BuildObserver` / `Deliberate` 四类，服务于调度与成本
+//!   核算；分类不封闭，四类之外的行为走 [`Behavior::Other`]（§7.1）；
+//! - [`ObserverContract`]：§7.2 的八条逐项落类型（原始要求及来源、命题与覆盖关系、测量位置与对象与
+//!   时序、支持的版本配置与条件、副作用与扰动、阳性 / 阴性对照与可注入故障、输出格式与失败状态与
+//!   失效条件、尚未覆盖）；
+//! - [`ObserverLibrary`]：候选 → 验证 → 启用 → 停用 / 被替代，一个 ID 只有一个启用版本；**启用要求
+//!   一份四路全过的独立检验记录**（[`ObserverCheck`]：阳性对照、阴性对照、可注入的已知故障、独立
+//!   隐藏检查），没通过就显式失败、停在原状态（§7.3 末段；详见 [`ObserverLibrary`] 的模块文档）；
+//! - 与失效联动：观测器停用或被替代时，读过它测量对象的判断待重查
+//!   （[`SemanticState::invalidate_observer`] / [`InvalidationCause::ObserverInvalidated`]）。
+//!
 //! # 本 crate 刻意不做的事
 //!
 //! - 不依赖 `jh-jev` / `jh-openai`：对象模型不绑死在某个判断器上，通道 wire 类型在适配层转换；
@@ -51,8 +66,10 @@
 //! - 不判定反例归因、不判晋升标准：反例只记 §6.1 的四类可能，晋升阈值属于实验层；
 //! - 不发动作、不回滚副作用：[`SemanticState`] 只回答「现在能不能发」，怎么发、发完怎么补偿由
 //!   `jh-app` 决定；
-//! - 不读时钟：证据与反例的时间、对象版本由调用方给出；问题库的版本号由库按定案规则分配
-//!   （见 [`QuestionLibrary`]）；
+//! - 不执行观测器、不生成观测器实现、不做沙箱或校验器 DSL：本 crate 只声明契约与生命周期，观测器
+//!   怎么跑、在哪里跑由 `jh-app` 的隔离实验环境负责（`docs/roadmap-1.0.md` §8 的 1.0 不做项）；
+//! - 不读时钟：证据与反例的时间、对象版本由调用方给出；问题库与观测器库的版本号由各自的库按定案
+//!   规则分配（见 [`QuestionLibrary`]、[`ObserverLibrary`]）；
 //! - 判断记录的落盘形态仍由 `jh-app` 决定（`var/calls.jsonl`，`docs/roadmap-1.0.md` §12 未确定项 2）；
 //! - 不引入异步运行时：判断器接口返回装箱 future，由调用方自己的 executor 驱动。
 //!
@@ -100,6 +117,7 @@
 #![warn(missing_docs)]
 
 mod answer;
+mod behavior;
 mod counterexample;
 mod error;
 mod evidence;
@@ -107,6 +125,7 @@ mod graph;
 mod hash;
 mod judge;
 mod library;
+mod observer;
 mod projection;
 mod question;
 mod record;
@@ -114,6 +133,7 @@ mod runtime;
 mod state;
 
 pub use answer::{Answer, ChoiceAnswer, NoulAnswer, ScoreAnswer, Usage};
+pub use behavior::Behavior;
 pub use counterexample::{
     Attribution, Counterexample, CounterexampleId, CounterexampleLog, FailureSource,
     JsonlCounterexampleLog, MemoryCounterexampleLog, NewCounterexample,
@@ -132,6 +152,11 @@ pub use judge::{Judge, JudgeRequest, JudgeResponse};
 pub use library::{
     Lifecycle, LifecycleRecord, NewQuestion, QuestionEntry, QuestionLibrary, ValidationKind,
     ValidationRecord,
+};
+pub use observer::{
+    CheckDirection, ControlResult, Controls, Disturbance, Measurement, ObserverCheck,
+    ObserverContract, ObserverEntry, ObserverId, ObserverLibrary, ObserverLifecycle,
+    ObserverLifecycleRecord, ObserverVerdict, OutputContract, Requirement, Support, Timing,
 };
 pub use projection::{
     Drift, FieldSelection, InputProjection, ObjectRead, SnapshotCheck, verify_snapshot,

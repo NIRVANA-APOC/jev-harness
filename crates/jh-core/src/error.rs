@@ -7,13 +7,15 @@
 //! 变体分两组：前三类描述**判断调用**的失败（[`Judge`](crate::Judge) 的契约），后几类描述
 //! **运行时对象**的失败——日志读写不了（证据日志与反例日志共用 [`Error::Storage`]）、引用了不存在的
 //! 证据 / 节点 / 行动、往已撤回的节点写结果、问题版本冲突、问题版本不存在、候选问题没有消费者、
-//! 生命周期迁移不合法。两组都是显式失败：没有哪一类会被悄悄吞掉、跳过或折成默认值。
+//! 生命周期迁移不合法（问题库与观测器库各一套）、观测器没有测量对象或没通过独立检验。两组都是显式
+//! 失败：没有哪一类会被悄悄吞掉、跳过或折成默认值。
 
 use thiserror::Error;
 
 use crate::evidence::EvidenceId;
 use crate::graph::{ActionId, NodeId};
 use crate::library::Lifecycle;
+use crate::observer::{ObserverId, ObserverLifecycle, ObserverVersion};
 use crate::question::{QuestionId, QuestionVersion};
 
 /// 调用判断器或使用运行时对象时可能显式失败的情况。
@@ -79,6 +81,39 @@ pub enum Error {
         version: QuestionVersion,
         /// 该版本当前的状态。
         lifecycle: Lifecycle,
+    },
+    /// 引用了不存在的观测器版本。
+    #[error("观测器版本不存在：{0} v{1}")]
+    UnknownObserverVersion(ObserverId, ObserverVersion),
+    /// 候选观测器的契约没有声明测量对象（研究目标 §7.2 第 3 条）。
+    ///
+    /// 库不记这条候选、也不给它分配版本号：没有测量对象的观测器在失效传播里没有挂点，撤回它时
+    /// 找不到该重查哪些判断——先补上对象，或别提。
+    #[error("候选观测器没有声明测量对象：{0}")]
+    ObserverWithoutObject(ObserverId),
+    /// 观测器库的生命周期迁移不合法：该版本当前的状态不允许这个操作。
+    ///
+    /// 允许的迁移见 [`ObserverLibrary`](crate::ObserverLibrary) 的迁移表。
+    #[error("观测器 `{observer}` v{version} 当前的生命周期是「{lifecycle}」，不允许这次迁移")]
+    InvalidObserverLifecycle {
+        /// 观测器标识。
+        observer: ObserverId,
+        /// 版本。
+        version: ObserverVersion,
+        /// 该版本当前的状态。
+        lifecycle: ObserverLifecycle,
+    },
+    /// 观测器未通过独立检验，不能启用（研究目标 §7.3 末段）。
+    ///
+    /// 检验记录已经落库（试过并失败也是凭据），`detail` 说明是哪一路没对上；生命周期保持原状。
+    #[error("观测器 `{observer}` v{version} 未通过独立检验，不能启用：{detail}")]
+    ObserverNotVerified {
+        /// 观测器标识。
+        observer: ObserverId,
+        /// 版本。
+        version: ObserverVersion,
+        /// 没通过的那一路，以及期望与观测到的判定。
+        detail: String,
     },
 }
 
@@ -146,5 +181,36 @@ mod tests {
         assert!(invalid.to_string().contains("cause_b_pair"), "{invalid}");
         assert!(invalid.to_string().contains("v2"), "{invalid}");
         assert!(invalid.to_string().contains("停用"), "{invalid}");
+    }
+
+    #[test]
+    fn observer_failures_name_the_object_and_the_failed_check() {
+        let observer = ObserverId::from("cancel_write_recorder");
+        assert!(
+            Error::UnknownObserverVersion(observer.clone(), ObserverVersion(3))
+                .to_string()
+                .contains("cancel_write_recorder v3")
+        );
+        assert!(
+            Error::ObserverWithoutObject(observer.clone())
+                .to_string()
+                .contains("cancel_write_recorder")
+        );
+
+        let invalid = Error::InvalidObserverLifecycle {
+            observer: observer.clone(),
+            version: ObserverVersion(1),
+            lifecycle: ObserverLifecycle::Candidate,
+        };
+        assert!(invalid.to_string().contains("候选"), "{invalid}");
+        assert!(invalid.to_string().contains("v1"), "{invalid}");
+
+        let unverified = Error::ObserverNotVerified {
+            observer,
+            version: ObserverVersion(1),
+            detail: "阴性对照未通过：期望「发现违反」，观测到「命题成立」".to_owned(),
+        };
+        assert!(unverified.to_string().contains("不能启用"), "{unverified}");
+        assert!(unverified.to_string().contains("阴性对照"), "{unverified}");
     }
 }
