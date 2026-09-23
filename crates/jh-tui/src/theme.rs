@@ -231,6 +231,17 @@ pub struct Theme {
     pub prompt_border: Color,
     pub prompt_border_active: Color,
     pub selection_border: Color,
+
+    /// 面板与提示框的边框（未聚焦）。
+    pub panel_border: Color,
+    /// 聚焦面板的边框。
+    pub panel_border_active: Color,
+    /// 面板内小节分隔线。
+    pub rule: Color,
+    /// 用户块时间戳、证据时间列。
+    pub timestamp: Color,
+    /// 用户块填充条背景。
+    pub user_block_bg: Color,
 }
 
 /// 取色值的 const 助手，形状与上游 `theme/groknight.rs:10-12` 的 `rgb()` 一致。
@@ -260,6 +271,11 @@ impl Theme {
         prompt_border: rgb(50, 50, 55),        // #323237
         prompt_border_active: rgb(80, 80, 88), // #505058
         selection_border: rgb(60, 60, 65),     // #3c3c41
+        panel_border: rgb(60, 60, 65),         // #3c3c41
+        panel_border_active: rgb(80, 80, 88),  // #505058
+        rule: rgb(88, 88, 88),                 // #585858
+        timestamp: rgb(108, 108, 108),         // #6c6c6c
+        user_block_bg: rgb(36, 36, 36),        // #242424
     };
 
     /// 量化到指定色深（逐个字段走 [`ColorLevel::quantize`]）。
@@ -283,6 +299,11 @@ impl Theme {
             &mut self.prompt_border,
             &mut self.prompt_border_active,
             &mut self.selection_border,
+            &mut self.panel_border,
+            &mut self.panel_border_active,
+            &mut self.rule,
+            &mut self.timestamp,
+            &mut self.user_block_bg,
         ];
         for slot in colors {
             *slot = level.quantize(*slot);
@@ -315,6 +336,15 @@ impl Theme {
             Style::new().fg(self.gray_dim)
         } else {
             Style::new().add_modifier(Modifier::DIM)
+        }
+    }
+
+    /// 盒子边框样式：无色档下不加前景色（加 `Reset` 等于把终端默认前景重新写一遍）。
+    pub fn frame(&self, color: Color) -> Style {
+        if self.level.has_color() {
+            Style::new().fg(color)
+        } else {
+            Style::new()
         }
     }
 
@@ -434,6 +464,39 @@ mod tests {
 
         let missing = ColorLevel::from_env_lookup(|_| None);
         assert_eq!(missing, ColorLevel::None);
+    }
+
+    /// 量化清单是本模块最容易漏项的一处：加了字段忘了登记，无色档就会漏出一格颜色。
+    #[test]
+    fn every_color_field_is_in_the_quantize_list() {
+        let plain = Theme::DARK.quantized(ColorLevel::None);
+        for (name, color) in [
+            ("bg_base", plain.bg_base),
+            ("bg_light", plain.bg_light),
+            ("bg_dark", plain.bg_dark),
+            ("text_primary", plain.text_primary),
+            ("text_secondary", plain.text_secondary),
+            ("gray", plain.gray),
+            ("gray_dim", plain.gray_dim),
+            ("accent_user", plain.accent_user),
+            ("accent_assistant", plain.accent_assistant),
+            ("accent_tool", plain.accent_tool),
+            ("accent_system", plain.accent_system),
+            ("accent_plan", plain.accent_plan),
+            ("accent_success", plain.accent_success),
+            ("accent_error", plain.accent_error),
+            ("accent_warning", plain.accent_warning),
+            ("prompt_border", plain.prompt_border),
+            ("prompt_border_active", plain.prompt_border_active),
+            ("selection_border", plain.selection_border),
+            ("panel_border", plain.panel_border),
+            ("panel_border_active", plain.panel_border_active),
+            ("rule", plain.rule),
+            ("timestamp", plain.timestamp),
+            ("user_block_bg", plain.user_block_bg),
+        ] {
+            assert_eq!(color, Color::Reset, "无色档漏掉了 {name}");
+        }
     }
 
     #[test]

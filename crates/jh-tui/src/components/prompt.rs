@@ -17,6 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::blocks::{BlockCtx, BlockLine, Selectable};
 use crate::glyphs;
 use crate::width;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// 提示框默认高度上限（可视行数），与上游 `area.height / 2` 的口径一致
@@ -29,6 +30,73 @@ pub struct TextCursor {
     pub row: usize,
     pub column: usize,
 }
+
+/// 提示框的 chrome：顶边内嵌的标题与底边内嵌的信息行（`模型 · 判定器 · 授权模式`）。
+///
+/// 信息行为 `None` 时退回平铺形态（无边框）——窄终端与组件级调用用得上；
+/// 主界面与首屏都给了信息行，因此都是四边盒。几何口径（边框 1 列 + 内边距 1 列）与
+/// 面板壳一致。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptChrome {
+    /// 顶边内嵌的标题（会话名）；`None` 表示顶边不嵌标题。
+    pub title: Option<String>,
+    /// 底边内嵌的信息行；`None` 表示不画盒子。
+    pub info: Option<String>,
+}
+
+impl PromptChrome {
+    /// 未接线时的信息行：如实标注当前状态，不假装接了模型（`AGENTS.md`「不虚构」）。
+    pub fn unwired() -> Self {
+        PromptChrome {
+            title: None,
+            info: Some("未接线 · 不调用模型与 API".to_owned()),
+        }
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub fn with_info(mut self, info: impl Into<String>) -> Self {
+        self.info = Some(info.into());
+        self
+    }
+
+    /// 是否画四边盒：有信息行就画。
+    pub fn boxed(&self) -> bool {
+        self.info.is_some()
+    }
+
+    /// 内容区（含标记列）的列宽。
+    pub fn inner_width(&self, area_width: usize) -> usize {
+        if self.boxed() {
+            area_width.saturating_sub(BOX_BORDERS + BOX_PAD * 2)
+        } else {
+            area_width
+        }
+    }
+
+    /// 内容区相对区域原点的偏移 `(列, 行)`。
+    pub fn content_origin(&self) -> (u16, u16) {
+        if self.boxed() {
+            ((BOX_BORDERS / 2 + BOX_PAD) as u16, 1)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// 给定内容可视行数时，区域需要的总行数（盒子上下各一条边框）。
+    pub fn rows(&self, content_rows: usize) -> u16 {
+        let borders = if self.boxed() { BOX_BORDERS } else { 0 };
+        (content_rows + borders) as u16
+    }
+}
+
+/// 盒子左右各一条边框。
+const BOX_BORDERS: usize = 2;
+/// 边框与内容之间的内边距（左右各一列）。
+const BOX_PAD: usize = 1;
 
 /// 多行输入缓冲。
 #[derive(Debug, Clone, PartialEq)]
@@ -277,8 +345,35 @@ impl Prompt {
         (row_offset, 0)
     }
 
-    /// 渲染提示框（已换行的屏幕行）：标记列 + 内容列；空输入时画幽灵文案。
-    pub fn render(&self, ctx: &BlockCtx, focused: bool) -> Vec<BlockLine> {
+    /// 渲染提示框（已换行的屏幕行）。
+    ///
+    /// `chrome.info` 为 `None` 时是平铺形态（标记列 + 内容列）；给了信息行就画四边盒，
+    /// 标题内嵌顶边、信息行内嵌底边（与面板壳同一个形状，见 `docs/tui-design.md` §5.1）。
+    pub fn render(&self, ctx: &BlockCtx, chrome: &PromptChrome, focused: bool) -> Vec<BlockLine> {
+        if !chrome.boxed() {
+            return self.content_lines(ctx, focused);
+        }
+        let inner = BlockCtx {
+            width: chrome.inner_width(ctx.width),
+            ..*ctx
+        };
+        let border = ctx.theme.frame(if focused {
+            ctx.theme.prompt_border_active
+        } else {
+            ctx.theme.prompt_border
+        });
+        let lines = self.content_lines(&inner, focused);
+        let mut output = Vec::with_capacity(lines.len() + 2);
+        output.push(border_line(ctx, border, chrome.title.as_deref(), true));
+        for line in lines {
+            output.push(wrap_row(ctx, line, border));
+        }
+        output.push(border_line(ctx, border, chrome.info.as_deref(), false));
+        output
+    }
+
+    /// 平铺形态：标记列 + 内容列；空输入时画幽灵文案。
+    fn content_lines(&self, ctx: &BlockCtx, focused: bool) -> Vec<BlockLine> {
         let marker = ctx.glyphs.resolve(glyphs::prompt());
         let prefix_width = width::display_width(marker);
         let content_width = ctx.content_width(prefix_width).max(1);
@@ -320,6 +415,72 @@ impl Prompt {
             ));
         }
         output
+    }
+}
+
+/// 盒子的一条边框：顶边内嵌标题、底边内嵌信息行，都左对齐（与面板壳同一个形状）。
+fn border_line(ctx: &BlockCtx, border: Style, label: Option<&str>, top: bool) -> BlockLine {
+    let horizontal = ctx.glyphs.resolve(glyphs::box_horizontal());
+    let (open, close) = if top {
+        (
+            ctx.glyphs.resolve(glyphs::box_top_left()),
+            ctx.glyphs.resolve(glyphs::box_top_right()),
+        )
+    } else {
+        (
+            ctx.glyphs.resolve(glyphs::box_bottom_left()),
+            ctx.glyphs.resolve(glyphs::box_bottom_right()),
+        )
+    };
+
+    let mut spans = vec![Span::styled(open.to_owned(), border)];
+    if let Some(label) = label {
+        // 标签最大列宽：整行去掉两角与两侧的 `─ ` / ` ─` 共 6 列。
+        let label_budget = ctx.width.saturating_sub(6).max(1);
+        let label =
+            width::clip_with_ellipsis(label, label_budget, ctx.glyphs.resolve(glyphs::ellipsis()));
+        spans.push(Span::styled(format!("{horizontal} "), border));
+        spans.push(Span::styled(label, ctx.theme.dim()));
+        spans.push(Span::styled(format!(" {horizontal}"), border));
+    }
+    let used: usize = spans
+        .iter()
+        .map(|span| width::display_width(span.content.as_ref()))
+        .sum();
+    let fill = ctx.width.saturating_sub(used + 1);
+    if fill > 0 {
+        spans.push(Span::styled(horizontal.repeat(fill), border));
+    }
+    spans.push(Span::styled(close.to_owned(), border));
+    BlockLine::new(Line::from(spans), Selectable::None)
+}
+
+/// 给一条内容行套上盒子的左右边框，并把可选列区间整体右移。
+fn wrap_row(ctx: &BlockCtx, line: BlockLine, border: Style) -> BlockLine {
+    let vertical = ctx.glyphs.resolve(glyphs::box_vertical());
+    let inner = ctx.width.saturating_sub(BOX_BORDERS + BOX_PAD * 2);
+    let used = width::display_width(&line.text());
+    let mut spans = vec![Span::styled(
+        format!("{vertical}{}", " ".repeat(BOX_PAD)),
+        border,
+    )];
+    spans.extend(line.content.spans);
+    if used < inner {
+        spans.push(Span::styled(" ".repeat(inner - used), Style::new()));
+    }
+    spans.push(Span::styled(
+        format!("{}{vertical}", " ".repeat(BOX_PAD)),
+        border,
+    ));
+    let selectable = match line.selectable {
+        Selectable::Spans(range) => Selectable::Spans(range.start + 2..range.end + 2),
+        other => other,
+    };
+    let wrapped = BlockLine::new(Line::from(spans), selectable);
+    if line.joiner.is_some() {
+        wrapped.soft_wrapped()
+    } else {
+        wrapped
     }
 }
 
@@ -515,10 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn render_marks_the_first_row_and_keeps_rows_aligned() {
+    fn flat_render_marks_the_first_row_and_keeps_rows_aligned() {
         let theme = Theme::DARK;
         let prompt = Prompt::with_text("hi\nthere");
-        let lines = prompt.render(&ctx(&theme, 20), true);
+        let lines = prompt.render(&ctx(&theme, 20), &PromptChrome::default(), true);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text(), "❯ hi");
         assert_eq!(lines[1].text(), "  there");
@@ -528,10 +689,50 @@ mod tests {
     }
 
     #[test]
+    fn boxed_render_draws_borders_and_embeds_title_and_info() {
+        let theme = Theme::DARK;
+        let prompt = Prompt::with_text("看一下 CI");
+        let chrome = PromptChrome::default()
+            .with_title("会话 1")
+            .with_info("deepseek-chat · rule · always-approve");
+        let lines = prompt.render(&ctx(&theme, 40), &chrome, true);
+        assert_eq!(lines.len(), 3, "顶边 + 内容 + 底边");
+        let text: Vec<String> = lines.iter().map(BlockLine::text).collect();
+        assert!(text[0].starts_with("╭─ 会话 1 "), "{}", text[0]);
+        assert!(text[0].ends_with('╮'), "{}", text[0]);
+        assert!(text[1].starts_with("│ ❯ 看一下 CI"), "{}", text[1]);
+        assert!(
+            text[2].starts_with("╰─ deepseek-chat · rule"),
+            "{}",
+            text[2]
+        );
+        for line in &text {
+            assert_eq!(width::display_width(line), 40, "{line:?}");
+        }
+        // 可选列区间整体右移了两个列（边框 + 内边距）。
+        assert_eq!(lines[1].selectable, Selectable::Spans(4..40 - 2));
+    }
+
+    #[test]
+    fn boxed_cursor_origin_matches_the_border() {
+        let boxed = PromptChrome {
+            title: None,
+            info: Some("x".to_owned()),
+        };
+        assert_eq!(boxed.content_origin(), (2, 1));
+        assert_eq!(boxed.inner_width(40), 36);
+        assert_eq!(boxed.rows(1), 3);
+        let flat = PromptChrome::default();
+        assert_eq!(flat.content_origin(), (0, 0));
+        assert_eq!(flat.inner_width(40), 40);
+        assert_eq!(flat.rows(2), 2);
+    }
+
+    #[test]
     fn empty_prompt_shows_ghost_text() {
         let theme = Theme::DARK;
         let prompt = Prompt::new();
-        let lines = prompt.render(&ctx(&theme, 40), false);
+        let lines = prompt.render(&ctx(&theme, 40), &PromptChrome::default(), false);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].text().contains("输入消息"));
         assert!(prompt.is_empty());

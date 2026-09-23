@@ -8,7 +8,9 @@
 //! 每帧重新摊平——行数规模小一个数量级，缓存是白付的复杂度（设计 §7「量级要砍」）。
 
 use crate::blocks::{Block, BlockCtx, BlockLine, Selectable};
-use ratatui::text::Line;
+use crate::glyphs;
+use crate::width;
+use ratatui::text::{Line, Span};
 
 /// 可见窗口切片。
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +27,36 @@ impl ScrollWindow {
     /// 是否贴在底部（跟随最新输出）。
     pub fn at_bottom(&self) -> bool {
         self.offset == 0
+    }
+}
+
+/// 滚动提示：不贴底时在回滚区最后一行居中画一个下箭头。
+///
+/// 形状对齐参考截图 `main_ui2.png` 底部居中的 `▼`；贴底（跟随最新输出）时整行让给内容。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollHint;
+
+impl ScrollHint {
+    /// 渲染提示行；贴底或宽度不足时返回 `None`。
+    pub fn render(window: &ScrollWindow, ctx: &BlockCtx) -> Option<BlockLine> {
+        if window.at_bottom() {
+            return None;
+        }
+        let glyph = ctx.glyphs.resolve(glyphs::scroll_hint());
+        let used = width::display_width(glyph);
+        if used == 0 || ctx.width < used {
+            return None;
+        }
+        let left = (ctx.width - used) / 2;
+        let right = ctx.width - used - left;
+        Some(BlockLine::new(
+            Line::from(vec![
+                Span::styled(" ".repeat(left), ctx.theme.dim()),
+                Span::styled(glyph.to_owned(), ctx.theme.muted()),
+                Span::styled(" ".repeat(right), ctx.theme.dim()),
+            ]),
+            Selectable::None,
+        ))
     }
 }
 
@@ -137,6 +169,25 @@ mod tests {
     }
 
     #[test]
+    fn scroll_hint_appears_only_when_not_at_bottom() {
+        let theme = Theme::DARK;
+        let ctx = ctx(&theme);
+        let mut scrollback = Scrollback::new();
+        for text in ["a", "b", "c", "d", "e"] {
+            scrollback.push(Block::user(text));
+        }
+        let bottom = scrollback.window(&ctx, 3);
+        assert!(ScrollHint::render(&bottom, &ctx).is_none(), "贴底不画提示");
+
+        scrollback.scroll_up(2, scrollback.max_offset(&ctx, 3));
+        let scrolled = scrollback.window(&ctx, 3);
+        let hint = ScrollHint::render(&scrolled, &ctx).expect("上滚后应有提示");
+        assert_eq!(hint.text().trim(), "▼");
+        assert_eq!(width::display_width(&hint.text()), ctx.width);
+        assert_eq!(hint.selectable, Selectable::None);
+    }
+
+    #[test]
     fn layout_inserts_one_gap_row_between_blocks() {
         let theme = Theme::DARK;
         let ctx = ctx(&theme);
@@ -164,14 +215,15 @@ mod tests {
         assert_eq!(window.total, 7);
         assert!(window.at_bottom());
         assert_eq!(window.lines.len(), 3);
-        assert_eq!(window.lines[2].text(), "❯ d");
+        // 用户块铺满整行（填充条），比对时只看正文。
+        assert_eq!(window.lines[2].text().trim_end(), "❯ d");
 
         // 上滚 2 行 → 窗口整体上移。
         scrollback.scroll_up(2, scrollback.max_offset(&ctx, 3));
         let scrolled = scrollback.window(&ctx, 3);
         assert_eq!(scrolled.offset, 2);
         assert!(!scrolled.at_bottom());
-        assert_eq!(scrolled.lines[2].text(), "❯ c");
+        assert_eq!(scrolled.lines[2].text().trim_end(), "❯ c");
 
         // 回到底部。
         scrollback.scroll_to_bottom();

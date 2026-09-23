@@ -295,9 +295,41 @@ pub enum ToolStatus {
 }
 
 /// 用户消息块。
+///
+/// 时间戳由适配层格式化好（本 crate 不做时区与日历计算），渲染时贴在填充条第一行的右端。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserBlock {
     pub text: String,
+    pub timestamp: Option<String>,
+}
+
+/// 提示语气：阶段行、完成行与失败行共用一处语气映射。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl NoticeTone {
+    fn style(self, theme: &Theme) -> Style {
+        match self {
+            NoticeTone::Info => theme.muted(),
+            NoticeTone::Success => theme.accent(theme.accent_success),
+            NoticeTone::Warning => theme.accent(theme.accent_warning),
+            NoticeTone::Error => theme.accent(theme.accent_error),
+        }
+    }
+}
+
+/// 阶段行块：`◆ 判定 12ms · 采纳 usr:allow 0.71 · 倾向`，或没有标记的 `用时 1.5s`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoticeBlock {
+    pub text: String,
+    /// 是否画标记列（`◆ `）；不画时用等宽空白占位，保证换行后对齐。
+    pub marker: bool,
+    pub tone: NoticeTone,
 }
 
 /// 助手消息块。
@@ -323,18 +355,55 @@ pub struct DecisionBlock {
     pub trace: DecisionTrace,
 }
 
-/// 块：纯函数 `output(ctx)` 的四种形态。
+/// 块：纯函数 `output(ctx)` 的五种形态。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     User(UserBlock),
     Assistant(AssistantBlock),
     Tool(ToolBlock),
     Decision(DecisionBlock),
+    Notice(NoticeBlock),
 }
 
 impl Block {
     pub fn user(text: impl Into<String>) -> Self {
-        Block::User(UserBlock { text: text.into() })
+        Block::User(UserBlock {
+            text: text.into(),
+            timestamp: None,
+        })
+    }
+
+    /// 带时间戳的用户块（时间戳由适配层格式化）。
+    pub fn user_at(text: impl Into<String>, timestamp: impl Into<String>) -> Self {
+        Block::User(UserBlock {
+            text: text.into(),
+            timestamp: Some(timestamp.into()),
+        })
+    }
+
+    /// 阶段行：带标记（`◆ 判定 …`）。
+    pub fn notice(text: impl Into<String>) -> Self {
+        Block::Notice(NoticeBlock {
+            text: text.into(),
+            marker: true,
+            tone: NoticeTone::Info,
+        })
+    }
+
+    /// 无标记的阶段行（`用时 1.5s`）。
+    pub fn plain_notice(text: impl Into<String>) -> Self {
+        Block::Notice(NoticeBlock {
+            text: text.into(),
+            marker: false,
+            tone: NoticeTone::Info,
+        })
+    }
+
+    pub fn with_tone(mut self, tone: NoticeTone) -> Self {
+        if let Block::Notice(notice) = &mut self {
+            notice.tone = tone;
+        }
+        self
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
@@ -364,37 +433,71 @@ impl Block {
             Block::Assistant(_) => "assistant",
             Block::Tool(_) => "tool",
             Block::Decision(_) => "decision",
+            Block::Notice(_) => "notice",
         }
     }
 
     /// 纯函数：给定上下文产出已换行的屏幕行；无副作用、无缓存。
     pub fn output(&self, ctx: &BlockCtx) -> BlockOutput {
         match self {
-            Block::User(block) => {
-                block_text_lines(ctx, glyphs::prompt(), ctx.theme.fg(), &block.text, false)
-            }
-            Block::Assistant(block) => block_text_lines(
+            Block::User(block) => text_block_lines(
                 ctx,
-                glyphs::diamond(),
-                ctx.theme.fg(),
+                &TextBlock {
+                    marker: ctx.glyphs.resolve(glyphs::prompt()).to_owned(),
+                    style: ctx.theme.fg(),
+                    // 无色档不铺底色（`Reset` 会覆盖用户终端的背景）。
+                    fill: ctx
+                        .theme
+                        .level
+                        .has_color()
+                        .then_some(ctx.theme.user_block_bg),
+                    tail: block.timestamp.as_deref(),
+                    streaming: false,
+                },
                 &block.text,
-                block.streaming,
+            ),
+            Block::Assistant(block) => text_block_lines(
+                ctx,
+                &TextBlock {
+                    // 标记后留一列空格：与参考截图的 `◆ Thought for 0.3s` 同形。
+                    marker: format!("{} ", ctx.glyphs.resolve(glyphs::diamond())),
+                    style: ctx.theme.fg(),
+                    fill: None,
+                    tail: None,
+                    streaming: block.streaming,
+                },
+                &block.text,
             ),
             Block::Tool(block) => tool_lines(ctx, block),
             Block::Decision(block) => decision_lines(ctx, &block.trace),
+            Block::Notice(block) => notice_lines(ctx, block),
         }
     }
 }
 
-/// 消息类块（用户 / 助手）的共用渲染：标记列 + 词级换行 + 续行缩进。
-fn block_text_lines(
-    ctx: &BlockCtx,
-    marker: glyphs::Glyph,
+/// 给样式补一层背景色；`None` 时原样返回。
+fn with_bg(style: Style, fill: Option<ratatui::style::Color>) -> Style {
+    match fill {
+        Some(color) => style.bg(color),
+        None => style,
+    }
+}
+
+/// 文本类块（用户 / 助手 / 阶段行）的渲染参数。
+struct TextBlock<'a> {
+    /// 标记列（已解析字形，含尾随空格）：续行缩进与正文列都按它的宽度算。
+    marker: String,
     style: Style,
-    text: &str,
+    /// 整行铺满的背景色（用户块的填充条）；`None` 表示不铺。
+    fill: Option<ratatui::style::Color>,
+    /// 首行右对齐的尾注（用户块的时间戳）。
+    tail: Option<&'a str>,
     streaming: bool,
-) -> BlockOutput {
-    let marker = ctx.glyphs.resolve(marker);
+}
+
+/// 消息类块的共用渲染：标记列 + 词级换行 + 续行缩进（+ 可选填充条与尾注）。
+fn text_block_lines(ctx: &BlockCtx, spec: &TextBlock, text: &str) -> BlockOutput {
+    let marker = spec.marker.as_str();
     let prefix_width = width::display_width(marker);
     let content_width = ctx.content_width(prefix_width).max(1);
     let mut output = BlockOutput::default();
@@ -411,14 +514,34 @@ fn block_text_lines(
                 " ".repeat(prefix_width)
             };
             let mut spans = vec![
-                Span::styled(head, ctx.theme.dim()),
-                Span::styled(text.clone(), style),
+                Span::styled(head, with_bg(ctx.theme.dim(), spec.fill)),
+                Span::styled(text.clone(), with_bg(spec.style, spec.fill)),
             ];
             // 流式末尾画一个「还在长」的三角，与软换行标记一样只是行级元数据之外的装饰。
-            if streaming && paragraph_index == last_paragraph && line_index == last_row {
+            if spec.streaming && paragraph_index == last_paragraph && line_index == last_row {
                 spans.push(Span::styled(
                     ctx.glyphs.resolve(glyphs::triangle_right()),
                     ctx.theme.dim(),
+                ));
+            }
+            // 尾注贴在填充条的右端：先补间隙再写尾注，尾注之后不再补空白。
+            let tail = match (paragraph_index, line_index) {
+                (0, 0) => spec.tail,
+                _ => None,
+            };
+            let used = prefix_width + width::display_width(text);
+            let padding = ctx
+                .width
+                .saturating_sub(used + tail.map_or(0, width::display_width));
+            if let Some(fill) = spec.fill {
+                spans.push(Span::styled(" ".repeat(padding), Style::new().bg(fill)));
+            } else if tail.is_some() {
+                spans.push(Span::styled(" ".repeat(padding), Style::new()));
+            }
+            if let Some(tail) = tail {
+                spans.push(Span::styled(
+                    tail.to_owned(),
+                    with_bg(ctx.theme.frame(ctx.theme.timestamp), spec.fill),
                 ));
             }
             let start = prefix_width;
@@ -440,6 +563,46 @@ fn block_text_lines(
             Line::from(Span::styled(marker.to_owned(), ctx.theme.dim())),
             Selectable::None,
         ));
+    }
+    output
+}
+
+/// 阶段行：标记列 + 词级换行，语气来自 [`NoticeBlock::tone`]。
+fn notice_lines(ctx: &BlockCtx, block: &NoticeBlock) -> BlockOutput {
+    let marker = ctx.glyphs.resolve(glyphs::diamond());
+    let head = if block.marker {
+        format!("{marker} ")
+    } else {
+        " ".repeat(width::display_width(marker) + 1)
+    };
+    let prefix_width = width::display_width(&head);
+    let content_width = ctx.content_width(prefix_width).max(1);
+    let style = block.tone.style(ctx.theme);
+
+    let mut output = BlockOutput::default();
+    for (index, text) in width::wrap_words(&block.text, content_width)
+        .iter()
+        .enumerate()
+    {
+        let head = if index == 0 {
+            head.clone()
+        } else {
+            " ".repeat(prefix_width)
+        };
+        let start = prefix_width;
+        let end = prefix_width + width::display_width(text);
+        let line = BlockLine::new(
+            Line::from(vec![
+                Span::styled(head, ctx.theme.dim()),
+                Span::styled(text.clone(), style),
+            ]),
+            Selectable::Spans(start as u16..end as u16),
+        );
+        output.push(if index == 0 {
+            line
+        } else {
+            line.soft_wrapped()
+        });
     }
     output
 }
@@ -828,6 +991,78 @@ mod tests {
         assert_eq!(
             Block::decision(DecisionTrace::new("q", vec![])).kind(),
             "decision"
+        );
+        assert_eq!(Block::notice("阶段").kind(), "notice");
+    }
+
+    #[test]
+    fn notice_lines_keep_the_marker_column_stable() {
+        let theme = Theme::DARK;
+        let ctx = BlockCtx {
+            width: 24,
+            theme: &theme,
+            glyphs: Glyphs::FANCY,
+            frame: 0,
+            decision: None,
+        };
+        let marked = Block::notice("判定 12ms · 采纳 usr:allow 0.71").output(&ctx);
+        let plain = Block::plain_notice("用时 1.5s").output(&ctx);
+        let marked_text = marked.lines[0].text();
+        let plain_text = plain.lines[0].text();
+        assert!(marked_text.starts_with("◆ "), "{marked_text:?}");
+        // 无标记的那条用等宽空白占位：正文与有标记的那条从同一列起（按显示列算，不按字节）。
+        assert!(plain_text.starts_with("  "), "{plain_text:?}");
+        assert_eq!(
+            crate::width::display_width(&marked_text[..marked_text.find('判').unwrap()]),
+            crate::width::display_width(&plain_text[..plain_text.find('用').unwrap()]),
+        );
+        // 语气只影响样式，不改文本。
+        let failed = Block::notice("判定失败").with_tone(NoticeTone::Error);
+        assert!(failed.output(&ctx).plain_text().contains("判定失败"));
+    }
+
+    #[test]
+    fn user_block_fills_the_row_and_keeps_the_timestamp_out_of_the_selection() {
+        let theme = Theme::DARK;
+        let ctx = BlockCtx {
+            width: 30,
+            theme: &theme,
+            glyphs: Glyphs::FANCY,
+            frame: 0,
+            decision: None,
+        };
+        let output = Block::user_at("看一下仓库状态", "14:22").output(&ctx);
+        let first = &output.lines[0];
+        // 30 列 = `❯ `(2) + 正文(14) + 间隙(9) + 时间戳(5)：时间戳贴右端。
+        assert_eq!(first.text(), "❯ 看一下仓库状态         14:22");
+        assert_eq!(first.selection_text().unwrap(), "看一下仓库状态");
+        assert!(!first.selection_text().unwrap().contains("14:22"));
+        // 填充条铺满整行（快照与不透明性都依赖这一点）。
+        let line = first.content.clone();
+        assert_eq!(
+            line.spans.last().unwrap().style.bg,
+            Some(theme.user_block_bg)
+        );
+    }
+
+    #[test]
+    fn user_block_without_timestamp_still_fills_the_row() {
+        let theme = Theme::DARK.quantized(ColorLevel::None);
+        let ctx = BlockCtx {
+            width: 20,
+            theme: &theme,
+            glyphs: Glyphs::FANCY,
+            frame: 0,
+            decision: None,
+        };
+        let output = Block::user("你好").output(&ctx);
+        // 无色档不铺底色（Reset 会盖掉终端自己的背景）。
+        assert!(
+            output.lines[0]
+                .content
+                .spans
+                .iter()
+                .all(|span| span.style.bg.is_none())
         );
     }
 }

@@ -12,10 +12,13 @@ use crossterm::event::{Event, KeyCode, KeyModifiers};
 use crate::actions::{ActionId, KeyChord, KeyOwner, Keymap};
 use crate::blocks::{Block, BlockCtx, DecisionTrace};
 use crate::components::{
-    ActiveModal, ApprovalRequest, Prompt, Scrollback, StatusModel, TurnPhase, WaitingReason,
+    ActiveModal, ApprovalRequest, HeaderModel, PanelState, Prompt, PromptChrome, Scrollback,
+    StatusModel, TurnPhase, WaitingReason,
 };
 use crate::glyphs::Glyphs;
+use crate::panels::{PanelId, Panels};
 use crate::render::{RenderGate, TickDemand, animation_frame};
+use crate::screens::Screen;
 use crate::terminal::Capabilities;
 use crate::theme::Theme;
 
@@ -30,6 +33,10 @@ pub enum Effect {
     Submit(String),
     /// 用户对审批卡作出裁决。
     Approval(ApprovalOutcome),
+    /// 研究视图按了单步：宿主推进一步（本 crate 不接线）。
+    Step,
+    /// 研究视图切换了暂停：宿主按这个值停/继续（本 crate 不接线）。
+    SetPaused(bool),
 }
 
 /// 审批裁决。
@@ -58,9 +65,21 @@ pub struct App {
     keymap: Keymap,
     scrollback: Scrollback,
     prompt: Prompt,
+    /// 提示框的 chrome（标题与底边信息行）；宿主用 [`App::set_prompt_chrome`] 换成真值。
+    prompt_chrome: PromptChrome,
     status: StatusModel,
+    /// 顶栏的左半：工作目录与用量；右侧徽章由屏幕决定。
+    header: HeaderModel,
+    /// 首屏右下角的注解（判定器与接线状态）。
+    startup_note: Option<String>,
     modal: Option<ActiveModal>,
     decision: Option<DecisionTrace>,
+    screen: Screen,
+    panels: Panels,
+    panel: PanelId,
+    panel_state: PanelState,
+    /// 当前是否暂停（研究视图；真实运行状态在宿主那里）。
+    paused: bool,
     tick: u64,
     gate: RenderGate,
     should_quit: bool,
@@ -70,6 +89,10 @@ pub struct App {
     scrollback_height: usize,
     /// 上一次布局算出的提示框内容宽度（纵向移动要用）。
     prompt_width: usize,
+    /// 上一次布局算出的面板带宽（内容行数折算要用）。
+    panel_width: usize,
+    /// 上一次布局算出的面板内高（滚动上限要用）。
+    panel_height: usize,
 }
 
 impl App {
@@ -81,15 +104,25 @@ impl App {
             keymap: Keymap::from_defaults(),
             scrollback: Scrollback::new(),
             prompt: Prompt::new(),
+            prompt_chrome: PromptChrome::unwired(),
             status: StatusModel::idle(),
+            header: HeaderModel::new("jev-harness"),
+            startup_note: None,
             modal: None,
             decision: None,
+            screen: Screen::Startup,
+            panels: Panels::default(),
+            panel: PanelId::Judgment,
+            panel_state: PanelState::default(),
+            paused: false,
             tick: 0,
             gate: RenderGate::new(),
             should_quit: false,
             scrollback_width: 80,
             scrollback_height: 10,
             prompt_width: 76,
+            panel_width: 80,
+            panel_height: 10,
         }
     }
 
@@ -139,6 +172,73 @@ impl App {
         &mut self.status
     }
 
+    pub fn prompt_chrome(&self) -> &PromptChrome {
+        &self.prompt_chrome
+    }
+
+    /// 换提示框的 chrome（模型、判定器、授权模式的真值由宿主给）。
+    pub fn set_prompt_chrome(&mut self, chrome: PromptChrome) {
+        self.prompt_chrome = chrome;
+        self.gate.mark_dirty();
+    }
+
+    /// 顶栏数据：左半来自宿主，右侧徽章跟着屏幕走（会话 ↔ 研究视图的入口说明）。
+    pub fn header(&self) -> HeaderModel {
+        let badge = match self.screen {
+            Screen::Agent => Some("[研究视图]".to_owned()),
+            Screen::Research => Some("[会话]".to_owned()),
+            Screen::Startup => None,
+        };
+        HeaderModel {
+            badge,
+            ..self.header.clone()
+        }
+    }
+
+    pub fn header_model_mut(&mut self) -> &mut HeaderModel {
+        &mut self.header
+    }
+
+    pub fn startup_note(&self) -> Option<&str> {
+        self.startup_note.as_deref()
+    }
+
+    /// 首屏右下角的注解（例如 `判定器 rule · 未接线`）。
+    pub fn set_startup_note(&mut self, note: impl Into<String>) {
+        self.startup_note = Some(note.into());
+        self.gate.mark_dirty();
+    }
+
+    pub fn screen(&self) -> Screen {
+        self.screen
+    }
+
+    pub fn set_screen(&mut self, screen: Screen) {
+        self.screen = screen;
+        self.gate.mark_dirty();
+    }
+
+    pub fn panels(&self) -> &Panels {
+        &self.panels
+    }
+
+    /// 喂面板数据（本批由预览样例给，接线后由适配层给）。
+    pub fn panels_mut(&mut self) -> &mut Panels {
+        &mut self.panels
+    }
+
+    pub fn panel(&self) -> PanelId {
+        self.panel
+    }
+
+    pub fn panel_state(&self) -> &PanelState {
+        &self.panel_state
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
     pub fn modal(&self) -> Option<&ActiveModal> {
         self.modal.as_ref()
     }
@@ -175,10 +275,12 @@ impl App {
         }
     }
 
-    /// 这一拍键盘归谁：有模态卡就是卡的（权限键优先），否则归提示框。
+    /// 这一拍键盘归谁：有模态卡就是卡的（权限键优先）；研究视图归面板；其余归提示框。
     pub fn key_owner(&self) -> KeyOwner {
         if self.modal.is_some() {
             KeyOwner::Approval
+        } else if self.screen == Screen::Research {
+            KeyOwner::Research
         } else {
             KeyOwner::Prompt
         }
@@ -198,6 +300,12 @@ impl App {
         self.scrollback_width = scrollback_width;
         self.scrollback_height = scrollback_height;
         self.prompt_width = prompt_width;
+    }
+
+    /// 面板视口的回写（宽度与内高，用于折算内容行数与滚动上限）。
+    pub fn set_panel_viewport(&mut self, width: usize, height: usize) {
+        self.panel_width = width;
+        self.panel_height = height;
     }
 
     /// 追加一个块；翻上去看历史时把视口锚在原地（否则新输出会把视口往上拽）。
@@ -309,8 +417,13 @@ impl App {
                 self.should_quit = true;
                 Some(Effect::Quit)
             }
+            // `Esc` 的阶梯：先关最上面那层（卡片 → 研究视图 → 会话），最后才是取消当前轮。
             ActionId::Interrupt => {
                 if self.modal.take().is_some() {
+                    self.gate.mark_dirty();
+                    None
+                } else if self.screen == Screen::Research {
+                    self.screen = Screen::Agent;
                     self.gate.mark_dirty();
                     None
                 } else {
@@ -323,6 +436,8 @@ impl App {
                     return None;
                 }
                 let text = self.prompt.take();
+                // 首屏提交即进入会话。
+                self.screen = Screen::Agent;
                 self.push_block(Block::user(text.clone()));
                 Some(Effect::Submit(text))
             }
@@ -349,29 +464,15 @@ impl App {
                 self.gate.mark_dirty();
                 None
             }
-            ActionId::ScrollLineUp => {
-                let max = self.max_scroll_offset();
-                self.scrollback.scroll_up(1, max);
-                self.gate.mark_dirty();
-                None
-            }
-            ActionId::ScrollLineDown => {
-                self.scrollback.scroll_down(1);
-                self.gate.mark_dirty();
-                None
-            }
+            ActionId::ScrollLineUp => self.scroll(1, false),
+            ActionId::ScrollLineDown => self.scroll(1, true),
             ActionId::ScrollPageUp => {
                 let step = self.page_step();
-                let max = self.max_scroll_offset();
-                self.scrollback.scroll_up(step, max);
-                self.gate.mark_dirty();
-                None
+                self.scroll(step, false)
             }
             ActionId::ScrollPageDown => {
                 let step = self.page_step();
-                self.scrollback.scroll_down(step);
-                self.gate.mark_dirty();
-                None
+                self.scroll(step, true)
             }
             ActionId::ScrollToBottom => {
                 self.scrollback.scroll_to_bottom();
@@ -398,7 +499,52 @@ impl App {
                 self.status = StatusModel::idle();
                 Some(Effect::Approval(outcome))
             }
+            ActionId::ToggleResearch => {
+                self.screen = match self.screen {
+                    Screen::Research => Screen::Agent,
+                    _ => Screen::Research,
+                };
+                self.gate.mark_dirty();
+                None
+            }
+            ActionId::NextPanel => {
+                self.panel = self.panel.next();
+                self.panel_state.reset();
+                self.gate.mark_dirty();
+                None
+            }
+            ActionId::PrevPanel => {
+                self.panel = self.panel.prev();
+                self.panel_state.reset();
+                self.gate.mark_dirty();
+                None
+            }
+            ActionId::StepOnce => Some(Effect::Step),
+            ActionId::PauseToggle => {
+                self.paused = !self.paused;
+                self.gate.mark_dirty();
+                Some(Effect::SetPaused(self.paused))
+            }
         }
+    }
+
+    /// 滚动：研究视图里滚面板，其余滚回滚区。
+    fn scroll(&mut self, rows: usize, down: bool) -> Option<Effect> {
+        if self.key_owner() == KeyOwner::Research {
+            let max = self.panel_max_offset();
+            if down {
+                self.panel_state.offset = self.panel_state.offset.saturating_sub(rows);
+            } else {
+                self.panel_state.offset = (self.panel_state.offset + rows).min(max);
+            }
+        } else if down {
+            self.scrollback.scroll_down(rows);
+        } else {
+            let max = self.max_scroll_offset();
+            self.scrollback.scroll_up(rows, max);
+        }
+        self.gate.mark_dirty();
+        None
     }
 
     fn edit_prompt(&mut self, edit: impl Fn(&mut Prompt)) -> Option<Effect> {
@@ -412,8 +558,23 @@ impl App {
         self.scrollback.max_offset(&ctx, self.scrollback_height)
     }
 
+    /// 面板能上滚的最大行数（内容不足一屏时为 0）。
+    pub fn panel_max_offset(&self) -> usize {
+        let ctx = self.block_ctx(self.panel_width);
+        let rows = self
+            .panels
+            .panel(self.panel, self.glyphs)
+            .content_rows(&ctx);
+        rows.saturating_sub(self.panel_height)
+    }
+
     fn page_step(&self) -> usize {
-        self.scrollback_height.saturating_sub(1).max(1)
+        let height = if self.key_owner() == KeyOwner::Research {
+            self.panel_height
+        } else {
+            self.scrollback_height
+        };
+        height.saturating_sub(1).max(1)
     }
 }
 
@@ -455,10 +616,91 @@ mod tests {
     }
 
     #[test]
+    fn submitting_from_startup_enters_the_agent_screen() {
+        let mut app = app();
+        assert_eq!(app.screen(), Screen::Startup);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Effect::Submit("h".to_owned()))
+        );
+        assert_eq!(app.screen(), Screen::Agent, "首屏提交即进入会话");
+    }
+
+    #[test]
     fn empty_prompt_does_not_submit() {
         let mut app = app();
         assert_eq!(press(&mut app, KeyCode::Enter), None);
         assert_eq!(app.scrollback().len(), 0);
+    }
+
+    #[test]
+    fn toggle_research_switches_screens_and_hands_the_keyboard_to_the_panel() {
+        let mut app = app();
+        assert_eq!(
+            app.handle_key(KeyChord::ctrl(KeyCode::Char('o'))),
+            None,
+            "切视图本身没有副作用"
+        );
+        assert_eq!(app.screen(), Screen::Research);
+        assert_eq!(app.key_owner(), KeyOwner::Research);
+        // 研究视图里 `s` 是单步，不是文本输入。
+        assert_eq!(press(&mut app, KeyCode::Char('s')), Some(Effect::Step));
+        assert_eq!(app.prompt().text(), "");
+        // 再按一次回到会话。
+        app.handle_key(KeyChord::ctrl(KeyCode::Char('o')));
+        assert_eq!(app.screen(), Screen::Agent);
+        assert_eq!(app.key_owner(), KeyOwner::Prompt);
+    }
+
+    #[test]
+    fn escape_leaves_the_research_screen_before_quitting() {
+        let mut app = app();
+        app.set_screen(Screen::Research);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(app.screen(), Screen::Agent, "Esc 先退出研究视图");
+        assert!(!app.should_quit());
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Effect::Interrupt));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn panel_keys_cycle_and_reset_the_scroll_offset() {
+        let mut app = app();
+        app.set_screen(Screen::Research);
+        app.set_panel_viewport(40, 2);
+        assert_eq!(app.panel(), PanelId::Judgment);
+        assert_eq!(press(&mut app, KeyCode::Tab), None);
+        assert_eq!(app.panel(), PanelId::Evidence);
+        // Shift+Tab（终端报成 BackTab）回到上一个面板。
+        app.handle_key(KeyChord::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.panel(), PanelId::Judgment);
+        assert_eq!(press(&mut app, KeyCode::Tab), None);
+        assert_eq!(app.panel(), PanelId::Evidence);
+
+        // 面板滚动：上滚受内容高度约束，下滚回到顶部。
+        app.set_panel_viewport(40, 1);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_state().offset, 0, "空数据没有可滚内容");
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.panel_state().offset, 0);
+    }
+
+    #[test]
+    fn pause_toggles_and_reports_the_host_side_effect() {
+        let mut app = app();
+        app.set_screen(Screen::Research);
+        assert!(!app.paused());
+        assert_eq!(
+            press(&mut app, KeyCode::Char(' ')),
+            Some(Effect::SetPaused(true))
+        );
+        assert!(app.paused());
+        assert_eq!(
+            press(&mut app, KeyCode::Char(' ')),
+            Some(Effect::SetPaused(false))
+        );
+        assert!(!app.paused());
     }
 
     #[test]

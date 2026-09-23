@@ -151,7 +151,7 @@ impl StatusModel {
         if let Some((used, limit)) = self.tokens {
             spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
             spans.push(Span::styled(
-                format!("{} 上下文", format_tokens(used, limit)),
+                format!("{} 上下文", crate::components::format_tokens(used, limit)),
                 ctx.theme.dim(),
             ));
         }
@@ -165,22 +165,6 @@ impl StatusModel {
             Selectable::All,
         )
     }
-}
-
-/// 上下文用量的短写法：`12.3k/64k`（整千不带小数）。
-fn format_tokens(used: u32, limit: u32) -> String {
-    fn short(value: u32) -> String {
-        if value < 1000 {
-            return value.to_string();
-        }
-        let thousands = value as f32 / 1000.0;
-        if thousands.fract() < f32::EPSILON {
-            format!("{}k", thousands as u32)
-        } else {
-            format!("{thousands:.1}k")
-        }
-    }
-    format!("{}/{}", short(used), short(limit))
 }
 
 /// 快捷键栏：数据源只有 [`Keymap::hints`]（注册表），这里只做排版与裁剪。

@@ -1,22 +1,43 @@
-//! 组件层：回滚区 / 提示框 / 状态行 / 快捷键栏 / 审批卡。
+//! 组件层：顶栏 / 回滚区 / 提示框 / 面板 / 状态行 / 快捷键栏 / 审批卡。
 //!
-//! 组件之间不互相调用，数据都来自参数（块上下文、动作注册表、状态模型）；
-//! 唯一被共享的排版工具是 [`clip_spans`]——按显示列裁剪带样式的一行。
+//! 组件之间不互相调用，数据都来自参数（块上下文、动作注册表、状态模型、面板行）；
+//! 被共享的排版工具是 [`clip_spans`]（按显示列裁剪带样式的一行）与 [`format_tokens`]
+//! （上下文用量的短写法，状态行与顶栏共用）。
 
 pub mod approval;
+pub mod header;
+pub mod panel;
 pub mod prompt;
 pub mod scrollback;
 pub mod status;
 
 pub use approval::{ActiveModal, ApprovalCard, ApprovalOption, ApprovalRequest};
-pub use prompt::{MAX_PROMPT_ROWS, Prompt, TextCursor};
-pub use scrollback::{ScrollWindow, Scrollback};
+pub use header::{HeaderBar, HeaderModel};
+pub use panel::{Panel, PanelLine, PanelState, PanelTitle, Tone};
+pub use prompt::{MAX_PROMPT_ROWS, Prompt, PromptChrome, TextCursor};
+pub use scrollback::{ScrollHint, ScrollWindow, Scrollback};
 pub use status::{ShortcutBar, StatusModel, TurnPhase, WaitingReason};
 
 use ratatui::style::Style;
 use ratatui::text::Span;
 
 use crate::width;
+
+/// 上下文用量的短写法：`12.3k/64k`（整千不带小数）。状态行与顶栏共用一处口径。
+pub fn format_tokens(used: u32, limit: u32) -> String {
+    fn short(value: u32) -> String {
+        if value < 1000 {
+            return value.to_string();
+        }
+        let thousands = value as f32 / 1000.0;
+        if thousands.fract() < f32::EPSILON {
+            format!("{}k", thousands as u32)
+        } else {
+            format!("{thousands:.1}k")
+        }
+    }
+    format!("{}/{}", short(used), short(limit))
+}
 
 /// 按显示列裁剪一组带样式的 span：超宽时裁掉尾部的簇并在末尾补省略号，
 /// 省略号沿用被抓到的那个 span 的样式。宽度不足时不会劈开宽字符。

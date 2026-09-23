@@ -47,6 +47,16 @@ pub enum ActionId {
     ApproveAlways,
     /// 拒绝（审批卡）。
     Deny,
+    /// 主界面 ↔ 研究视图。
+    ToggleResearch,
+    /// 下一个研究面板。
+    NextPanel,
+    /// 上一个研究面板。
+    PrevPanel,
+    /// 单步（研究视图；副作用由宿主执行）。
+    StepOnce,
+    /// 暂停 / 继续（研究视图；副作用由宿主执行）。
+    PauseToggle,
 }
 
 impl ActionId {
@@ -72,6 +82,11 @@ impl ActionId {
         ActionId::ApproveOnce,
         ActionId::ApproveAlways,
         ActionId::Deny,
+        ActionId::ToggleResearch,
+        ActionId::NextPanel,
+        ActionId::PrevPanel,
+        ActionId::StepOnce,
+        ActionId::PauseToggle,
     ];
 }
 
@@ -86,18 +101,22 @@ pub enum When {
     ScrollbackFocused,
     /// 审批卡持有键盘时。
     ApprovalFocused,
+    /// 研究视图持有键盘时（面板滚动、面板切换、单步 / 暂停）。
+    ResearchFocused,
 }
 
 /// 这一拍键盘归谁：显式枚举，不靠隐式焦点推断。
 ///
 /// 对应上游 `key_owner.rs` 的排位思想（权限卡抢断其他卡，`key_owner.rs:96-105`），
-/// 这里收敛成三档。审批卡在槽位上时，**权限键优先**：只查 `ApprovalFocused` 与 `Always`，
+/// 这里收敛成四档。审批卡在槽位上时，**权限键优先**：只查 `ApprovalFocused` 与 `Always`，
 /// 其他上下文里绑到同一键的动作不会遮蔽它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOwner {
     Approval,
     Prompt,
     Scrollback,
+    /// 研究视图：面板吃键盘（没有文本输入）。
+    Research,
 }
 
 impl KeyOwner {
@@ -107,6 +126,7 @@ impl KeyOwner {
             KeyOwner::Approval => When::ApprovalFocused,
             KeyOwner::Prompt => When::PromptFocused,
             KeyOwner::Scrollback => When::ScrollbackFocused,
+            KeyOwner::Research => When::ResearchFocused,
         }
     }
 }
@@ -265,7 +285,8 @@ fn display_code(code: &KeyCode) -> String {
         KeyCode::Enter => "Enter".to_owned(),
         KeyCode::Esc => "Esc".to_owned(),
         KeyCode::Tab => "Tab".to_owned(),
-        KeyCode::BackTab => "BackTab".to_owned(),
+        // 终端把 Shift+Tab 报成 BackTab；对用户来说它的名字就是 Shift+Tab。
+        KeyCode::BackTab => "Shift+Tab".to_owned(),
         KeyCode::Backspace => "Backspace".to_owned(),
         KeyCode::Delete => "Delete".to_owned(),
         KeyCode::Insert => "Insert".to_owned(),
@@ -343,19 +364,20 @@ const ALT_APPROVE_ONCE: &[KeyChord] = &[KeyChord {
     code: KeyCode::Char('1'),
     modifiers: KeyModifiers::NONE,
 }];
-const ALT_APPROVE_ALWAYS: &[KeyChord] = &[
-    KeyChord {
-        code: KeyCode::Char('2'),
-        modifiers: KeyModifiers::NONE,
-    },
-    KeyChord {
-        code: KeyCode::Char('o'),
-        modifiers: KeyModifiers::CONTROL,
-    },
-];
+// `Ctrl+O` 曾是这一条的备用键；它现在是 `ToggleResearch`（`When::Always`）——两者都全局可见，
+// 同键双绑会被 `validate()` 拦下，于是这里只留数字键。
+const ALT_APPROVE_ALWAYS: &[KeyChord] = &[KeyChord {
+    code: KeyCode::Char('2'),
+    modifiers: KeyModifiers::NONE,
+}];
 const ALT_DENY: &[KeyChord] = &[KeyChord {
     code: KeyCode::Char('3'),
     modifiers: KeyModifiers::NONE,
+}];
+/// 终端对 `Shift+Tab` 的两种送达形态：有的报 `BackTab` 不带修饰键，有的带上 SHIFT。
+const ALT_PREV_PANEL: &[KeyChord] = &[KeyChord {
+    code: KeyCode::BackTab,
+    modifiers: KeyModifiers::SHIFT,
 }];
 
 /// 单一注册表：所有默认键位只在这里出现一次。
@@ -541,6 +563,89 @@ pub fn default_actions() -> Vec<ActionDef> {
             alt_keys: ALT_DENY,
             hint_priority: Some(2),
         },
+        ActionDef {
+            id: ActionId::ToggleResearch,
+            label: "切换视图",
+            description: "主界面与研究视图之间切换",
+            context: When::Always,
+            default_key: KeyChord::ctrl(KeyCode::Char('o')),
+            alt_keys: &[],
+            hint_priority: Some(6),
+        },
+        ActionDef {
+            id: ActionId::NextPanel,
+            label: "下一个面板",
+            description: "研究视图切到下一个面板",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::Tab),
+            alt_keys: &[],
+            hint_priority: Some(2),
+        },
+        ActionDef {
+            id: ActionId::PrevPanel,
+            label: "上一个面板",
+            description: "研究视图切到上一个面板",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::BackTab),
+            alt_keys: ALT_PREV_PANEL,
+            hint_priority: Some(3),
+        },
+        ActionDef {
+            id: ActionId::StepOnce,
+            label: "单步",
+            description: "让宿主推进一步（研究视图）",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::Char('s')),
+            alt_keys: &[],
+            hint_priority: Some(4),
+        },
+        ActionDef {
+            id: ActionId::PauseToggle,
+            label: "暂停",
+            description: "暂停或继续（研究视图）",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::Char(' ')),
+            alt_keys: &[],
+            hint_priority: Some(5),
+        },
+        // 滚动动作在研究视图里再注册一份：同一个动作在两个上下文各有绑定，
+        // 面板吃 `↑ ↓ PgUp PgDn`，回滚区那份不受影响。
+        ActionDef {
+            id: ActionId::ScrollLineUp,
+            label: "上滚一行",
+            description: "面板内容上滚一行",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::Up),
+            alt_keys: &[],
+            hint_priority: None,
+        },
+        ActionDef {
+            id: ActionId::ScrollLineDown,
+            label: "下滚一行",
+            description: "面板内容下滚一行",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::Down),
+            alt_keys: &[],
+            hint_priority: None,
+        },
+        ActionDef {
+            id: ActionId::ScrollPageUp,
+            label: "上翻",
+            description: "面板内容上翻一屏",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::PageUp),
+            alt_keys: &[],
+            hint_priority: None,
+        },
+        ActionDef {
+            id: ActionId::ScrollPageDown,
+            label: "下翻",
+            description: "面板内容下翻一屏",
+            context: When::ResearchFocused,
+            default_key: KeyChord::plain(KeyCode::PageDown),
+            alt_keys: &[],
+            hint_priority: None,
+        },
     ]
 }
 
@@ -690,13 +795,63 @@ mod tests {
         KeyChord::new(code, modifiers)
     }
 
+    /// 每个动作至少要有一条绑定；同一个动作可以在多个上下文里各有一条（研究视图的滚动键
+    /// 就是这么来的），所以这里是「至少出现一次」而不是「一一对应」。
     #[test]
     fn registry_covers_every_action_id() {
         let defs = default_actions();
         for id in ActionId::ALL {
             assert!(defs.iter().any(|def| def.id == *id), "注册表缺少 {id:?}");
         }
-        assert_eq!(defs.len(), ActionId::ALL.len());
+        assert!(defs.len() >= ActionId::ALL.len());
+    }
+
+    #[test]
+    fn research_keys_are_context_scoped() {
+        let keymap = Keymap::from_defaults();
+        // 研究视图里 `s` 是单步，不是文本；切回提示框后 `s` 又是普通字符。
+        assert_eq!(
+            keymap.lookup(
+                KeyOwner::Research,
+                chord(KeyCode::Char('s'), KeyModifiers::NONE)
+            ),
+            Some(ActionId::StepOnce)
+        );
+        assert_eq!(
+            keymap.lookup(
+                KeyOwner::Prompt,
+                chord(KeyCode::Char('s'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        // Tab / Shift+Tab（BackTab 的两种送达形态）都切面板。
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(
+                keymap.lookup(KeyOwner::Research, chord(KeyCode::BackTab, modifiers)),
+                Some(ActionId::PrevPanel)
+            );
+        }
+        assert_eq!(
+            keymap.lookup(KeyOwner::Research, chord(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(ActionId::NextPanel)
+        );
+        // 上下键在研究视图里滚面板，在提示框里移动光标。
+        assert_eq!(
+            keymap.lookup(KeyOwner::Research, chord(KeyCode::Up, KeyModifiers::NONE)),
+            Some(ActionId::ScrollLineUp)
+        );
+        // 切视图在两个上下文都可用。
+        for owner in [KeyOwner::Prompt, KeyOwner::Research] {
+            assert_eq!(
+                keymap.lookup(owner, KeyChord::ctrl(KeyCode::Char('o'))),
+                Some(ActionId::ToggleResearch)
+            );
+        }
+    }
+
+    #[test]
+    fn back_tab_renders_as_shift_tab() {
+        assert_eq!(KeyChord::plain(KeyCode::BackTab).display(), "Shift+Tab");
     }
 
     #[test]

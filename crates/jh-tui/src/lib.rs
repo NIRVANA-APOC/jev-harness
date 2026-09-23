@@ -15,8 +15,13 @@
 //! ## 本批次范围边界（设计 §7.2）
 //!
 //! 做：主题（一套写死的深色配色 + 色深降级）、字形（每字形一个函数 + 同宽回退）、
-//! 宽度工具、块模型（用户 / 助手 / 工具 / 决策轨迹）、组件（回滚区 / 提示框 / 状态行 /
-//! 快捷键栏 / 审批卡）、动作注册表（键位可覆盖）、三条件重绘闸门、终端护栏、离线快照测试。
+//! 宽度工具、块模型（用户 / 助手 / 工具 / 决策轨迹 / 阶段行）、组件（顶栏 / 回滚区 /
+//! 四边盒提示框 / 面板壳 / 状态行 / 快捷键栏 / 审批卡）、三屏（首屏 / 主界面 / 研究视图）、
+//! 研究视图的三个面板（判断详情 / 事件与证据 / 失效传播）、动作注册表（键位可覆盖）、
+//! 三条件重绘闸门、终端护栏、离线快照测试。
+//!
+//! **不接线**：本 crate 不依赖 `jh-core` / `jh-app`，面板数据与提示框信息行由宿主喂入；
+//! 单步与暂停只产出 [`app::Effect`]，真实运行状态在宿主那里。
 //!
 //! 不做：多形态渲染（只做 alt-screen 全屏）、鼠标与选择/剪贴板、主题热切换、命令面板与
 //! 模糊搜索、折叠分组、语法高亮（不引入 `syntect`）、Markdown 解析（不引入
@@ -32,10 +37,15 @@
 //! | [`width`] | 显示列度量、grapheme 整簇裁剪与折行 |
 //! | [`blocks`] | 块 = 纯函数 `output(ctx)`，产出已换行的屏幕行 + 行级元数据 |
 //! | [`actions`] | `ActionId` 编译期枚举 + `default_actions()` 单一注册表 + 键位覆盖 |
-//! | [`components`] | 回滚区 / 提示框 / 状态行 / 快捷键栏 / 审批卡 |
-//! | [`render`] | 布局 + 三条件重绘闸门 + 唯一绘制入口 |
+//! | [`components`] | 顶栏 / 回滚区 / 提示框 / 面板 / 状态行 / 快捷键栏 / 审批卡 |
+//! | [`screens`] | `Screen`（首屏 / 主界面 / 研究视图）与三屏的纯函数布局 |
+//! | [`panels`] | 研究视图的三个面板：判断详情 / 事件与证据 / 失效传播 |
+//! | [`startup`] | 首屏面板：字标 + 版本 + 概览 + 菜单 |
+//! | [`render`] | 三条件重绘闸门 + 唯一绘制入口（按屏分发） |
 //! | [`app`] | 应用状态与纯调度（副作用描述成 [`app::Effect`]） |
 //! | [`terminal`] | 能力位 + 进入/退出/幂等恢复护栏 |
+//!
+//! 屏幕与交互的设计基准见 `docs/tui-design.md`。
 //!
 //! ## 用法
 //!
@@ -57,14 +67,18 @@
 //! ```
 //!
 //! 真实终端里的进入/退出、模式开关（raw mode / 备用屏 / bracketed paste）、
-//! 信号恢复与 panic hook 见 [`terminal::TerminalGuard`] 与 `examples/demo.rs`。
+//! 信号恢复与 panic hook 见 [`terminal::TerminalGuard`] 与 `examples/design.rs`
+//! （`cargo run -p jh-tui --example design` 在非 TTY 下逐屏打印设计预览）。
 
 pub mod actions;
 pub mod app;
 pub mod blocks;
 pub mod components;
 pub mod glyphs;
+pub mod panels;
 pub mod render;
+pub mod screens;
+pub mod startup;
 pub mod terminal;
 pub mod theme;
 pub mod width;

@@ -12,12 +12,20 @@ use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::text::{Line, Text};
+use ratatui::layout::{Position, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
-use crate::components::{ApprovalCard, MAX_PROMPT_ROWS, ShortcutBar};
+use crate::blocks::{BlockCtx, BlockLine, Selectable};
+use crate::components::{
+    ApprovalCard, HeaderBar, MAX_PROMPT_ROWS, PanelState, ScrollHint, ShortcutBar, clip_spans,
+};
+use crate::glyphs;
+use crate::screens::{self, Screen};
+use crate::startup::{self, StartupFacts};
+use crate::width;
 
 /// 动画降帧：每 4 个 tick 前进一帧（上游 `SPINNER_DIVISOR = 4`，专题 06 §2）。
 pub const SPINNER_DIVISOR: u64 = 4;
@@ -144,54 +152,38 @@ impl RenderGate {
     }
 }
 
-/// 一屏的四个区域。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppLayout {
-    pub scrollback: Rect,
-    pub status: Rect,
-    pub prompt: Rect,
-    pub shortcuts: Rect,
-}
-
-/// 自上而下：回滚区（吃剩余高度）/ 状态行（1）/ 提示框（1..=n）/ 快捷键栏（1）。
-pub fn layout(area: Rect, prompt_rows: u16) -> AppLayout {
-    let [scrollback, status, prompt, shortcuts] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(prompt_rows),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    AppLayout {
-        scrollback,
-        status,
-        prompt,
-        shortcuts,
-    }
-}
-
-/// 提示框占几行：按软折行后的可视行数，受区域高度一半与 [`MAX_PROMPT_ROWS`] 限制。
+/// 提示框占几行：按软折行后的可视行数，受区域高度一半与 [`MAX_PROMPT_ROWS`] 限制，
+/// 再按 chrome 加上盒子的上下边框。
 pub fn prompt_rows(app: &App, area: Rect) -> u16 {
     let content_width = prompt_content_width(app, area.width);
     let rows = app.prompt().visual_rows(content_width);
     let ceiling = (area.height / 2).max(1).min(MAX_PROMPT_ROWS as u16);
-    (rows as u16).clamp(1, ceiling)
+    let content_rows = (rows as u16).clamp(1, ceiling);
+    app.prompt_chrome().rows(content_rows as usize)
 }
 
-/// 提示框内容列宽（扣掉提示字符占的列）。
+/// 提示框内容列宽（扣掉边框、内边距与提示字符占的列）。
 pub fn prompt_content_width(app: &App, area_width: u16) -> usize {
-    (area_width as usize)
-        .saturating_sub(crate::width::display_width(
-            app.glyphs().resolve(crate::glyphs::prompt()),
-        ))
+    let inner = app.prompt_chrome().inner_width(area_width as usize);
+    inner
+        .saturating_sub(width::display_width(app.glyphs().resolve(glyphs::prompt())))
         .max(1)
 }
 
-/// 唯一绘制入口：一屏画完所有组件。
+/// 唯一绘制入口：按 [`Screen`] 分发到三屏之一。
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    match app.screen() {
+        Screen::Startup => draw_startup(frame, app),
+        Screen::Agent => draw_agent(frame, app),
+        Screen::Research => draw_research(frame, app),
+    }
+}
+
+/// 主界面：顶栏 / 回滚区（+ 审批卡、滚动提示）/ 状态行 / 提示框 / 快捷键栏。
+fn draw_agent(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let rows = prompt_rows(app, area);
-    let layout = layout(area, rows);
+    let layout = screens::agent_layout(area, rows);
 
     // 布局信息回写：按键处理（纵向移动、翻页）要用到上一次布局算出的宽度与高度。
     app.set_viewport(
@@ -200,18 +192,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         prompt_content_width(app, layout.prompt.width),
     );
 
-    // 1) 回滚区：只画可见窗口里的行（块已经自己换好行了）。
+    // 1) 顶栏。
+    if layout.header.height > 0 {
+        let header_ctx = app.block_ctx(layout.header.width as usize);
+        let header = app.header();
+        render_lines(
+            frame,
+            layout.header,
+            std::iter::once(HeaderBar::render(&header, &header_ctx).content),
+        );
+    }
+
+    // 2) 回滚区：只画可见窗口里的行（块已经自己换好行了）；不贴底时最后一行让给滚动提示。
     let ctx = app.block_ctx(layout.scrollback.width as usize);
     let window = app
         .scrollback()
         .window(&ctx, layout.scrollback.height as usize);
-    render_lines(
-        frame,
-        layout.scrollback,
-        window.lines.iter().map(|line| line.content.clone()),
-    );
+    let mut lines: Vec<Line<'_>> = window
+        .lines
+        .iter()
+        .map(|line| line.content.clone())
+        .collect();
+    if let Some(hint) = ScrollHint::render(&window, &ctx)
+        && let Some(last) = lines.last_mut()
+    {
+        *last = hint.content;
+    }
+    render_lines(frame, layout.scrollback, lines);
 
-    // 2) 审批卡：单槽位模态，压在回滚区底部；在槽位里就持有键盘。
+    // 3) 审批卡：单槽位模态，压在回滚区底部；在槽位里就持有键盘。
     if let Some(modal) = app.modal() {
         let request = modal.request().clone();
         let card_ctx = app.block_ctx(layout.scrollback.width as usize);
@@ -229,40 +238,178 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // 3) 状态行。
+    // 4) 状态行。
     let status_ctx = app.block_ctx(layout.status.width as usize);
     let status = app.status().render(&status_ctx);
     render_lines(frame, layout.status, std::iter::once(status.content));
 
-    // 4) 提示框（+ 终端光标）。
-    let prompt_ctx = app.block_ctx(layout.prompt.width as usize);
-    let focused = app.is_prompt_focused();
-    let prompt_lines = app.prompt().render(&prompt_ctx, focused);
-    render_lines(
-        frame,
-        layout.prompt,
-        prompt_lines.into_iter().map(|line| line.content),
-    );
-    if focused {
-        let (row, column) = app
-            .prompt()
-            .cursor_cell(prompt_content_width(app, layout.prompt.width));
-        let x = layout.prompt.x
-            + crate::width::display_width(event_prompt_glyph(app)) as u16
-            + column as u16;
-        let y = layout.prompt.y + row as u16;
-        if x < layout.prompt.right() && y < layout.prompt.bottom() {
-            frame.set_cursor_position(Position::new(x, y));
-        }
-    }
+    // 5) 提示框（+ 终端光标）。
+    draw_prompt(frame, app, layout.prompt);
 
-    // 5) 快捷键栏：条目来自动作注册表的 hint_priority。
-    let bar = ShortcutBar::render(&prompt_ctx, app.keymap(), app.key_owner());
+    // 6) 快捷键栏：条目来自动作注册表的 hint_priority。
+    let bar_ctx = app.block_ctx(layout.shortcuts.width as usize);
+    let bar = ShortcutBar::render(&bar_ctx, app.keymap(), app.key_owner());
     render_lines(frame, layout.shortcuts, std::iter::once(bar.content));
 }
 
-fn event_prompt_glyph(app: &App) -> &'static str {
-    app.glyphs().resolve(crate::glyphs::prompt())
+/// 首屏：居中面板（或小屏退化列表）/ 提示框 / 右下注解。
+fn draw_startup(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let rows = prompt_rows(app, area);
+    let layout = screens::startup_layout(area, rows);
+    let workspace = app.header().title;
+    let note = app.startup_note().unwrap_or("未接线").to_owned();
+    let facts = StartupFacts {
+        // 工作区各 crate 同版本；要显示别的版本号时由宿主的顶栏标题承担。
+        version: env!("CARGO_PKG_VERSION"),
+        judge: &note,
+        workspace: &workspace,
+    };
+
+    app.set_viewport(
+        layout.body.width as usize,
+        layout.body.height as usize,
+        prompt_content_width(app, layout.prompt.width),
+    );
+
+    if screens::startup_fits(area) {
+        let panel_width = screens::startup_panel_width(layout.body);
+        let ctx = app.block_ctx(panel_width as usize);
+        let panel = startup::panel(&facts, app.glyphs());
+        let height = (panel.height(&ctx) as u16).min(layout.body.height).max(1);
+        let rect = screens::startup_panel_rect(layout.body, panel_width, height);
+        let lines = panel.render(&ctx, height as usize, &PanelState::default(), true);
+        render_lines(frame, rect, lines.into_iter().map(|line| line.content));
+    } else {
+        let ctx = app.block_ctx(layout.body.width as usize);
+        render_lines(
+            frame,
+            layout.body,
+            startup::plain(&facts, &ctx)
+                .into_iter()
+                .map(|line| line.content),
+        );
+    }
+
+    // 右下注解：判定器与接线状态（如实标注，不假装接了模型）。
+    let note_ctx = app.block_ctx(layout.note.width as usize);
+    render_lines(
+        frame,
+        layout.note,
+        std::iter::once(note_line(&note, &note_ctx).content),
+    );
+
+    draw_prompt(frame, app, layout.prompt);
+}
+
+/// 研究视图：顶栏 / 面板带 / 状态行 / 快捷键栏（没有提示框：研究态不接受自然语言输入）。
+fn draw_research(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let layout = screens::research_layout(area);
+
+    if layout.header.height > 0 {
+        let header_ctx = app.block_ctx(layout.header.width as usize);
+        let header = app.header();
+        render_lines(
+            frame,
+            layout.header,
+            std::iter::once(HeaderBar::render(&header, &header_ctx).content),
+        );
+    }
+
+    let band = layout.panel;
+    app.set_panel_viewport(band.width as usize, band.height.saturating_sub(2) as usize);
+    let ctx = app.block_ctx(band.width as usize);
+    let panel = app.panels().panel(app.panel(), app.glyphs());
+    let state = *app.panel_state();
+    let lines = panel.render(&ctx, band.height as usize, &state, true);
+    render_lines(frame, band, lines.into_iter().map(|line| line.content));
+
+    let status_ctx = app.block_ctx(layout.status.width as usize);
+    render_lines(
+        frame,
+        layout.status,
+        std::iter::once(research_status(app, &status_ctx).content),
+    );
+
+    let bar_ctx = app.block_ctx(layout.shortcuts.width as usize);
+    let bar = ShortcutBar::render(&bar_ctx, app.keymap(), app.key_owner());
+    render_lines(frame, layout.shortcuts, std::iter::once(bar.content));
+}
+
+/// 提示框（三屏共用）：四边盒 + 终端光标。
+fn draw_prompt(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let ctx = app.block_ctx(area.width as usize);
+    let focused = app.is_prompt_focused();
+    let lines = app.prompt().render(&ctx, app.prompt_chrome(), focused);
+    render_lines(frame, area, lines.into_iter().map(|line| line.content));
+
+    if focused {
+        let (dx, dy) = app.prompt_chrome().content_origin();
+        let (row, column) = app
+            .prompt()
+            .cursor_cell(prompt_content_width(app, area.width));
+        let x = area.x
+            + dx
+            + width::display_width(app.glyphs().resolve(glyphs::prompt())) as u16
+            + column as u16;
+        let y = area.y + dy + row as u16;
+        if x < area.right() && y < area.bottom() {
+            frame.set_cursor_position(Position::new(x, y));
+        }
+    }
+}
+
+/// 研究视图的状态行：屏幕名 + 当前面板 + 暂停标记 + 面板的规模读数。
+fn research_status(app: &App, ctx: &BlockCtx) -> BlockLine {
+    let separator = ctx.glyphs.resolve(glyphs::separator());
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", ctx.glyphs.resolve(glyphs::dot())),
+            ctx.theme.dim(),
+        ),
+        Span::styled(Screen::Research.label().to_owned(), ctx.theme.muted()),
+        Span::styled(format!(" {separator} "), ctx.theme.dim()),
+        Span::styled(
+            app.panel().label().to_owned(),
+            ctx.theme.accent(ctx.theme.accent_system),
+        ),
+    ];
+    if let Some(summary) = app.panels().summary(app.panel()) {
+        spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
+        spans.push(Span::styled(summary, ctx.theme.dim()));
+    }
+    if app.paused() {
+        spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
+        spans.push(Span::styled(
+            "已暂停".to_owned(),
+            ctx.theme.accent(ctx.theme.accent_warning),
+        ));
+    }
+    BlockLine::new(
+        Line::from(clip_spans(
+            spans,
+            ctx.width,
+            ctx.glyphs.resolve(glyphs::ellipsis()),
+        )),
+        Selectable::All,
+    )
+}
+
+/// 右对齐的一行（首屏右下注解）。
+fn note_line(text: &str, ctx: &BlockCtx) -> BlockLine {
+    let text = width::clip_with_ellipsis(text, ctx.width, ctx.glyphs.resolve(glyphs::ellipsis()));
+    let padding = ctx.width.saturating_sub(width::display_width(&text));
+    BlockLine::new(
+        Line::from(vec![
+            Span::styled(" ".repeat(padding), Style::new()),
+            Span::styled(text, ctx.theme.dim()),
+        ]),
+        Selectable::All,
+    )
 }
 
 /// 把一组已换行的行画进矩形（块已经换好行，这里不做折行）。
@@ -360,8 +507,10 @@ mod tests {
 
     #[test]
     fn layout_carves_the_screen_from_top_to_bottom() {
+        // 12 行 < SHORT_TERMINAL_ROWS：顶栏收起，其余自上而下排开。
         let area = Rect::new(0, 0, 40, 12);
-        let layout = layout(area, 3);
+        let layout = screens::agent_layout(area, 3);
+        assert_eq!(layout.header.height, 0);
         assert_eq!(layout.scrollback, Rect::new(0, 0, 40, 7));
         assert_eq!(layout.status, Rect::new(0, 7, 40, 1));
         assert_eq!(layout.prompt, Rect::new(0, 8, 40, 3));
