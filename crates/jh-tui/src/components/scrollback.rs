@@ -81,6 +81,11 @@ impl Scrollback {
         &self.blocks
     }
 
+    /// 末尾块的就地写权限：流式助手文本要接着写，工具块执行完要回填状态与结果摘要。
+    pub fn last_mut(&mut self) -> Option<&mut Block> {
+        self.blocks.last_mut()
+    }
+
     pub fn len(&self) -> usize {
         self.blocks.len()
     }

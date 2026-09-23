@@ -10,7 +10,7 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 use crate::actions::{ActionId, KeyChord, KeyOwner, Keymap};
-use crate::blocks::{Block, BlockCtx, DecisionTrace};
+use crate::blocks::{Block, BlockCtx, DecisionTrace, ToolStatus};
 use crate::components::{
     ActiveModal, ApprovalRequest, HeaderModel, PanelState, Prompt, PromptChrome, Scrollback,
     StatusModel, TurnPhase, WaitingReason,
@@ -331,6 +331,80 @@ impl App {
         self.gate.mark_dirty();
     }
 
+    /// 流式追加助手文本：末尾是流式助手块就接着写，否则新起一块。
+    pub fn stream_assistant(&mut self, delta: &str) {
+        if self.trailing_streams() {
+            self.edit_trailing(|block| {
+                if let Block::Assistant(assistant) = block {
+                    assistant.text.push_str(delta);
+                }
+            });
+            return;
+        }
+        self.push_block(Block::streaming_assistant(delta));
+    }
+
+    /// 收尾流式助手块：清掉「还在长」的标记，块本身留在屏上。
+    ///
+    /// 返回末尾是不是流式助手块（false 表示这次收尾没有落到任何块上）；宿主据此
+    /// 决定要不要把正文另外压一块，而不是静默丢掉。
+    pub fn finish_assistant(&mut self) -> bool {
+        let streaming = self.trailing_streams();
+        if streaming {
+            self.edit_trailing(|block| {
+                if let Block::Assistant(assistant) = block {
+                    assistant.streaming = false;
+                }
+            });
+        }
+        streaming
+    }
+
+    /// 起一个工具块（执行中）；结果回来后用 [`App::finish_tool`] 回填。
+    pub fn begin_tool(&mut self, name: impl Into<String>, args: impl Into<String>) {
+        self.push_block(Block::tool(name, args, ToolStatus::Running));
+    }
+
+    /// 回填末尾工具块：状态与结果摘要。
+    ///
+    /// 返回末尾是不是工具块；false 表示没有可回填的块（宿主据此如实上屏结果，
+    /// 免得工具块永远转圈、结果摘要无声丢掉）。
+    pub fn finish_tool(&mut self, status: ToolStatus, detail: Option<String>) -> bool {
+        let is_tool = matches!(self.scrollback.blocks().last(), Some(Block::Tool(_)));
+        if is_tool {
+            self.edit_trailing(|block| {
+                if let Block::Tool(tool) = block {
+                    tool.status = status;
+                    tool.detail = detail;
+                }
+            });
+        }
+        is_tool
+    }
+
+    fn trailing_streams(&self) -> bool {
+        matches!(self.scrollback.blocks().last(), Some(Block::Assistant(block)) if block.streaming)
+    }
+
+    /// 就地改末尾块（流式追加与工具回填共用）：翻上去看历史时把视口锚在原地。
+    fn edit_trailing(&mut self, edit: impl FnOnce(&mut Block)) {
+        let rows_before = if self.scrollback.is_at_bottom() {
+            None
+        } else {
+            let ctx = self.block_ctx(self.scrollback_width);
+            Some(self.scrollback.total_rows(&ctx))
+        };
+        if let Some(block) = self.scrollback.last_mut() {
+            edit(block);
+        }
+        if let Some(rows_before) = rows_before {
+            let ctx = self.block_ctx(self.scrollback_width);
+            let added = self.scrollback.total_rows(&ctx).saturating_sub(rows_before);
+            self.scrollback.scroll_up(added, usize::MAX);
+        }
+        self.gate.mark_dirty();
+    }
+
     /// 打开审批卡：单槽位，重复调用就是换一张卡（没有浮层栈）。
     pub fn open_approval(&mut self, request: ApprovalRequest) {
         self.modal = Some(ActiveModal::Approval(request));
@@ -397,12 +471,19 @@ impl App {
         if let Some(action) = self.keymap.lookup(owner, chord) {
             return self.apply(action);
         }
+        // 能走到这里说明键位表没有认这一拍——剩下的就是「打字」。
+        // Shift 是**打字用的**修饰键：ASCII 大写的 Shift 已被 [`KeyChord::new`] 归一化进字符
+        // 本身（`actions.rs`），需要 Shift 的符号（`!`、`?`）也带着它，所以这里先把它减掉；
+        // 减完还剩下 Control/Alt/Super 的，是没绑定的组合键，不往提示框里塞字符。
+        //
+        // 基线 `3ddd519` 只减了后三个，于是「大写字母」与「Ctrl+小写字母」都在这条路径上被
+        // 静默吃掉（批次四的真调与评审暴露，见 `docs/tui-design.md` §10 的修正记录）。
         if owner == KeyOwner::Prompt
             && let KeyCode::Char(c) = chord.code
+            && !c.is_control()
         {
-            let modifiers =
-                chord.modifiers - KeyModifiers::CONTROL - KeyModifiers::ALT - KeyModifiers::SUPER;
-            if modifiers.is_empty() && !c.is_control() {
+            let modifiers = chord.modifiers - KeyModifiers::SHIFT;
+            if modifiers.is_empty() {
                 self.prompt.insert_char(c);
                 self.gate.mark_dirty();
             }
@@ -417,7 +498,7 @@ impl App {
                 self.should_quit = true;
                 Some(Effect::Quit)
             }
-            // `Esc` 的阶梯：先关最上面那层（卡片 → 研究视图 → 会话），最后才是取消当前轮。
+            // `Esc` 的阶梯：先关最上面那层（卡片 → 研究视图 → 取消当前轮 → 退出）。
             ActionId::Interrupt => {
                 if self.modal.take().is_some() {
                     self.gate.mark_dirty();
@@ -426,6 +507,11 @@ impl App {
                     self.screen = Screen::Agent;
                     self.gate.mark_dirty();
                     None
+                } else if self.status.phase == Some(TurnPhase::Running) {
+                    // 有在途轮次：只取消这一轮（宿主据此停掉在途的调用），不退出。
+                    // 「有没有在途轮次」是宿主的事实，它用状态行的 Running 如实告诉本 crate。
+                    self.gate.mark_dirty();
+                    Some(Effect::Interrupt)
                 } else {
                     self.should_quit = true;
                     Some(Effect::Interrupt)
@@ -438,7 +524,7 @@ impl App {
                 let text = self.prompt.take();
                 // 首屏提交即进入会话。
                 self.screen = Screen::Agent;
-                self.push_block(Block::user(text.clone()));
+                // 用户块由宿主回显（它才有格式化好的时间戳）：这里再推一块会把同一句话画两遍。
                 Some(Effect::Submit(text))
             }
             ActionId::InsertNewline => {
@@ -611,7 +697,11 @@ mod tests {
         let effect = press(&mut app, KeyCode::Enter);
         assert_eq!(effect, Some(Effect::Submit("hi".to_owned())));
         assert!(app.prompt().is_empty(), "提交后输入框清空");
-        assert_eq!(app.scrollback().len(), 1, "回显了一个用户块");
+        assert_eq!(
+            app.scrollback().len(),
+            0,
+            "回显交给宿主（带时间戳的那一块），本 crate 不再推块"
+        );
         assert!(app.gate().is_dirty());
     }
 
@@ -625,6 +715,28 @@ mod tests {
             Some(Effect::Submit("h".to_owned()))
         );
         assert_eq!(app.screen(), Screen::Agent, "首屏提交即进入会话");
+    }
+
+    #[test]
+    fn uppercase_and_shifted_characters_are_typed_not_swallowed() {
+        let mut app = app();
+        // 终端报大写字符的两种形态（有的带 SHIFT、有的不带）归一化后都该能打进去。
+        app.handle_key(KeyChord::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        app.handle_key(KeyChord::new(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        app.handle_key(KeyChord::plain(KeyCode::Char('F')));
+        // 需要 Shift 的符号同理（`!` 这类不是字母，归一化不动它，SHIFT 会一路带进来）。
+        app.handle_key(KeyChord::new(KeyCode::Char('!'), KeyModifiers::SHIFT));
+        assert_eq!(app.prompt().text(), "DEF!");
+    }
+
+    #[test]
+    fn unbound_combinations_do_not_leak_characters_into_the_prompt() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('a'));
+        app.handle_key(KeyChord::ctrl(KeyCode::Char('q')));
+        app.handle_key(KeyChord::alt(KeyCode::Char('x')));
+        app.handle_key(KeyChord::ctrl(KeyCode::Char('z')));
+        assert_eq!(app.prompt().text(), "a", "没绑定的组合键不该塞字符进来");
     }
 
     #[test]
@@ -728,12 +840,30 @@ mod tests {
     }
 
     #[test]
-    fn escape_closes_the_card_first_and_only_then_quits() {
+    fn escape_closes_the_card_first_and_only_then_cancels_or_quits() {
         let mut app = app();
         app.open_approval(ApprovalRequest::new("bash", "ls"));
         assert_eq!(press(&mut app, KeyCode::Esc), None);
         assert!(app.modal().is_none());
         assert!(!app.should_quit());
+        // 卡片关掉时状态行还停在「等待授权」（这一轮仍在途）：下一记 Esc 取消这一轮。
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Effect::Interrupt));
+        assert!(!app.should_quit(), "在途轮次没结束前不退出");
+        // 宿主把轮次收尾（状态行空闲）之后，Esc 才是退出。
+        *app.status_mut() = StatusModel::idle();
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Effect::Interrupt));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn escape_cancels_the_running_turn_before_it_quits() {
+        let mut app = app();
+        // 宿主用状态行的 Running 如实告诉本 crate「有在途轮次」。
+        *app.status_mut() = StatusModel::running(WaitingReason::ToolRunning);
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Effect::Interrupt));
+        assert!(!app.should_quit(), "有在途轮次时 Esc 只取消这一轮");
+        // 轮次收尾（空闲）之后，Esc 才退出。
+        *app.status_mut() = StatusModel::idle();
         assert_eq!(press(&mut app, KeyCode::Esc), Some(Effect::Interrupt));
         assert!(app.should_quit());
     }
@@ -781,6 +911,70 @@ mod tests {
             before,
             "翻上去看历史时，新输出不应把视口拽走"
         );
+    }
+
+    #[test]
+    fn streaming_assistant_text_grows_one_block_and_finishes_it() {
+        let mut app = app();
+        app.stream_assistant("先看");
+        app.stream_assistant("一下改动");
+        assert_eq!(app.scrollback().len(), 1, "同一次流式输出只占一个块");
+        let Block::Assistant(block) = &app.scrollback().blocks()[0] else {
+            panic!("末尾应是助手块");
+        };
+        assert_eq!(block.text, "先看一下改动");
+        assert!(block.streaming);
+        app.finish_assistant();
+        let Block::Assistant(block) = &app.scrollback().blocks()[0] else {
+            panic!("末尾应是助手块");
+        };
+        assert!(!block.streaming, "收尾后不再画「还在长」的三角");
+        // 收尾之后再来的是下一轮的块，不并进上一轮。
+        app.stream_assistant("第二段");
+        assert_eq!(app.scrollback().len(), 2);
+    }
+
+    #[test]
+    fn tool_block_starts_running_and_takes_the_result() {
+        let mut app = app();
+        app.begin_tool("bash", "git status --short");
+        let Block::Tool(tool) = &app.scrollback().blocks()[0] else {
+            panic!("末尾应是工具块");
+        };
+        assert_eq!(tool.status, ToolStatus::Running);
+        assert!(tool.detail.is_none());
+        assert!(
+            app.finish_tool(ToolStatus::Ok, Some("工作区干净".to_owned())),
+            "末尾是工具块，回填应当生效"
+        );
+        let Block::Tool(tool) = &app.scrollback().blocks()[0] else {
+            panic!("末尾应是工具块");
+        };
+        assert_eq!(tool.status, ToolStatus::Ok);
+        assert_eq!(tool.detail.as_deref(), Some("工作区干净"));
+        // 末尾不是工具块时如实返回 false（宿主据此另外上屏，不静默丢结果）。
+        app.push_block(Block::user("插一句话"));
+        assert!(!app.finish_tool(ToolStatus::Failed, Some("失败".to_owned())));
+        app.stream_assistant("流式");
+        assert!(app.finish_assistant());
+        assert!(!app.finish_assistant(), "收尾一次之后末尾不再是流式块");
+    }
+
+    #[test]
+    fn streaming_while_scrolled_keeps_the_viewport_anchored() {
+        let mut app = app();
+        app.set_viewport(40, 2, 36);
+        for index in 0..3 {
+            app.push_block(Block::user(format!("第 {index} 行")));
+        }
+        assert_eq!(press(&mut app, KeyCode::PageUp), None);
+        let anchored = |app: &App| {
+            let ctx = app.block_ctx(40);
+            app.scrollback().window(&ctx, 2).lines[0].text()
+        };
+        let before = anchored(&app);
+        app.stream_assistant("很长的一段流式输出，会把行数顶开");
+        assert_eq!(anchored(&app), before, "流式追加同样不该把视口拽走");
     }
 
     #[test]

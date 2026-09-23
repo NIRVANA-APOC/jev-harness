@@ -8,6 +8,7 @@ resolver = "2"
 jh-core = { path = "crates/jh-core" }
 jh-jev = { path = "crates/jh-jev" }
 jh-openai = { path = "crates/jh-openai" }
+jh-tui = { path = "crates/jh-tui" }
 tokio = { version = "1.53", features = [
     "rt-multi-thread",
     "macros",

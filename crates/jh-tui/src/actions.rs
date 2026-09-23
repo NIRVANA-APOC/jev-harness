@@ -142,6 +142,9 @@ impl KeyChord {
     /// 归一化后构造：`Char('G')` 自带 SHIFT，`Char('g')+SHIFT` 折成 `Char('G')+SHIFT`
     /// （上游 `input/key.rs:46-66`）。两种写法归一化后必须相等，否则同一物理按键会
     /// 因为「事件带不带 SHIFT」而落到不同动作上。
+    ///
+    /// 契约：既然大写字符自带 SHIFT，**打字路径就必须把 SHIFT 减掉**再看还剩什么修饰键
+    /// （[`crate::app::App::handle_key`] 的插入分支）——不然大写字母谁都匹配不上、也插不进去。
     pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
         let plain = modifiers - KeyModifiers::SHIFT;
         match code {
