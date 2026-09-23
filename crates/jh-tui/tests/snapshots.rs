@@ -116,6 +116,80 @@ fn scrollback_snapshot_scrolled_up_shifts_the_window() {
 }
 
 #[test]
+fn streaming_assistant_snapshot_marks_the_growing_text() {
+    let mut app = App::new(&capabilities());
+    app.set_viewport(44, 8, 40);
+    app.push_block(Block::user("看一下仓库状态"));
+    // 同一次流式输出：两次增量落在同一个块里。
+    app.stream_assistant("我先跑一下");
+    app.stream_assistant(" git status，看有没有未提交改动。");
+    assert_eq!(app.scrollback().len(), 2, "两个增量共用一个块");
+
+    let ctx = app.block_ctx(44);
+    let window = app.scrollback().window(&ctx, 8);
+    let screen = render_lines(
+        44,
+        8,
+        window.lines.into_iter().map(|line| line.content).collect(),
+    );
+    // 末尾的 `▸` 就是「还在长」的标记；正文按内容宽度换行、续行对齐正文列。
+    assert_screen(
+        &screen,
+        "❯ 看一下仓库状态
+
+◆ 我先跑一下 git status，看有没有未提交
+  改动。▸",
+    );
+
+    // 收尾：末尾的「还在长」标记消失，正文一个字符都不少。
+    app.finish_assistant();
+    let ctx = app.block_ctx(44);
+    let window = app.scrollback().window(&ctx, 8);
+    let screen = render_lines(
+        44,
+        8,
+        window.lines.into_iter().map(|line| line.content).collect(),
+    );
+    assert_screen(
+        &screen,
+        "❯ 看一下仓库状态
+
+◆ 我先跑一下 git status，看有没有未提交
+  改动。",
+    );
+}
+
+#[test]
+fn tool_block_snapshot_takes_the_result_detail() {
+    let mut app = App::new(&capabilities());
+    app.begin_tool("bash", "git status --short");
+    let ctx = app.block_ctx(44);
+    let window = app.scrollback().window(&ctx, 6);
+    let running = render_lines(
+        44,
+        6,
+        window.lines.into_iter().map(|line| line.content).collect(),
+    );
+    // 执行中：只有工具行与转轮，没有结果行。
+    assert_screen(&running, "⠋ bash git status --short");
+
+    app.finish_tool(ToolStatus::Ok, Some("干净：没有未提交改动".to_owned()));
+    let ctx = app.block_ctx(44);
+    let window = app.scrollback().window(&ctx, 6);
+    let done = render_lines(
+        44,
+        6,
+        window.lines.into_iter().map(|line| line.content).collect(),
+    );
+    // 结果回来：状态从转轮换成标记，摘要缩进在工具行的正文列下。
+    assert_screen(
+        &done,
+        "▸ bash git status --short
+  干净：没有未提交改动",
+    );
+}
+
+#[test]
 fn user_block_snapshot_fills_the_row_and_right_aligns_the_timestamp() {
     let theme = capabilities().theme();
     let ctx = ctx_for(&theme, 40);

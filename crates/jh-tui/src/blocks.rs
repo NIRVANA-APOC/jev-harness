@@ -413,6 +413,14 @@ impl Block {
         })
     }
 
+    /// 流式助手块：正文还在长（末尾画三角）；收尾时由宿主把 `streaming` 清掉。
+    pub fn streaming_assistant(text: impl Into<String>) -> Self {
+        Block::Assistant(AssistantBlock {
+            text: text.into(),
+            streaming: true,
+        })
+    }
+
     pub fn tool(name: impl Into<String>, args: impl Into<String>, status: ToolStatus) -> Self {
         Block::Tool(ToolBlock {
             name: name.into(),
