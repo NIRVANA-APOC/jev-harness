@@ -313,6 +313,7 @@ impl Tools {
         let mut hits: Vec<String> = Vec::new();
         let mut visited = 0usize;
         let mut skipped = 0usize;
+        let mut outside = 0usize;
         let mut queue = VecDeque::from([start]);
         while let Some(directory) = queue.pop_front() {
             let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -323,13 +324,19 @@ impl Tools {
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries {
                 let path = entry.path();
-                let Ok(kind) = entry.file_type() else {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // 逐个解析再比对前缀：工作区里的符号链接同样拦下（只解析起点是不够的，
+                // 一条 `link.txt -> /外面/secret` 就能把工作区外的内容搜出来）。
+                let Ok(real) = path.canonicalize() else {
                     continue;
                 };
-                let name = entry.file_name().to_string_lossy().to_string();
-                if kind.is_dir() {
+                if !real.starts_with(&self.root) {
+                    outside += 1;
+                    continue;
+                }
+                if real.is_dir() {
                     if !SKIPPED_DIRS.contains(&name.as_str()) {
-                        queue.push_back(path);
+                        queue.push_back(real);
                     }
                     continue;
                 }
@@ -338,14 +345,14 @@ impl Tools {
                 }
                 visited += 1;
                 // 非 UTF-8（二进制）文件跳过：这里搜的是文本，不假装能搜二进制。
-                let Ok(text) = std::fs::read_to_string(&path) else {
+                let Ok(text) = std::fs::read_to_string(&real) else {
                     continue;
                 };
                 for (index, line) in text.lines().enumerate() {
                     if line.contains(pattern.as_str()) {
                         hits.push(format!(
                             "{}:{}: {}",
-                            self.display_path(&path),
+                            self.display_path(&real),
                             index + 1,
                             line.trim()
                         ));
@@ -360,7 +367,7 @@ impl Tools {
         if hits.is_empty() {
             return ToolOutcome::ok(format!(
                 "没有命中（子串 `{pattern}`，看了 {visited} 个文件{note}）",
-                note = skipped_note(skipped)
+                note = skip_note(skipped, outside)
             ));
         }
         let count = hits.len();
@@ -372,7 +379,7 @@ impl Tools {
         let mut text = format!(
             "命中 {count} 条{capped}：\n{}{}",
             hits.join("\n"),
-            skipped_note(skipped)
+            skip_note(skipped, outside)
         );
         truncate(&mut text);
         ToolOutcome::ok(text)
@@ -447,12 +454,20 @@ fn truncate(text: &mut String) {
     *text = format!("{head}\n…（已截断 {dropped} 个字符）");
 }
 
-/// 搜内容时跳过的不可读目录：有跳过就如实说，没跳过就什么都不写。
-fn skipped_note(skipped: usize) -> String {
-    if skipped == 0 {
+/// 搜内容时跳过的东西：不可读目录与越出工作区的路径（含符号链接指向的外面）。
+/// 有跳过就如实说，没跳过就什么都不写。
+fn skip_note(skipped: usize, outside: usize) -> String {
+    let mut parts = Vec::new();
+    if skipped > 0 {
+        parts.push(format!("跳过 {skipped} 个不可读目录"));
+    }
+    if outside > 0 {
+        parts.push(format!("跳过 {outside} 个越出工作区的路径"));
+    }
+    if parts.is_empty() {
         String::new()
     } else {
-        format!("，跳过 {skipped} 个不可读目录")
+        format!("，{}", parts.join("、"))
     }
 }
 
@@ -544,6 +559,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn search_does_not_follow_symlinks_out_of_the_workspace() {
+        let (tools, dir) = tools();
+        // 工作区外放一个带标记的文件，工作区内放一个指向它的软链接。
+        std::fs::write(dir.join("outside.txt"), "SECRET-OUTSIDE-CONTENT\n").expect("写文件");
+        std::os::unix::fs::symlink(dir.join("outside.txt"), tools.root().join("link.txt"))
+            .expect("建软链接");
+
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            SEARCH,
+            serde_json::json!({"pattern": "SECRET-OUTSIDE"}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        // 「没有命中」的回文里会带上搜索词本身，所以断言的是**内容**没被搜出来。
+        assert!(
+            !outcome.text.contains("SECRET-OUTSIDE-CONTENT"),
+            "{}",
+            outcome.text
+        );
+        assert!(outcome.text.contains("没有命中"), "{}", outcome.text);
+        assert!(outcome.text.contains("越出工作区"), "{}", outcome.text);
+
+        // 拦截软链接不等于把搜索弄瘫：工作区内的文件照样搜得到。
+        let inside = crate::session::test_support::block_on(
+            tools.execute(&call(SEARCH, serde_json::json!({"pattern": "8080"}))),
+        );
+        assert!(inside.text.contains("src/main.rs:2:"), "{}", inside.text);
+    }
+
+    #[test]
     fn list_dir_marks_directories() {
         let (tools, _dir) = tools();
         let outcome = crate::session::test_support::block_on(
@@ -575,23 +620,34 @@ mod tests {
     fn bash_reports_the_exit_code_and_scrubs_the_api_keys() {
         let (tools, _dir) = tools();
         unsafe {
-            // 两个别名都要摘：会话侧的真 key 就在 DEEPSEEK_API_KEY 里。
-            std::env::set_var("OPENAI_API_KEY", "should-not-leak");
-            std::env::set_var("DEEPSEEK_API_KEY", "should-not-leak");
+            // 三个名字都要摘：会话侧的真 key 就在 DEEPSEEK_API_KEY 里。
+            for name in SCRUBBED_ENV {
+                std::env::set_var(name, "should-not-leak");
+            }
         }
         let outcome = crate::session::test_support::block_on(tools.execute(&call(
             BASH,
             serde_json::json!({
-                "command": "echo \"key=${OPENAI_API_KEY:-none}/${DEEPSEEK_API_KEY:-none}\"; pwd"
+                "command": "for v in OPENAI_API_KEY DEEPSEEK_API_KEY TYPESAFE_API_KEY; do \
+                    eval \"value=\\${$v:-none}\"; [ \"$value\" = none ] || echo \"LEAK:$v\"; done; \
+                    echo \"key=${OPENAI_API_KEY:-none}/${DEEPSEEK_API_KEY:-none}\"; pwd"
             }),
         )));
         assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.text);
-        assert!(outcome.text.contains("key=none"), "{}", outcome.text);
+        assert!(outcome.text.contains("key=none/none"), "{}", outcome.text);
         assert!(
             !outcome.text.contains("should-not-leak"),
             "{}",
             outcome.text
         );
+        // 名单里的每个名字都要断言（只写在数组里不算验证）。
+        for name in SCRUBBED_ENV {
+            assert!(
+                !outcome.text.contains(name),
+                "子进程不该看到 {name}：{}",
+                outcome.text
+            );
+        }
         assert!(outcome.text.contains(&tools.root().display().to_string()));
 
         let failed = crate::session::test_support::block_on(

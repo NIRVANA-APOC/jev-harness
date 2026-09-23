@@ -54,6 +54,10 @@ use crate::session::view;
 /// 本轮最多几次模型调用（一次模型调用 + 它请求的工具执行算一轮）。
 pub const DEFAULT_MAX_ROUNDS: usize = 8;
 
+/// 一轮还在跑时提交被退回的提示：宿主把它压到屏上，并把话放回输入框。
+pub const BUSY_NOTICE: &str =
+    "这一轮还在跑：等它收尾，或按 Esc 取消后再提交（这句话已退回输入框，没有被丢掉）";
+
 /// 建会话需要的全部外部材料。
 pub struct AgentConfig {
     /// 工作区根。
@@ -91,8 +95,9 @@ pub enum Update {
         /// 时间戳（`HH:MM:SSZ`）。
         at: String,
     },
-    /// 助手正文收尾（收起「还在长」的标记）。
-    AssistantEnd,
+    /// 助手正文收尾（收起「还在长」的标记）；带上这次调用的最终正文，供宿主在没有
+    /// 增量（通道不给 `delta`）时补上正文。
+    AssistantEnd(String),
     /// 阶段行（带 `◆` 标记）。
     Notice {
         /// 文案。
@@ -319,7 +324,16 @@ impl Agent {
     }
 
     /// 用户提交一句话：回显、写证据、准备开轮。
+    ///
+    /// **一轮还在跑时不接受新提交**（[`Agent::busy`]）：否则用户块会变成末尾块，工具结果与
+    /// 助手正文都无处回填。宿主在调用前先查 `busy()`，把话放回输入框（[`BUSY_NOTICE`]）。
     pub fn submit(&mut self, text: String) -> Vec<Update> {
+        if self.busy() {
+            return vec![Update::Notice {
+                text: BUSY_NOTICE.to_owned(),
+                tone: NoticeTone::Warning,
+            }];
+        }
         let mut updates = Vec::new();
         let at = now_unix_ms();
         updates.push(Update::User {
@@ -374,7 +388,7 @@ impl Agent {
         match result {
             Ok(turn) => {
                 self.record_model_call(&turn, None, &mut updates);
-                updates.push(Update::AssistantEnd);
+                updates.push(Update::AssistantEnd(turn.text.clone()));
                 if !turn.text.trim().is_empty() {
                     self.conversation
                         .push(InputItem::assistant_text(turn.text.clone()));
@@ -398,7 +412,7 @@ impl Agent {
             }
             Err(error) => {
                 self.record_model_failure(&error, &mut updates);
-                updates.push(Update::AssistantEnd);
+                updates.push(Update::AssistantEnd(String::new()));
                 updates.push(Update::Notice {
                     text: format!("模型调用失败：{}", crate::session::call_reason(&error)),
                     tone: NoticeTone::Error,
@@ -541,10 +555,14 @@ impl Agent {
         self.queue.clear();
         self.owes_model = false;
         match phase {
-            Phase::Modeling => updates.push(Update::Notice {
-                text: "已取消本轮：模型调用在途，这次回复作废".to_owned(),
-                tone: NoticeTone::Warning,
-            }),
+            Phase::Modeling => {
+                // 收尾这一块，否则屏上留着永久的「还在长」三角。
+                updates.push(Update::AssistantEnd(String::new()));
+                updates.push(Update::Notice {
+                    text: "已取消本轮：模型调用在途，这次回复作废".to_owned(),
+                    tone: NoticeTone::Warning,
+                });
+            }
             Phase::Running { call, .. } => {
                 updates.push(Update::ToolEnd {
                     status: ToolStatus::Failed,
@@ -1518,6 +1536,60 @@ mod tests {
             matches!(agent.advance(now).0, Step::Idle),
             "打断后没有在途步骤"
         );
+    }
+
+    #[test]
+    fn a_submit_while_a_turn_is_running_is_refused_not_queued() {
+        let model = Scripted::new(vec![
+            turn("第一轮的回复", Vec::new()),
+            turn("第二轮", Vec::new()),
+        ]);
+        let (mut agent, _dir) = session_agent(Some(choice_judge(0.9, 0.1, 0.8)), Some(model));
+        let now = Instant::now();
+        agent.submit("第一句".to_owned());
+        let (step, _) = agent.advance(now);
+        assert!(matches!(step, Step::Model(_)), "第一句先进模型");
+        assert!(agent.busy());
+
+        // 在途时再提交：拒绝并如实说明，不改状态、不开第二轮。
+        let updates = agent.submit("第二句".to_owned());
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert!(
+            notices(&updates).contains("还在跑"),
+            "{}",
+            notices(&updates)
+        );
+        assert_eq!(agent.stats().turns, 1, "第二次提交没有开新一轮");
+        assert!(matches!(&updates[0], Update::Notice { tone, .. } if *tone == NoticeTone::Warning));
+
+        // 第一轮照常收尾，没有被新提交搅乱。
+        agent.on_model_result(Ok(turn("答完了", Vec::new())));
+        assert!(!agent.busy());
+        assert_eq!(agent.stats().turns, 1);
+    }
+
+    #[test]
+    fn interrupt_during_the_model_call_closes_the_growing_text() {
+        let model = Scripted::new(vec![turn("很长的正文", Vec::new())]);
+        let (mut agent, _dir) = session_agent(None, Some(model));
+        let now = Instant::now();
+        agent.submit("在吗".to_owned());
+        let (step, _) = agent.advance(now);
+        assert!(matches!(step, Step::Model(_)));
+
+        let updates = agent.on_interrupt();
+        assert!(
+            updates
+                .iter()
+                .any(|update| matches!(update, Update::AssistantEnd(text) if text.is_empty())),
+            "打断也要收起「还在长」的标记：{updates:?}"
+        );
+        assert!(
+            notices(&updates).contains("已取消本轮"),
+            "{}",
+            notices(&updates)
+        );
+        assert!(matches!(agent.advance(now).0, Step::Idle));
     }
 
     #[test]

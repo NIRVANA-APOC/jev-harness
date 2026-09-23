@@ -344,8 +344,8 @@ BlockLine（已换行 + 行级元数据）→ 缓冲区
 6. **缺凭据不阻止进入界面**：非 TTY 下 `jev chat` 显式报「需要真实终端」并退 2；TTY 下判定器缺凭据
    标「不可用」、模型缺配置在提交后如实上屏失败原因——界面照常可用，不假装接了模型。
 
-验收口径（批次二至四的实际读数）：`cargo test --workspace` 全绿（`jh-tui` 单元测试 138 +
-整屏与组件快照 28 + 文档测试 1；`jh-app` 含会话宿主的 26 条会话级单测（`session::*`）），
+验收口径（批次二至四的实际读数）：`cargo test --workspace` 全绿（`jh-tui` 单元测试 139 +
+整屏与组件快照 28 + 文档测试 1；`jh-app` 含会话宿主的 33 条会话级单测（`session::*`，另 1 条真调默认忽略）），
 `cargo clippy --workspace --all-targets` 零告警；`cargo run -p jh-tui --example design` 在非 TTY 下按
 100×24 逐屏打印首屏 / 主界面 / 审批卡 / 三个研究面板 / 无色回退档六种单帧；
 `jev chat` 在真实终端里进备用屏、`Ctrl+C` 退出并恢复终端（已在伪终端里冒烟：进入 → 提交一句 →
@@ -363,33 +363,48 @@ BlockLine（已换行 + 行级元数据）→ 缓冲区
 命令（key 只经环境变量，本机真 key 在 `DEEPSEEK_API_KEY` 里；`OPENAI_BASE_URL` 不带尾斜杠）：
 
 ```text
-(sleep 3; printf '请用 bash 跑 ls -1 列出工作区文件，再用一句话总结。\r'; sleep 40; printf 'y'; \
-  sleep 35; printf '\x03'; sleep 3) \
-  | OPENAI_API_KEY="$DEEPSEEK_API_KEY" OPENAI_BASE_URL=https://api.deepseek.com \
-    OPENAI_MODEL=deepseek-flash \
-    script -qec 'stty rows 40 cols 120; target/debug/jev chat --workspace /tmp/chat-live3' /dev/null
+export OPENAI_API_KEY="$DEEPSEEK_API_KEY" OPENAI_BASE_URL=https://api.deepseek.com \
+  OPENAI_MODEL=deepseek-flash
+tmux new-session -d -s live -x 120 -y 40 \
+  "cd <仓库> && target/debug/jev chat --workspace /tmp/m25live/ws"
+tmux pipe-pane -o -t live 'cat >> /tmp/m25live2.log'
+# 打字：请用 bash 跑 ls -1 列出工作区文件，再用一句话总结。→ Enter → y（允许一次）→ Ctrl+C
 ```
 
-`stty` 是必需的：伪终端没有窗口尺寸时 ratatui 画不出内容——循环照常跑、读数照常有，界面却是空的
-（同一天的 `h1h2-1790160738057` 那次就是这样，记在这里免得下次再踩）。
+窗口尺寸（`-x 120 -y 40`，或 `script` 路径下的 `stty rows/cols`）是必需的：伪终端没有尺寸时
+ratatui 画不出内容——循环照常跑、读数照常有，界面却是空的。
+读取屏上内容用 `tmux pipe-pane` 把 pty 原始字节落盘再按转义切分：本机的 `tmux capture-pane`
+对这些会话返回空白（**不是**应用没画——同一份字节流里内容齐全），记在这里免得下次白试。
 
-读数（产物 `var/chat/h1h2-1790160989294/evidence.jsonl`；调用记录追加进 `var/calls.jsonl`）：
+读数（run `h1h2-1790162050626`，证据 `var/chat/h1h2-1790162050626/evidence.jsonl`，调用记录追加进
+`var/calls.jsonl`）：
 
 | 项 | 读数 |
 | --- | --- |
-| 轮数 / 退出 | 1 轮，`Ctrl+C` 退出，终端恢复，退出码 0，屏上 `用时 41.3s`（含伪终端等待按键的节奏） |
-| 模型调用 | 2 次 `deepseek-flash`：989 ms（in 799 / out 64 token）、1384 ms（in 885 / out 120 token），累计 in 1684 / out 184 |
-| 门控判定 | 1 次 `shell_command_allowed` → `real_api` / `jev-1.13.0`，664 ms，`usr:allow 0.99` / `usr:deny 0.01`，`confidence 0.98`，阈值 `margin 0.15` / `confidence 0.5`（写进判断记录），`request_id` `req_01a0cde8…` |
-| 工具与审批 | `bash ls -1`（确定性层：只读）→ 审批卡「允许一次」→ 真实执行，退出码 0，输出 `notes.md` / `src`，结果回填到工具块 |
+| 轮数 / 退出 | 1 轮，`Ctrl+C` 退出，终端恢复，退出码 0，屏上 `用时 14.7s` |
+| 模型调用 | 2 次 `deepseek-flash`：823 ms（in 799 / out 73 token）、727 ms（in 895 / out 75 token），累计 in 1694 / out 148 |
+| 门控判定 | 1 次 `shell_command_allowed` → `real_api` / `jev-1.13.0`，353 ms，`usr:allow 0.99` / `usr:deny 0.01`，`confidence 0.99`，阈值 `margin 0.15` / `confidence 0.5`（写进判断记录），`request_id` `req_01a0cdf9…` |
+| 工具与审批 | `bash ls -1`（确定性层：只读）→ 审批卡「允许一次」→ 真实执行，退出码 0，输出 `a.rs` / `b.md`，结果回填到工具块 |
 | 证据 | `session.ask` v1（用户原话）、`shell.command` v1（命令 + cwd + 风险类别）、`tool.result` v1（状态 + 输出） |
-| 屏上顺序 | 首屏 → 用户块（时间戳）→ `⠋ 模型输出中` → `◆ 模型请求了 1 个工具调用` → `◆ 判定 664ms · 采纳 usr:allow 0.99 · margin 0.98 · confidence 0.98 · 倾向允许` → 判定块（两条概率条 + 采纳行）→ 审批卡（标题 `权限请求 · bash`、命令行 `ls -1`、两段理由、`y/a/n`）→ `◆ 已裁决：bash 允许一次` → `⠋ bash ls -1` → `▸ bash 退出码 0 …` → 助手正文 → `✓ 完成 · 判定 …` |
+| 屏上顺序 | 首屏 → 用户块（**只有一块**：`❯ 请用bash跑ls-1列出工作区文件，再用一句话总结。` + 右对齐时间戳 `11:14:13Z`）→ `⠋ 模型输出中` → `◆ 模型请求了 1 个工具调用` → `◆ 判定 353ms · 采纳 usr:allow 0.99 · margin 0.98 · confidence 0.99 · 倾向允许` → 判定块（两条概率条 + 采纳行）→ 审批卡（标题 `权限请求 · bash`、命令行 `ls -1`、两段理由、`y/a/n`）→ `◆ 已裁决：bash 允许一次` → `⠋ bash ls -1` → `▸ bash 退出码 0 …` → 助手正文 → `用时 14.7s` → `✓ 完成 · 判定 usr:allow 0.99 · margin 0.98 · confidence 0.99 · 确定 · deepseek-flash` |
 
-真调暴露并已修掉的一处 bug：工具块曾画成 `▸ bash bash ls -1`、审批卡命令行也重复工具名——
-参数摘要与工具名拆成两个方法（`Tools::detail` 给块与卡片、`Tools::display` 给通知与证据），
-修复后同一次真调的屏上是 `⠋ bash ls -1` 与 `命令  ls -1`。
+复审（r1）修正后的复跑验证，都能在同一份字节流里核对：
 
-key 自检：`var/calls.jsonl`、三个 run 的证据文件与三次伪终端日志里都没有 key 原文（逐一 `grep` 过）；
-会话侧真 key 的别名 `DEEPSEEK_API_KEY` 也进了 `tools.rs` 的子进程摘除名单。
+- **转轮在动、收尾帧不再等按键**：整场除 `y` 与 `Ctrl+C` 外没有按键，字节流里出现 8 个不同的
+  转轮帧（`⠋⠙⠦⠧⠴⠸⠹⠼`），`✓ 完成 …` 那一帧在无按键的情况下画出；
+- **用户块只有一块**：文案 `请用 bash 跑 ls -1 …` 在字节流里只写了一遍。
+
+真调与复审暴露并已修掉的问题（按发现顺序）：
+
+1. 工具块曾画成 `▸ bash bash ls -1`、审批卡命令行也重复工具名——参数摘要与工具名拆成
+   `Tools::detail`（块与卡片用）/ `Tools::display`（通知与证据用）；
+2. 子进程摘除名单漏了 `DEEPSEEK_API_KEY`（本机真 key 的别名，一条 `env` 就能把它打进证据文件）；
+3. **P1**：宿主从不喂 `TickDemand`，`poll_timeout()` 永远是空闲长睡（转轮停帧、收尾帧要等下一次
+   事件）——`apply()` 结尾统一喂一次，且推进之后立刻回头画一帧；
+4. **P1**：`App::apply(Submit)` 与宿主回显各画一次用户块——只留宿主那一块（带时间戳）。
+
+key 自检：`var/calls.jsonl`、各 run 的证据文件与各次伪终端/管道日志里都没有 key 原文（逐一 `grep` 过）；
+会话侧真 key 的别名 `DEEPSEEK_API_KEY` 也在 `tools.rs` 的子进程摘除名单里。
 
 ## 10. 非目标与未确定项
 
@@ -429,7 +444,8 @@ key 自检：`var/calls.jsonl`、三个 run 的证据文件与三次伪终端日
     同一命令在窗口内复用上一次判定；「材料变了还复不复用」这条线是按会话形态拍的，
     没有实测数据，改窗口用 `jev chat --debounce`。
 12. **采纳门槛未校准**：`margin ≥ 0.15` 且 `confidence ≥ 0.5` 才采纳「拒绝」是**声明口径**
-    （写进判断记录的 `thresholds`），取值的合理性要看真实调用的分布，本批没有真调读数。
+    （写进判断记录的 `thresholds`）。真调（§9.1）只走到 **allow 分支**（`usr:allow 0.99`），
+    **拒绝分支**的门槛取值仍没有实测——要校它得凑出真实的高危命令场景。
 13. 模型正文仍按纯文本画（不做 Markdown 解析，§10 非目标 3 不变）：会话里模型给的列表与代码块
     会原样平铺，排版待定。
 14. **成本与观测器面板未落地**（批次四的另一半）：会话已经在记调用记录（`var/calls.jsonl`）

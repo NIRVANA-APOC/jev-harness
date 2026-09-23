@@ -345,12 +345,19 @@ impl App {
     }
 
     /// 收尾流式助手块：清掉「还在长」的标记，块本身留在屏上。
-    pub fn finish_assistant(&mut self) {
-        self.edit_trailing(|block| {
-            if let Block::Assistant(assistant) = block {
-                assistant.streaming = false;
-            }
-        });
+    ///
+    /// 返回末尾是不是流式助手块（false 表示这次收尾没有落到任何块上）；宿主据此
+    /// 决定要不要把正文另外压一块，而不是静默丢掉。
+    pub fn finish_assistant(&mut self) -> bool {
+        let streaming = self.trailing_streams();
+        if streaming {
+            self.edit_trailing(|block| {
+                if let Block::Assistant(assistant) = block {
+                    assistant.streaming = false;
+                }
+            });
+        }
+        streaming
     }
 
     /// 起一个工具块（执行中）；结果回来后用 [`App::finish_tool`] 回填。
@@ -359,13 +366,20 @@ impl App {
     }
 
     /// 回填末尾工具块：状态与结果摘要。
-    pub fn finish_tool(&mut self, status: ToolStatus, detail: Option<String>) {
-        self.edit_trailing(|block| {
-            if let Block::Tool(tool) = block {
-                tool.status = status;
-                tool.detail = detail;
-            }
-        });
+    ///
+    /// 返回末尾是不是工具块；false 表示没有可回填的块（宿主据此如实上屏结果，
+    /// 免得工具块永远转圈、结果摘要无声丢掉）。
+    pub fn finish_tool(&mut self, status: ToolStatus, detail: Option<String>) -> bool {
+        let is_tool = matches!(self.scrollback.blocks().last(), Some(Block::Tool(_)));
+        if is_tool {
+            self.edit_trailing(|block| {
+                if let Block::Tool(tool) = block {
+                    tool.status = status;
+                    tool.detail = detail;
+                }
+            });
+        }
+        is_tool
     }
 
     fn trailing_streams(&self) -> bool {
@@ -503,7 +517,7 @@ impl App {
                 let text = self.prompt.take();
                 // 首屏提交即进入会话。
                 self.screen = Screen::Agent;
-                self.push_block(Block::user(text.clone()));
+                // 用户块由宿主回显（它才有格式化好的时间戳）：这里再推一块会把同一句话画两遍。
                 Some(Effect::Submit(text))
             }
             ActionId::InsertNewline => {
@@ -676,7 +690,11 @@ mod tests {
         let effect = press(&mut app, KeyCode::Enter);
         assert_eq!(effect, Some(Effect::Submit("hi".to_owned())));
         assert!(app.prompt().is_empty(), "提交后输入框清空");
-        assert_eq!(app.scrollback().len(), 1, "回显了一个用户块");
+        assert_eq!(
+            app.scrollback().len(),
+            0,
+            "回显交给宿主（带时间戳的那一块），本 crate 不再推块"
+        );
         assert!(app.gate().is_dirty());
     }
 
@@ -896,12 +914,21 @@ mod tests {
         };
         assert_eq!(tool.status, ToolStatus::Running);
         assert!(tool.detail.is_none());
-        app.finish_tool(ToolStatus::Ok, Some("工作区干净".to_owned()));
+        assert!(
+            app.finish_tool(ToolStatus::Ok, Some("工作区干净".to_owned())),
+            "末尾是工具块，回填应当生效"
+        );
         let Block::Tool(tool) = &app.scrollback().blocks()[0] else {
             panic!("末尾应是工具块");
         };
         assert_eq!(tool.status, ToolStatus::Ok);
         assert_eq!(tool.detail.as_deref(), Some("工作区干净"));
+        // 末尾不是工具块时如实返回 false（宿主据此另外上屏，不静默丢结果）。
+        app.push_block(Block::user("插一句话"));
+        assert!(!app.finish_tool(ToolStatus::Failed, Some("失败".to_owned())));
+        app.stream_assistant("流式");
+        assert!(app.finish_assistant());
+        assert!(!app.finish_assistant(), "收尾一次之后末尾不再是流式块");
     }
 
     #[test]

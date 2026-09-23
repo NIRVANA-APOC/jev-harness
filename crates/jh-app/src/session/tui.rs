@@ -87,9 +87,11 @@ async fn session_loop(
             || model_deltas.is_some()
             || gate_future.is_some()
             || tool_future.is_some();
+        let mut advanced = false;
         if !busy && (!app.paused() || step_requested) {
             step_requested = false;
             let (step, updates) = agent.advance(Instant::now());
+            advanced = !updates.is_empty();
             apply(app, updates);
             match step {
                 Step::Idle => {}
@@ -104,6 +106,10 @@ async fn session_loop(
                     tool_future = Some(Box::pin(async move { tools.execute(&call).await }));
                 }
             }
+        }
+        if advanced {
+            // 这一步改了界面就立刻回头画：不然空转的等待时长可能很长（收尾那帧要靠它）。
+            continue;
         }
 
         // 3) 等一个唤醒：终端事件 / 模型增量 / 在途结果 / 按需 tick。
@@ -175,7 +181,17 @@ fn handle_event(
         Effect::Quit => false,
         Effect::Submit(text) => {
             // 首屏提交会由 App 自己切到会话屏；这里只把话送进会话。
-            apply(app, agent.submit(text));
+            if agent.busy() {
+                // 一轮还在跑：把话放回输入框并说清楚，不静默吞掉用户的输入。
+                app.prompt_mut().insert_str(&text);
+                app.push_block(
+                    Block::notice(crate::session::agent::BUSY_NOTICE)
+                        .with_tone(jh_tui::blocks::NoticeTone::Warning),
+                );
+                apply(app, Vec::new());
+            } else {
+                apply(app, agent.submit(text));
+            }
             false
         }
         Effect::Approval(outcome) => {
@@ -200,17 +216,37 @@ fn handle_event(
 }
 
 /// 把会话的更新翻译成界面的调用。
+///
+/// 结尾统一喂一次 `TickDemand`：`jh-tui` 只在自己 `advance_tick` 里 `set_demand`，而 tick
+/// 的等待时长又来自 `poll_timeout()`——初值是「空闲长睡（3600s）」。不喂的话转轮停在第一帧、
+/// 每轮收尾的更新要等下一次按键才上屏。
 fn apply(app: &mut App, updates: Vec<Update>) {
     for update in updates {
         match update {
             Update::User { text, at } => app.push_block(Block::user_at(text, at)),
-            Update::AssistantEnd => app.finish_assistant(),
+            Update::AssistantEnd(text) => {
+                // 末尾没有流式块（通道没给增量）就把最终正文补上，别把回复丢了。
+                if !app.finish_assistant() && !text.is_empty() {
+                    app.push_block(Block::assistant(text));
+                }
+            }
             Update::Notice { text, tone } => app.push_block(Block::notice(text).with_tone(tone)),
             Update::PlainNotice(text) => app.push_block(Block::plain_notice(text)),
             Update::ToolBegin { name, args } => app.begin_tool(name, args),
             Update::ToolEnd { status, detail } => {
-                let detail = (!detail.is_empty()).then_some(detail);
-                app.finish_tool(status, detail);
+                let text = detail.clone();
+                let filled = app.finish_tool(status, (!detail.is_empty()).then_some(detail));
+                if !filled {
+                    // 没处回填也要如实上屏：工具块转圈与结果摘要无声丢掉都不可接受。
+                    app.push_block(Block::plain_notice(format!(
+                        "工具结果没有可回填的块（末尾不是工具块）：{}",
+                        if text.is_empty() {
+                            "（无输出）"
+                        } else {
+                            &text
+                        }
+                    )));
+                }
             }
             Update::Decision(trace) => {
                 app.push_block(Block::decision((*trace).clone()));
@@ -229,6 +265,8 @@ fn apply(app: &mut App, updates: Vec<Update>) {
             Update::HeaderTitle(title) => app.header_model_mut().title = title,
         }
     }
+    let demand = app.tick_demand();
+    app.gate_mut().set_demand(demand);
 }
 
 /// 首屏与常驻区间的初值：工作目录、接线状态、提示框信息行与面板数据都来自会话。
@@ -293,4 +331,96 @@ async fn restore_on_signal(guard: Arc<TerminalGuard>) {
     }
     let _ = guard.restore();
     std::process::exit(130);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jh_tui::blocks::ToolStatus;
+    use jh_tui::components::{StatusModel, WaitingReason};
+    use jh_tui::render::{self, TICK_INTERVAL, TickDemand};
+    use jh_tui::screens::Screen;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn app() -> App {
+        let mut app = App::new(&Capabilities::from_env_lookup(|_| None, true, false));
+        app.set_screen(Screen::Agent);
+        app
+    }
+
+    fn screen(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("TestBackend");
+        terminal
+            .draw(|frame| render::draw(frame, app))
+            .expect("绘制不失败");
+        render::screen_lines(terminal.backend().buffer()).join("\n")
+    }
+
+    /// P1-1 的回归：宿主必须喂 `TickDemand`，否则 `poll_timeout()` 永远是空闲长睡，
+    /// 转轮停在第一帧、收尾那一帧要等下一次按键才上屏。
+    #[test]
+    fn applying_updates_feeds_the_tick_demand() {
+        let mut app = app();
+        assert_eq!(app.gate().demand(), TickDemand::None);
+        apply(
+            &mut app,
+            vec![Update::Status(StatusModel::running(
+                WaitingReason::LlmStreaming,
+            ))],
+        );
+        assert_eq!(
+            app.gate().demand(),
+            TickDemand::Fast,
+            "有在途轮次要按帧唤醒"
+        );
+        assert!(app.gate().poll_timeout() <= TICK_INTERVAL);
+
+        apply(&mut app, vec![Update::Status(StatusModel::idle())]);
+        assert_eq!(app.gate().demand(), TickDemand::None, "收尾后回到空闲长睡");
+    }
+
+    /// P1-2 的回归：用户块只画一次，且带宿主给的时间戳。
+    #[test]
+    fn a_user_update_is_drawn_once_with_its_timestamp() {
+        let mut app = app();
+        apply(
+            &mut app,
+            vec![Update::User {
+                text: "hello".to_owned(),
+                at: "11:04:22Z".to_owned(),
+            }],
+        );
+        let screen = screen(&mut app);
+        assert_eq!(screen.matches("hello").count(), 1, "{screen}");
+        assert!(screen.contains("11:04:22Z"), "{screen}");
+    }
+
+    /// P2-3 的回归：没有可回填的块时，工具结果要如实上屏而不是无声丢掉。
+    #[test]
+    fn tool_results_without_a_block_are_reported_instead_of_swallowed() {
+        let mut app = app();
+        apply(
+            &mut app,
+            vec![Update::ToolEnd {
+                status: ToolStatus::Ok,
+                detail: "退出码 0".to_owned(),
+            }],
+        );
+        let screen = screen(&mut app);
+        assert!(screen.contains("没有可回填的块"), "{screen}");
+        assert!(screen.contains("退出码 0"), "{screen}");
+    }
+
+    /// 通道不给增量时，正文也不能丢。
+    #[test]
+    fn assistant_text_without_deltas_is_still_drawn() {
+        let mut app = app();
+        apply(&mut app, vec![Update::AssistantEnd("完整正文".to_owned())]);
+        let drawn = screen(&mut app);
+        assert!(drawn.contains("完整正文"), "{drawn}");
+        // 收尾再来一次（例如 Esc 打断）不该把正文再画一遍。
+        apply(&mut app, vec![Update::AssistantEnd(String::new())]);
+        assert_eq!(screen(&mut app).matches("完整正文").count(), 1);
+    }
 }
