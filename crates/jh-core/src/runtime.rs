@@ -7,9 +7,9 @@
 //!   可改写——重新判断会得到新节点，旧节点留着当审计与回退；
 //! - **两个维度分开管**（§5.3）：[`EvaluationStatus`] 记「有没有拿到一次有效响应」，
 //!   [`Validity`] 记「还能不能作为依据」；答案内容本身留在 [`JudgmentRecord`] 里，三者互不覆盖；
-//! - **失效传播**：撤回一条证据、撤销一个判断、追加一条新证据，或问题库里换了某个问题的当前定义
-//!   （发布 / 回退 / 停用），都从依赖图往下游传播，把受影响的判断标成待重查、把以它们为前提的行动
-//!   标成不能发出，无关结果原样保留；
+//! - **失效传播**：撤回一条证据、撤销一个判断、追加一条新证据，问题库里换了某个问题的当前定义
+//!   （发布 / 回退 / 停用），或观测器退出使用（停用 / 被替代），都从依赖图往下游传播，把受影响的
+//!   判断标成待重查、把以它们为前提的行动标成不能发出，无关结果原样保留；
 //! - **行动前提复核**（§5.2）：行动发出前调 [`SemanticState::check_action`]；撤销只改变使用资格，
 //!   已经发生的外部副作用需要独立的补偿动作，本 crate 不自动回滚。
 //!
@@ -26,6 +26,7 @@
 //! | 撤回了一条属于对象 `O` 的证据 | 所有读过 `O` 的判断——被撤回的记录可能就在它们的材料里 |
 //! | 撤销判断 | 由它支持的下游判断、以它为前提的行动 |
 //! | 问题换了定义（发布 / 回退 / 停用） | 回答过该问题任一版本的判断，以及沿依赖边到它们下游的判断与行动 |
+//! | 观测器退出使用（停用 / 被替代） | 读过它测量对象的判断，以及沿依赖边到它们下游的判断与行动 |
 //! | 全量重查 | 所有当前有效的判断与行动（保守出口，不沿路径） |
 //!
 //! 冲突候选是对称关系，两种情形都不传播（见 [`DependencyGraph::cycles`](crate::DependencyGraph)）。
@@ -127,6 +128,7 @@ use crate::evidence::{
 use crate::graph::{
     ActionId, DependencyGraph, EdgeKind, EdgeOrigin, NodeId, NodeRef, PropagationPath,
 };
+use crate::observer::{ObserverId, ObserverVersion};
 use crate::projection::{InputProjection, SnapshotCheck, verify_snapshot};
 use crate::question::{QuestionId, QuestionVersion, Questions};
 use crate::record::{Judgment, JudgmentRecord};
@@ -236,6 +238,14 @@ pub enum InvalidationCause {
         question: QuestionId,
         /// 变更后的当前版本（发布 / 回退的目标）；停用时是退出使用的那个版本。
         version: QuestionVersion,
+    },
+    /// 观测器退出使用：停用，或被更新的版本替代——它的观测证据不再作为依据
+    /// （研究目标 §7「能否被验证、复用和撤回」）。
+    ObserverInvalidated {
+        /// 观测器。
+        observer: ObserverId,
+        /// 退出使用的那个版本。
+        version: ObserverVersion,
     },
     /// 保守全量重查：不沿传播路径，把所有当前有效的判断与行动一并标为待重查。
     FullRecheck,
@@ -549,6 +559,70 @@ impl SemanticState {
         }
 
         // 与其它传播出口同口径：paths 先判断节点、后行动，各按标识排序。
+        stale.sort();
+        blocked.sort();
+        let mut ordered = Vec::with_capacity(stale.len() + blocked.len());
+        for id in &stale {
+            if let Some(path) = paths.remove(&NodeRef::Judgment(*id)) {
+                ordered.push(path);
+            }
+        }
+        for id in &blocked {
+            if let Some(path) = paths.remove(&NodeRef::Action(id.clone())) {
+                ordered.push(path);
+            }
+        }
+
+        Invalidation {
+            cause,
+            stale,
+            blocked,
+            paths: ordered,
+        }
+    }
+
+    /// 观测器退出使用（停用，或被更新的版本替代）：读过它测量对象的判断全部变成待重查，沿依赖图
+    /// 传播，以它们为前提的行动一并失效；无关结果原样保留。研究目标 §7 要求观测能力「能被验证、
+    /// 复用和撤回」，这里就是撤回那一半。
+    ///
+    /// 口径与证据传播一致，并且刻意保守：**按对象判定，不按渠道判定**。判断的输入投影只登记「读了
+    /// 哪些对象与字段」，不登记「从哪个渠道读到的」，所以只要判断读过观测器测量过的对象，就一律算受影响
+    /// ——宁可误失效，不留漏失效（§5.3）。要精确撤回某几条证据本身，走
+    /// [`SemanticState::retract_evidence`]。
+    ///
+    /// 它由 [`ObserverLibrary::retire`](crate::ObserverLibrary::retire) 与
+    /// [`ObserverLibrary::enable`](crate::ObserverLibrary::enable)（替代旧版本时）直接调用，也可以
+    /// 单独使用（例如实验层自己发现观测器被绕过之后补一次撤回）。
+    ///
+    /// `objects` 是观测器契约里声明的测量对象；重复的对象只算一次，结果按对象标识排序处理，
+    /// 因此 [`Invalidation::stale`]、[`Invalidation::blocked`] 与 [`Invalidation::paths`] 的顺序
+    /// 与其它多起点的传播出口一致（先判断节点、后行动，各按标识排序），每个目标只留先到的一条路径。
+    pub fn invalidate_observer(
+        &mut self,
+        observer: &ObserverId,
+        version: ObserverVersion,
+        objects: impl IntoIterator<Item = ObjectId>,
+    ) -> Invalidation {
+        let cause = InvalidationCause::ObserverInvalidated {
+            observer: observer.clone(),
+            version,
+        };
+        let origins: BTreeSet<ObjectId> = objects.into_iter().collect();
+
+        let mut stale = Vec::new();
+        let mut blocked = Vec::new();
+        let mut paths: BTreeMap<NodeRef, PropagationPath> = BTreeMap::new();
+        for object in origins {
+            let affected = self.readers_of(&object);
+            let invalidation = self.propagate(cause.clone(), NodeRef::Object(object), affected);
+            stale.extend(invalidation.stale);
+            blocked.extend(invalidation.blocked);
+            for path in invalidation.paths {
+                paths.entry(path.target.clone()).or_insert(path);
+            }
+        }
+
+        // 与 invalidate_question 同口径：paths 先判断节点、后行动，各按标识排序。
         stale.sort();
         blocked.sort();
         let mut ordered = Vec::with_capacity(stale.len() + blocked.len());
@@ -1399,5 +1473,97 @@ mod tests {
         // 已撤回的节点不在失效范围里，也不该被重算。
         state.retract_judgment(v1).unwrap();
         assert!(!state.recheck_set().contains(&v1));
+    }
+
+    #[test]
+    fn invalidating_an_observer_marks_the_readers_of_its_measured_objects() {
+        let mut state = SemanticState::in_memory();
+        observe(&mut state, "cache.writes", 1);
+        observe(&mut state, "scheduler.events", 1);
+        observe(&mut state, "app.log", 1);
+
+        // 一个判断读了两个被测对象，一个只读了其中一个，一个读了别的对象。
+        let both = declare(
+            &mut state,
+            "write_after_cancel",
+            &[("cache.writes", 1), ("scheduler.events", 1)],
+        );
+        let writes_only = declare(&mut state, "cancel_confirmed", &[("cache.writes", 1)]);
+        let unrelated = declare(&mut state, "cause_b_pair", &[("app.log", 1)]);
+        let action = ActionId::from("declare-cancel-safe");
+        state.declare_action(action.clone(), [both]).unwrap();
+        let unrelated_action = ActionId::from("escalate-manual-review");
+        state
+            .declare_action(unrelated_action.clone(), [unrelated])
+            .unwrap();
+        for node in [both, writes_only, unrelated] {
+            judge(&mut state, node, 1.0);
+        }
+
+        let invalidation = state.invalidate_observer(
+            &ObserverId::from("cancel_write_recorder"),
+            ObserverVersion(1),
+            [
+                ObjectId::from("cache.writes"),
+                ObjectId::from("scheduler.events"),
+            ],
+        );
+
+        assert_eq!(
+            invalidation.cause,
+            InvalidationCause::ObserverInvalidated {
+                observer: ObserverId::from("cancel_write_recorder"),
+                version: ObserverVersion(1),
+            }
+        );
+        // 读过被测对象的判断都待重查；无关结果保留。
+        assert_eq!(invalidation.stale, vec![both, writes_only]);
+        assert_eq!(invalidation.blocked, vec![action.clone()]);
+        assert_eq!(state.node(unrelated).unwrap().validity, Validity::Current);
+        assert_eq!(
+            state.check_action(&unrelated_action).unwrap(),
+            PremiseCheck::Cleared
+        );
+        // 每个目标一条完整路径，与 stale、blocked 一一对应。
+        assert_eq!(
+            invalidation.paths.len(),
+            invalidation.stale.len() + invalidation.blocked.len()
+        );
+        assert_eq!(
+            invalidation
+                .paths
+                .iter()
+                .find(|path| path.target == NodeRef::Judgment(both))
+                .expect("读了两个被测对象的判断在结果里")
+                .hops
+                .iter()
+                .map(|hop| hop.kind)
+                .collect::<Vec<_>>(),
+            vec![EdgeKind::Read],
+            "多起点也只留先到的一条路径：对象 → 判断"
+        );
+        assert_eq!(
+            invalidation
+                .paths
+                .iter()
+                .find(|path| path.target == NodeRef::Action(action.clone()))
+                .expect("行动在结果里")
+                .hops
+                .iter()
+                .map(|hop| hop.kind)
+                .collect::<Vec<_>>(),
+            vec![EdgeKind::Read, EdgeKind::Premise]
+        );
+
+        // 已经失效过的不重复标记：同一批对象再撤回一次不产生新结果。
+        assert!(
+            state
+                .invalidate_observer(
+                    &ObserverId::from("cancel_write_recorder"),
+                    ObserverVersion(1),
+                    [ObjectId::from("cache.writes")],
+                )
+                .is_empty()
+        );
     }
 }
