@@ -47,8 +47,8 @@ use jh_core::{ObserverContract, ObserverVerdict, SemanticState};
 use serde::Serialize;
 
 use crate::c_measure::{
-    Check, EnableOutcome, GeneratedContract, GeneratedTests, IndependentCheck, MeasureCall,
-    Observer, Verdict,
+    Check, EnableOutcome, FixedDeclaration, GeneratedContract, GeneratedTests, IndependentCheck,
+    MeasureCall, Observer, Verdict,
 };
 use crate::c_program::{self, Attachment, CFamily, Implementation, ProgramVersion, Schedule};
 use crate::calls::{CallEntry, CallLog};
@@ -258,6 +258,9 @@ pub struct FamilySummary {
     pub schedules: Vec<ScheduleSummary>,
     /// 隐藏检查认定的违反判据。
     pub hidden_criterion: String,
+    /// 固定测试臂在这一族上声明的检查项；`weakened_substitution = true` 的那一条就是 §7.3
+    /// 明令禁止的替换（它作为对照存在，不是用来满足要求的）。
+    pub fixed_arm_declaration: Vec<FixedDeclaration>,
 }
 
 /// 一条调度的摘要。
@@ -403,12 +406,16 @@ pub struct TransferCell {
     pub detections: u32,
     /// 误放行数。
     pub false_passes: u32,
-    /// 落在失败态的数。
-    pub inconclusive: u32,
+    /// 有违反却落在失败态（弃权让违反溜过去的那些）。
+    pub inconclusive_on_opportunity: u32,
+    /// 无违反却落在失败态（弃权，不构成放行也不构成误报）。
+    pub inconclusive_on_clean: u32,
     /// 误报数。
     pub false_alarms: u32,
     /// 无违反用例数。
     pub clean_runs: u32,
+    /// 无违反且判「成立」的用例数。
+    pub correct_clears: u32,
     /// 检出率。
     pub detection_rate: Option<f64>,
     /// 误报率。
@@ -485,10 +492,45 @@ pub struct DirectionReading {
 pub struct MaintenanceSection {
     /// 版本变更说明了什么。
     pub change: String,
-    /// 每臂的读数。
+    /// 每臂逐族的读数。
     pub arms: Vec<MaintenanceReading>,
+    /// 每臂在全部族上的合计（「重挂之后检出率从多少到多少」这类话，只靠报告就能闭合）。
+    pub totals: Vec<MaintenanceTotal>,
     /// 口径说明。
     pub note: String,
+}
+
+/// 一个臂在版本变更阶段全部族上的合计读数。
+#[derive(Debug, Clone, Serialize)]
+pub struct MaintenanceTotal {
+    /// 臂标识。
+    pub arm: String,
+    /// 覆盖几个族。
+    pub families: usize,
+    /// 用例数。
+    pub runs: u32,
+    /// 机会数。
+    pub opportunities: u32,
+    /// 无违反用例数。
+    pub clean_runs: u32,
+    /// 检出数。
+    pub detections: u32,
+    /// 误放行数。
+    pub false_passes: u32,
+    /// 有违反却落在失败态。
+    pub inconclusive_on_opportunity: u32,
+    /// 无违反却落在失败态。
+    pub inconclusive_on_clean: u32,
+    /// 误报数。
+    pub false_alarms: u32,
+    /// 变更前的检出率（同一个臂在 v1 上的同批读数）。
+    pub detection_rate_before: Option<f64>,
+    /// 变更后的检出率。
+    pub detection_rate_after: Option<f64>,
+    /// 变更后的误放行率。
+    pub false_pass_rate_after: Option<f64>,
+    /// 变更后的误报率。
+    pub false_alarm_rate_after: Option<f64>,
 }
 
 /// 一个臂在版本变更前后的读数。
@@ -550,8 +592,11 @@ pub struct AmortizationSection {
 pub struct HypothesisSection {
     /// 被检验的假说原文（§7.4）。
     pub statement: String,
-    /// 跑之前就写好的判据。
+    /// 跑之前就写好的判据（只有判定规则；报告方式的说明在 `reporting` 里，它与判据分开记，
+    /// 因为它是跑后可以扩充的，而判据不能）。
     pub criteria: Vec<String>,
+    /// 报告方式：读数怎么摆、给几种读法。跑后扩充过一次（加了「两侧读数」），如实记在这里。
+    pub reporting: String,
     /// 读数。
     pub readings: Vec<String>,
     /// 是否改善了后续任务的结果（检出率）。
@@ -657,6 +702,10 @@ pub struct RawPaths {
     pub contracts_file: String,
     /// 测试产物。
     pub tests_file: String,
+    /// 版本变更阶段重新生成的测试计划产物（复用预置产物时与 `tests_file` 同一份内容）。
+    pub tests_v2_file: String,
+    /// 迁移矩阵的逐用例读数（JSONL）。
+    pub transfer: String,
     /// 独立检验读数。
     pub verification_file: String,
     /// 调用记录。
@@ -776,6 +825,7 @@ pub async fn run(options: &H4Options) -> Result<H4Outcome, Error> {
     }
     let contracts_path = options.out_dir.join("contracts.json");
     let tests_path = options.out_dir.join("tests.json");
+    let tests_v2_path = options.out_dir.join("tests-v2.json");
     if matches!(options.contracts, ArtifactSource::Generate) {
         write_json(&contracts_path, &artifacts.contracts)?;
     }
@@ -864,7 +914,7 @@ pub async fn run(options: &H4Options) -> Result<H4Outcome, Error> {
     let maintenance = maintenance_section(&arms, &v2_arms, options, v2_calls.calls);
 
     // 5) 迁移矩阵。
-    let transfer = transfer_matrix(&families, &setups, repeats);
+    let (transfer, transfer_cases) = transfer_matrix(&families, &setups, repeats);
 
     // 6) 摊薄曲线与假说判据。
     let amortization = amortization_section(
@@ -883,6 +933,10 @@ pub async fn run(options: &H4Options) -> Result<H4Outcome, Error> {
     write_jsonl(&runs_path, &cases)?;
     let runs_v2_path = options.out_dir.join("runs-v2.jsonl");
     write_jsonl(&runs_v2_path, &v2_cases)?;
+    // 版本变更阶段用的那份测试计划单独落盘：`generated@v2` 的维护读数要能只靠产物复核。
+    write_json(&tests_v2_path, &artifacts.tests_v2)?;
+    let transfer_path = options.out_dir.join("transfer.jsonl");
+    write_jsonl(&transfer_path, &transfer_cases)?;
     let verification = verification_section(&families, &setups);
     let verification_path = options.out_dir.join("verification.json");
     write_json(&verification_path, &verification)?;
@@ -928,6 +982,8 @@ pub async fn run(options: &H4Options) -> Result<H4Outcome, Error> {
             runs_v2: absolute(&runs_v2_path),
             contracts_file: absolute(&contracts_path),
             tests_file: absolute(&tests_path),
+            tests_v2_file: absolute(&tests_v2_path),
+            transfer: absolute(&transfer_path),
             verification_file: absolute(&verification_path),
             calls_log: absolute(&options.calls_path),
         },
@@ -1183,6 +1239,7 @@ fn family_summary(family: CFamily) -> FamilySummary {
             })
             .collect(),
         hidden_criterion: hidden_criterion(family).to_owned(),
+        fixed_arm_declaration: crate::c_measure::fixed_declaration(family),
     }
 }
 
@@ -1416,6 +1473,9 @@ async fn regenerate_tests(
     artifacts: &mut Artifacts,
 ) -> Result<Regeneration, Error> {
     if !matches!(options.tests, ArtifactSource::Generate) {
+        // 复用预置产物：版本变更阶段沿用同一份计划（`regenerated = false` 如实标出来）。
+        // 这一行不能省——省了 `generated@v2` 那一臂会整个消失，维护读数跟着变成 null。
+        artifacts.tests_v2 = artifacts.tests.clone();
         return Ok(Regeneration::default());
     }
     let regenerated = generate_tests(families, options, calls, clean, "-tests-v2").await?;
@@ -1502,9 +1562,58 @@ fn maintenance_section(
         }
     }
 
+    let mut totals = Vec::new();
+    for (v2_arm, v1_arm) in [
+        (ARM_FIXED_V2, ARM_FIXED),
+        (ARM_GENERATED_V2, ARM_GENERATED),
+        (ARM_OBSERVER_V2_SUPPORT_ONLY, ARM_OBSERVER),
+        (ARM_OBSERVER_V2_REVERIFIED, ARM_OBSERVER),
+        (ARM_OBSERVER_V2_NO_COUNTER, ARM_OBSERVER),
+    ] {
+        let after: Vec<&ArmReport> = v2_arms
+            .iter()
+            .filter(|report| report.arm == v2_arm)
+            .collect();
+        if after.is_empty() {
+            continue;
+        }
+        let before: Vec<&ArmReport> = arms
+            .iter()
+            .filter(|report| report.arm == v1_arm && report.version == ProgramVersion::V1.id())
+            .collect();
+        let sum = |reports: &[&ArmReport], pick: fn(&ArmReport) -> u32| -> u32 {
+            reports.iter().map(|report| pick(report)).sum()
+        };
+        let opportunities = sum(&after, |report| report.opportunities);
+        let clean_runs = sum(&after, |report| report.clean_runs);
+        let detections = sum(&after, |report| report.detections);
+        let false_passes = sum(&after, |report| report.false_passes);
+        let false_alarms = sum(&after, |report| report.false_alarms);
+        totals.push(MaintenanceTotal {
+            arm: v2_arm.to_owned(),
+            families: after.len(),
+            runs: sum(&after, |report| report.runs),
+            opportunities,
+            clean_runs,
+            detections,
+            false_passes,
+            inconclusive_on_opportunity: sum(&after, |report| report.inconclusive_on_opportunity),
+            inconclusive_on_clean: sum(&after, |report| report.inconclusive_on_clean),
+            false_alarms,
+            detection_rate_before: rate(
+                sum(&before, |report| report.detections),
+                sum(&before, |report| report.opportunities),
+            ),
+            detection_rate_after: rate(detections, opportunities),
+            false_pass_rate_after: rate(false_passes, opportunities),
+            false_alarm_rate_after: rate(false_alarms, clean_runs),
+        });
+    }
+
     MaintenanceSection {
         change: ProgramVersion::V2.note().to_owned(),
         arms: readings,
+        totals,
         note: "版本变更只动了一件事：v2 新增直接提交路径（批量提交 commit_batch）。\
                固定测试臂一行都不用改，通用测试生成臂要重新生成，观测器臂的代价是「重挂钩子点 + \
                重跑四路独立检验」。重挂那一步值不值，看两张读数：\
@@ -1523,8 +1632,9 @@ fn transfer_matrix(
     families: &[CFamily],
     setups: &BTreeMap<CFamily, ObserverSetup>,
     repeats: usize,
-) -> Vec<TransferCell> {
+) -> (Vec<TransferCell>, Vec<TransferCase>) {
     let mut out = Vec::new();
+    let mut cases = Vec::new();
     for built_for in families {
         let Some(setup) = setups.get(built_for) else {
             continue;
@@ -1546,6 +1656,14 @@ fn transfer_matrix(
                     let verdict = setup.observer.observe(&run);
                     score_cell(&truth, &verdict, &mut cell);
                     runs += 1;
+                    cases.push(TransferCase {
+                        built_for: built_for.id().to_owned(),
+                        applied_to: applied_to.id().to_owned(),
+                        schedule: schedule.id.clone(),
+                        implementation: implementation.id().to_owned(),
+                        hidden: truth,
+                        observer: verdict,
+                    });
                 }
             }
             out.push(TransferCell {
@@ -1556,15 +1674,34 @@ fn transfer_matrix(
                 opportunities: cell.opportunities(),
                 detections: cell.detections,
                 false_passes: cell.false_passes,
-                inconclusive: cell.inconclusive(),
+                inconclusive_on_opportunity: cell.inconclusive_on_opportunity,
+                inconclusive_on_clean: cell.inconclusive_on_clean,
                 false_alarms: cell.false_alarms,
                 clean_runs: cell.clean_runs(),
+                correct_clears: cell.correct_clears,
                 detection_rate: rate(cell.detections, cell.opportunities()),
                 false_alarm_rate: rate(cell.false_alarms, cell.clean_runs()),
             });
         }
     }
-    out
+    (out, cases)
+}
+
+/// 迁移矩阵的一条逐用例读数（落 JSONL，`TransferCell` 的每个数字都能回查到具体哪一条）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferCase {
+    /// 观测器是为哪个族建的。
+    pub built_for: String,
+    /// 套用到哪个族。
+    pub applied_to: String,
+    /// 调度。
+    pub schedule: String,
+    /// 实现。
+    pub implementation: String,
+    /// 隐藏检查的判定（真值）。
+    pub hidden: Verdict,
+    /// 观测器的判定（按它被建的那个族算）。
+    pub observer: Verdict,
 }
 
 fn amortization_section(
@@ -1859,13 +1996,18 @@ fn hypothesis_section(
                 "作出过判定（检出数 > 0，不是靠全程弃权换来的零误放行）",
             )
             .to_owned(),
-            "改善预算利用 = 观测器臂「每检出一次所花生成调用数」不高于通用测试生成臂".to_owned(),
             concat!(
-                "两条都不成立时，结论写「不支持累积能力假说」；成立时也要写清是哪一条成立，",
-                "并把另一种读法与「两侧读数」一并给出",
+                "改善预算利用 = 观测器臂「每检出一次所花生成调用数」不高于通用测试生成臂；",
+                "两条都不成立时，结论写「不支持累积能力假说」，成立时写清是哪一条成立",
             )
             .to_owned(),
         ],
+        reporting: concat!(
+            "判据冻结在上面的三条里，跑前提交、跑后未改。报告方式跑后扩充过一次，如实记在这里：",
+            "两侧读数（检出率与「无误违反时判对率」的平均）是跑后加的稳健性检查——只用一侧错误率",
+            "会被「一律判违反」的臂骗过去——它**不是**判据的一部分，判据与结论都没有因它改变。",
+        )
+        .to_owned(),
         readings,
         improves_results,
         improves_budget,
@@ -2174,22 +2316,9 @@ fn reuse_reading<'a>(
 fn cost_section(calls_path: &Path, run: &str, runs: RunCounts) -> Result<CostSection, Error> {
     let entries = crate::calls::read_entries(calls_path).unwrap_or_default();
     let mut by_purpose = Vec::new();
-    let mut total = PurposeCost {
-        purpose: "合计".to_owned(),
-        calls: 0,
-        succeeded: 0,
-        failed: 0,
-        input_tokens: None,
-        output_tokens: None,
-        latency_p50_ms: None,
-        stats: call_stats(&[]),
-        latency: latency_stats(&[]),
-        usage: UsageStats {
-            calls_with_usage: 0,
-            input_tokens: None,
-            output_tokens: None,
-        },
-    };
+    // 合计与分项用同一个构造函数：`calls` / `succeeded` / `failed` / token / 延迟分位数 / 调用统计
+    // 必须互相自洽（同一个对象里不能一边说 9 次调用、一边说样本数 0）。
+    let mut matched_all: Vec<&CallEntry> = Vec::new();
     for (purpose, suffix) in [
         ("contract", "-contract"),
         ("tests", "-tests"),
@@ -2200,20 +2329,10 @@ fn cost_section(calls_path: &Path, run: &str, runs: RunCounts) -> Result<CostSec
             .iter()
             .filter(|entry| entry.run() == target)
             .collect();
-        let cost = purpose_cost(purpose, &matched);
-        total.calls += cost.calls;
-        total.succeeded += cost.succeeded;
-        total.failed += cost.failed;
-        total.input_tokens = match (total.input_tokens, cost.input_tokens) {
-            (None, None) => None,
-            (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
-        };
-        total.output_tokens = match (total.output_tokens, cost.output_tokens) {
-            (None, None) => None,
-            (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
-        };
-        by_purpose.push(cost);
+        matched_all.extend(matched.iter().copied());
+        by_purpose.push(purpose_cost(purpose, &matched));
     }
+    let total = purpose_cost("合计", &matched_all);
     Ok(CostSection {
         by_purpose,
         total,
@@ -2419,6 +2538,21 @@ impl H4Report {
                 percent(reading.detection_rate_before),
                 percent(reading.detection_rate_after),
                 percent(reading.false_pass_rate_after),
+            ));
+        }
+        for total in &self.maintenance.totals {
+            lines.push(format!(
+                "维护合计 {}：{} 个族｜机会 {}｜检出 {}（{} → {}）｜误放行 {}（{}）｜弃权 {}（机会上 {}）",
+                total.arm,
+                total.families,
+                total.opportunities,
+                total.detections,
+                percent(total.detection_rate_before),
+                percent(total.detection_rate_after),
+                total.false_passes,
+                percent(total.false_pass_rate_after),
+                total.inconclusive_on_opportunity + total.inconclusive_on_clean,
+                total.inconclusive_on_opportunity,
             ));
         }
         for point in &self.amortization.points {

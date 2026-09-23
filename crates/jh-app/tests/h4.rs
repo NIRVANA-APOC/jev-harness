@@ -270,7 +270,32 @@ async fn the_whole_three_arm_chain_runs_offline_and_the_report_is_json() {
         "第一位是标志性任务"
     );
     assert!(dir.join("run").join("runs.jsonl").exists());
+    assert!(dir.join("run").join("runs-v2.jsonl").exists());
     assert!(dir.join("run").join("verification.json").exists());
+    // 迁移矩阵有逐用例原始件，`TransferCell` 的每个数字都能回查。
+    assert!(dir.join("run").join("transfer.jsonl").exists());
+    assert!(
+        wire["raw"]["transfer"]
+            .as_str()
+            .expect("迁移原始件路径")
+            .ends_with("transfer.jsonl")
+    );
+    assert!(
+        wire["raw"]["tests_v2_file"]
+            .as_str()
+            .expect("v2 测试产物路径")
+            .ends_with("tests-v2.json")
+    );
+    // 固定测试臂的声明表在报告里：§7.3 禁止的那条替换要看得见。
+    let declarations = wire["families"][0]["fixed_arm_declaration"]
+        .as_array()
+        .expect("固定臂声明表在报告里");
+    assert!(
+        declarations
+            .iter()
+            .any(|item| item["weakened_substitution"] == json!(true)),
+        "被禁的替换必须在报告里标出来：{declarations:?}"
+    );
 }
 
 #[tokio::test]
@@ -391,7 +416,8 @@ async fn a_built_observer_does_not_transfer_to_a_different_fault_family() {
                 "换个族建的观测器不该比为它建的更好：{cell:?} vs {diagonal:?}"
             );
             assert!(
-                cell.false_passes > 0 || cell.inconclusive > 0,
+                cell.false_passes > 0
+                    || cell.inconclusive_on_opportunity + cell.inconclusive_on_clean > 0,
                 "非对角线要么误放行、要么落在失败态——它看不见这个族的顺序：{cell:?}"
             );
         }
@@ -533,7 +559,12 @@ async fn the_amortization_curve_and_the_hypothesis_verdict_are_written_down() {
     }
 
     // 假说判据在报告里写全了，结论与之自洽。
-    assert_eq!(report.hypothesis.criteria.len(), 4);
+    assert_eq!(
+        report.hypothesis.criteria.len(),
+        3,
+        "判据冻结成三条判定规则；报告方式单独记在 reporting 里"
+    );
+    assert!(!report.hypothesis.reporting.is_empty());
     assert!(!report.hypothesis.conclusion.is_empty());
     assert_eq!(
         report.hypothesis.supported,
@@ -663,5 +694,138 @@ async fn a_weakened_contract_leaves_that_family_without_an_observer() {
         observer.inconclusive(),
         observer.runs,
         "没有可用观测器的每一例都落在失败态"
+    );
+}
+
+#[tokio::test]
+async fn reusing_preloaded_artifacts_still_runs_the_generated_arm_on_v2() {
+    // 复现评审实测到的那条回归：`--tests` 复用预置产物时，`generated@v2` 那一臂曾经整个消失。
+    let dir = TempDir::new("reuse-v2");
+    let outcome = run_offline(&dir).await;
+    let report = &outcome.report;
+
+    for family in CFamily::ALL {
+        let entry = arm(
+            report,
+            ARM_GENERATED_V2,
+            family.id(),
+            ProgramVersion::V2.id(),
+        );
+        assert!(
+            entry.detection_rate.is_some(),
+            "{family} 的 generated@v2 必须有读数（回退没写就会是 null）"
+        );
+        assert_eq!(entry.runs, 40, "{family}：N × 4 路实现");
+        let reading = report
+            .maintenance
+            .arms
+            .iter()
+            .find(|reading| reading.arm == ARM_GENERATED_V2)
+            .expect("维护行在");
+        assert!(
+            reading.detection_rate_after.is_some(),
+            "维护读数不能是 null：{reading:?}"
+        );
+        assert!(!reading.regenerated, "复用预置产物时如实标「没有重生成」");
+        assert_eq!(reading.regeneration_calls, 0);
+    }
+    // 版本变更阶段用的那份计划也落了盘，维护读数可以只靠产物复核。
+    assert!(dir.join("run").join("tests-v2.json").exists());
+}
+
+#[tokio::test]
+async fn the_cost_total_agrees_with_its_own_parts() {
+    let dir = TempDir::new("cost");
+    let outcome = run_offline(&dir).await;
+    let cost = &outcome.report.cost;
+
+    let by_parts: u32 = cost.by_purpose.iter().map(|entry| entry.calls).sum();
+    assert_eq!(cost.total.calls, by_parts, "合计的调用数要等于分项之和");
+    assert_eq!(
+        cost.total.stats.attempted, cost.total.calls,
+        "同一个对象里 `calls` 与调用统计的样本数不能各说各话"
+    );
+    assert_eq!(
+        cost.total.latency.samples, cost.total.calls,
+        "延迟样本数要与调用数一致"
+    );
+    let with_usage: u32 = cost
+        .by_purpose
+        .iter()
+        .map(|entry| entry.usage.calls_with_usage)
+        .sum();
+    assert_eq!(cost.total.usage.calls_with_usage, with_usage);
+    assert_eq!(
+        cost.total.input_tokens.is_some(),
+        with_usage > 0,
+        "有上报过用量的调用时合计不能是 null"
+    );
+}
+
+#[tokio::test]
+async fn the_transfer_cells_can_be_closed_against_their_own_counts() {
+    let dir = TempDir::new("transfer-counts");
+    let outcome = run_offline(&dir).await;
+    for cell in &outcome.report.transfer {
+        assert_eq!(
+            cell.opportunities + cell.clean_runs,
+            cell.runs,
+            "机会 + 无违反 = 用例数，每个用例只落一边：{cell:?}"
+        );
+        assert_eq!(
+            cell.opportunities,
+            cell.detections + cell.false_passes + cell.inconclusive_on_opportunity,
+            "机会上的三种结果要加起来等于机会数：{cell:?}"
+        );
+        assert_eq!(
+            cell.clean_runs,
+            cell.false_alarms
+                + cell.inconclusive_on_clean
+                + (cell.clean_runs - cell.false_alarms - cell.inconclusive_on_clean),
+            "{cell:?}"
+        );
+        assert!(
+            cell.inconclusive_on_clean <= cell.clean_runs,
+            "干净用例上的弃权不可能超过干净用例数：{cell:?}"
+        );
+    }
+    assert!(dir.join("run").join("transfer.jsonl").exists());
+}
+
+#[tokio::test]
+async fn the_maintenance_totals_close_over_the_whole_batch() {
+    let dir = TempDir::new("maintenance-totals");
+    let outcome = run_offline(&dir).await;
+    let totals = &outcome.report.maintenance.totals;
+    assert!(!totals.is_empty());
+
+    let reverified = totals
+        .iter()
+        .find(|total| total.arm == ARM_OBSERVER_V2_REVERIFIED)
+        .expect("重挂那一行在");
+    let support_only = totals
+        .iter()
+        .find(|total| total.arm == ARM_OBSERVER_V2_SUPPORT_ONLY)
+        .expect("只改支持版本那一行在");
+    assert_eq!(reverified.families, 3, "合计覆盖三个族");
+    assert_eq!(
+        reverified.opportunities + reverified.clean_runs,
+        reverified.runs
+    );
+    assert!(
+        reverified.detection_rate_after.unwrap_or(0.0)
+            > support_only.detection_rate_after.unwrap_or(1.0),
+        "全批口径下重挂也要带来更多检出：{:?} vs {:?}",
+        reverified.detection_rate_after,
+        support_only.detection_rate_after
+    );
+    let no_counter = totals
+        .iter()
+        .find(|total| total.arm == ARM_OBSERVER_V2_NO_COUNTER)
+        .expect("拿掉计数器那一行在");
+    assert!(
+        no_counter.false_pass_rate_after.unwrap_or(0.0)
+            > support_only.false_pass_rate_after.unwrap_or(1.0),
+        "少选一个钩子点在全批口径下也要多出误放行"
     );
 }
