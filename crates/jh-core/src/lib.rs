@@ -156,7 +156,8 @@ pub use library::{
 pub use observer::{
     CheckDirection, ControlResult, Controls, Disturbance, Measurement, ObserverCheck,
     ObserverContract, ObserverEntry, ObserverId, ObserverLibrary, ObserverLifecycle,
-    ObserverLifecycleRecord, ObserverVerdict, OutputContract, Requirement, Support, Timing,
+    ObserverLifecycleRecord, ObserverVerdict, ObserverVersion, OutputContract, Requirement,
+    Support, Timing,
 };
 pub use projection::{
     Drift, FieldSelection, InputProjection, ObjectRead, SnapshotCheck, verify_snapshot,

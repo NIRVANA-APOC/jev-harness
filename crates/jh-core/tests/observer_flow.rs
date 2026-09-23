@@ -9,8 +9,8 @@ use jh_core::{
     ActionId, Answer, ControlResult, EdgeKind, Error, EvidenceLog, InputProjection,
     JsonlEvidenceLog, JudgeSource, Judgment, JudgmentRecord, Measurement, NewEvidence, NoulAnswer,
     ObjectId, ObjectVersion, ObserverCheck, ObserverId, ObserverLibrary, ObserverLifecycle,
-    ObserverVerdict, OutputContract, PremiseCheck, QuestionId, QuestionVersion, Requirement,
-    SemanticState, SnapshotId, Timing, Validity,
+    ObserverVerdict, ObserverVersion, OutputContract, PremiseCheck, QuestionId, QuestionVersion,
+    Requirement, SemanticState, SnapshotId, Timing, Validity,
 };
 use serde_json::json;
 
@@ -143,7 +143,8 @@ fn a_verified_observer_earns_its_evidence_and_losing_it_invalidates_the_judgment
     let observer = ObserverId::from("cancel_write_recorder");
 
     // 候选 → 验证 → 启用：启用要求一份四路全过的独立检验记录（§7.3 末段）。
-    let version = library
+    // 版本号写成显式类型：它在公共签名上出现，crate 根必须导出，外部才存得进自己的结构体。
+    let version: ObserverVersion = library
         .propose(
             &observer,
             contract(&["cache.writes"]),

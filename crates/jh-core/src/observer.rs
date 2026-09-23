@@ -243,6 +243,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::evidence::ObjectId;
+use crate::graph::{NodeRef, PropagationPath};
 use crate::runtime::{Invalidation, SemanticState};
 
 /// 观测器的稳定标识（如 `cancel_write_recorder`）。
@@ -675,10 +676,15 @@ impl ObserverLibrary {
     /// 失败——启用被拒绝，生命周期保持原状。判定只看最近一条记录：改好之后重新检验、再启用是合法的。
     ///
     /// 启用成功时，同 ID 原先启用的版本记成 [`ObserverLifecycle::Superseded`]，并触发失效传播：
-    /// 读过**被换下那个版本**测量对象的判断全部待重查、以它们为前提的行动不能发出
+    /// 读过**每个被换下版本**测量对象的判断全部待重查、以它们为前提的行动不能发出
     /// （[`InvalidationCause::ObserverInvalidated`](crate::InvalidationCause::ObserverInvalidated)）。
-    /// 返回这次写下的生命周期记录（新启用版本一条在前，被它换下的旧版本再一条），以及那一路传播
+    /// 返回这次写下的生命周期记录（新启用版本一条在前，被它换下的旧版本各一条），以及那一路传播
     /// ——全新启用（没有替代谁）时为 `None`，因为没有谁的证据因此作废。
+    ///
+    /// 写入路径上被换下的版本只有一个（一个 ID 一个启用版本）；从 JSON 读回的库是可信输入、不重跑
+    /// 这条不变量，里面可能有两个——那就**每个都发一次传播再合并**：`stale`、`blocked` 与 `paths`
+    /// 是各次传播的并集，起因记第一个退出使用的版本（逐版本的完整轨迹在
+    /// [`ObserverLibrary::history`] 里）。
     pub fn enable(
         &mut self,
         state: &mut SemanticState,
@@ -723,18 +729,22 @@ impl ObserverLibrary {
         )?];
         let displaced = self.supersede_enabled(id, version, at_unix_ms, reason)?;
 
-        let invalidation = match displaced.first() {
-            Some(record) => {
-                let objects = self
-                    .entry(id, record.version)?
-                    .contract
-                    .measurement
-                    .objects
-                    .clone();
-                Some(state.invalidate_observer(id, record.version, objects))
-            }
-            None => None,
-        };
+        // 每个被换下的版本各发一次失效传播再合并：写入路径上只有一个（一个 ID 一个启用版本），
+        // 但读回的库文件是可信输入、不重跑这条不变量，里面可能有多个——那就一个都不漏。
+        let mut invalidation = None;
+        for record in &displaced {
+            let objects = self
+                .entry(id, record.version)?
+                .contract
+                .measurement
+                .objects
+                .clone();
+            let next = state.invalidate_observer(id, record.version, objects);
+            invalidation = Some(match invalidation {
+                None => next,
+                Some(previous) => merge_invalidations(previous, next),
+            });
+        }
         records.extend(displaced);
 
         Ok((records, invalidation))
@@ -885,6 +895,48 @@ impl ObserverLibrary {
             .get_mut(id)
             .and_then(|versions| versions.get_mut(&version))
             .ok_or_else(|| Error::UnknownObserverVersion(id.clone(), version))
+    }
+}
+
+/// 把同一批替代里的多次失效传播并成一次结果。
+///
+/// 起因取先发生的那次（即第一个退出使用的版本）；`stale` / `blocked` 取并集，各按标识排序；
+/// `paths` 重建为与之一一对应的顺序（先判断节点、后行动，每个目标一条路径）。
+/// 只在同一次 [`ObserverLibrary::enable`] 换下多个版本时用到——那要求库文件里同一个 ID 有两个
+/// 启用版本，是注入态而不是写入路径能走到的形态；即便如此也不留漏失效。
+fn merge_invalidations(first: Invalidation, next: Invalidation) -> Invalidation {
+    let mut stale = first.stale;
+    stale.extend(next.stale);
+    stale.sort();
+    stale.dedup();
+
+    let mut blocked = first.blocked;
+    blocked.extend(next.blocked);
+    blocked.sort();
+    blocked.dedup();
+
+    let mut paths: BTreeMap<NodeRef, PropagationPath> = BTreeMap::new();
+    for path in first.paths.into_iter().chain(next.paths) {
+        paths.entry(path.target.clone()).or_insert(path);
+    }
+
+    let mut ordered = Vec::with_capacity(stale.len() + blocked.len());
+    for node in &stale {
+        if let Some(path) = paths.remove(&NodeRef::Judgment(*node)) {
+            ordered.push(path);
+        }
+    }
+    for action in &blocked {
+        if let Some(path) = paths.remove(&NodeRef::Action(action.clone())) {
+            ordered.push(path);
+        }
+    }
+
+    Invalidation {
+        cause: first.cause,
+        stale,
+        blocked,
+        paths: ordered,
     }
 }
 
@@ -1687,19 +1739,38 @@ mod tests {
         let first = enable_first_version(&mut library, &mut state);
 
         let second = library
-            .propose(&id, contract(&["cache.writes"]), 200, "换测量范围".to_owned())
+            .propose(
+                &id,
+                contract(&["cache.writes"]),
+                200,
+                "换测量范围".to_owned(),
+            )
             .unwrap();
         library
             .start_verifying(&id, second, 210, "重跑独立检验".to_owned())
             .unwrap();
         library
-            .enable(&mut state, &id, second, passing_check(220), 230, "v2 四路全过".to_owned())
+            .enable(
+                &mut state,
+                &id,
+                second,
+                passing_check(220),
+                230,
+                "v2 四路全过".to_owned(),
+            )
             .unwrap();
 
         // v1 更稳：带一份新的检验记录回退过去（被替代的版本允许复用，但检验要重新给）。
         let read = judge_reading(&mut state, "write_after_cancel", &[("cache.writes", 1)]);
         let (records, invalidation) = library
-            .enable(&mut state, &id, first, passing_check(240), 250, "回退到 v1".to_owned())
+            .enable(
+                &mut state,
+                &id,
+                first,
+                passing_check(240),
+                250,
+                "回退到 v1".to_owned(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -1720,7 +1791,10 @@ mod tests {
                 version: second,
             }
         );
-        assert_eq!(library.enabled(&id).map(|(version, _)| version), Some(first));
+        assert_eq!(
+            library.enabled(&id).map(|(version, _)| version),
+            Some(first)
+        );
         assert_eq!(library.versions(&id).len(), 2, "回退不产生新版本号");
         assert_eq!(
             library.at(&id, first).unwrap().checks.len(),
@@ -1728,5 +1802,101 @@ mod tests {
             "首版 1 条 + 回退这次 1 条"
         );
         assert_eq!(state.recheck_set(), vec![read]);
+    }
+
+    #[test]
+    fn a_hand_edited_library_with_two_enabled_versions_invalidates_both() {
+        let mut state = SemanticState::in_memory();
+        let mut library = ObserverLibrary::default();
+        let id = observer_id();
+        observe(&mut state, "cache.writes", 1);
+        observe(&mut state, "scheduler.events", 1);
+        let first = enable_first_version(&mut library, &mut state);
+
+        let second = library
+            .propose(
+                &id,
+                contract(&["scheduler.events"]),
+                200,
+                "换测量对象".to_owned(),
+            )
+            .unwrap();
+        library
+            .start_verifying(&id, second, 210, "重跑独立检验".to_owned())
+            .unwrap();
+
+        // 入库文件是可信输入：手工把 v2 也改成启用，造出「同 ID 两个启用版本」的注入态
+        // （写入路径走不到，只有手改库文件能造出来）。
+        let mut wire = serde_json::to_value(&library).unwrap();
+        wire["entries"]["cancel_write_recorder"]["2"]["lifecycle"] =
+            json!({ "lifecycle": "enabled" });
+        let mut library: ObserverLibrary = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            library.at(&id, first).unwrap().lifecycle,
+            ObserverLifecycle::Enabled
+        );
+        assert_eq!(
+            library.at(&id, second).unwrap().lifecycle,
+            ObserverLifecycle::Enabled
+        );
+
+        // 两个旧版本各有自己的读者。
+        let reads_writes = judge_reading(&mut state, "write_after_cancel", &[("cache.writes", 1)]);
+        let reads_events =
+            judge_reading(&mut state, "cancel_confirmed", &[("scheduler.events", 1)]);
+
+        let third = library
+            .propose(&id, contract(&["cache.writes"]), 300, "再换一版".to_owned())
+            .unwrap();
+        library
+            .start_verifying(&id, third, 310, "独立检验".to_owned())
+            .unwrap();
+        let (records, invalidation) = library
+            .enable(
+                &mut state,
+                &id,
+                third,
+                passing_check(320),
+                330,
+                "四路全过".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.version, record.lifecycle))
+                .collect::<Vec<_>>(),
+            vec![
+                (third, ObserverLifecycle::Enabled),
+                (first, ObserverLifecycle::Superseded { by: third }),
+                (second, ObserverLifecycle::Superseded { by: third }),
+            ],
+            "两个启用版本都让位"
+        );
+        let invalidation = invalidation.expect("替代了版本就一定有待失效的东西");
+        assert_eq!(
+            invalidation.cause,
+            InvalidationCause::ObserverInvalidated {
+                observer: id.clone(),
+                version: first,
+            },
+            "起因记第一个退出使用的版本，逐版本轨迹在 history 里"
+        );
+        assert_eq!(
+            invalidation.stale,
+            vec![reads_writes, reads_events],
+            "两个退出使用的版本各自的读者都不漏"
+        );
+        assert_eq!(
+            invalidation.paths.len(),
+            invalidation.stale.len(),
+            "合并之后 paths 仍与 stale 一一对应"
+        );
+        assert_eq!(state.recheck_set(), vec![reads_writes, reads_events]);
+        assert_eq!(
+            library.enabled(&id).map(|(version, _)| version),
+            Some(third)
+        );
     }
 }
