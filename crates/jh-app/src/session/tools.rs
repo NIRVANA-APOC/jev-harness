@@ -39,7 +39,10 @@ const MAX_OUTPUT_CHARS: usize = 4000;
 /// 遍历时跳过的目录：构建产物与本仓库的忽略目录。
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "var"];
 /// 子进程里要摘掉的环境变量。
-const SCRUBBED_ENV: [&str; 2] = ["OPENAI_API_KEY", "TYPESAFE_API_KEY"];
+///
+/// 含本项目真调用的两个别名：会话侧走 `OPENAI_*`（本机由 `DEEPSEEK_API_KEY` 提供值），
+/// 判定侧走 `TYPESAFE_API_KEY`——一条 `env` 就能把它们打进回滚区与证据文件，所以一律不传。
+const SCRUBBED_ENV: [&str; 3] = ["OPENAI_API_KEY", "TYPESAFE_API_KEY", "DEEPSEEK_API_KEY"];
 
 /// 只读工具：读文件。
 pub const READ_FILE: &str = "read_file";
@@ -150,10 +153,13 @@ impl Tools {
         ]
     }
 
-    /// 一次调用的参数摘要（工具块那一行：`bash git status --short`）。
-    pub fn display(&self, call: &ToolCall) -> String {
+    /// 一次调用的参数摘要（**不含**工具名：工具块与审批卡的命令行用它）。
+    ///
+    /// 工具块那一行由块自己画成 `▸ <工具名> <参数摘要>`，审批卡的标题也已经有工具名，
+    /// 所以这里不再重复带名字（真调里踩过一次：块上写成 `▸ bash bash ls -1`）。
+    pub fn detail(&self, call: &ToolCall) -> String {
         let args = self.args(call).unwrap_or_default();
-        let detail = match call.name.as_str() {
+        match call.name.as_str() {
             BASH => args.command.unwrap_or_default(),
             READ_FILE => match args.offset {
                 Some(offset) => format!("{}（从第 {offset} 行起）", args.path.unwrap_or_default()),
@@ -165,8 +171,12 @@ impl Tools {
                 None => args.pattern.unwrap_or_default(),
             },
             _ => call.arguments.clone(),
-        };
-        format!("{} {detail}", call.name)
+        }
+    }
+
+    /// 一行完整摘要（工具名 + 参数摘要）：通知文案与证据的 `note` 用它。
+    pub fn display(&self, call: &ToolCall) -> String {
+        format!("{} {}", call.name, self.detail(call))
     }
 
     /// 执行一次调用。不认识的名字、参数不合契约、路径越界都以失败结果回给模型。
@@ -564,10 +574,16 @@ mod tests {
     #[test]
     fn bash_reports_the_exit_code_and_scrubs_the_api_keys() {
         let (tools, _dir) = tools();
-        unsafe { std::env::set_var("OPENAI_API_KEY", "should-not-leak") };
+        unsafe {
+            // 两个别名都要摘：会话侧的真 key 就在 DEEPSEEK_API_KEY 里。
+            std::env::set_var("OPENAI_API_KEY", "should-not-leak");
+            std::env::set_var("DEEPSEEK_API_KEY", "should-not-leak");
+        }
         let outcome = crate::session::test_support::block_on(tools.execute(&call(
             BASH,
-            serde_json::json!({"command": "echo \"key=${OPENAI_API_KEY:-none}\"; pwd"}),
+            serde_json::json!({
+                "command": "echo \"key=${OPENAI_API_KEY:-none}/${DEEPSEEK_API_KEY:-none}\"; pwd"
+            }),
         )));
         assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.text);
         assert!(outcome.text.contains("key=none"), "{}", outcome.text);

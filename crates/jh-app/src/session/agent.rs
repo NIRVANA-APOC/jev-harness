@@ -436,7 +436,7 @@ impl Agent {
                 let text = "用户拒绝了这次调用；请换一个做法，不要重试同一条命令".to_owned();
                 updates.push(Update::ToolBegin {
                     name: call.name.clone(),
-                    args: self.tools.display(&call),
+                    args: self.tools.detail(&call),
                 });
                 updates.push(Update::ToolEnd {
                     status: ToolStatus::Failed,
@@ -465,7 +465,7 @@ impl Agent {
         self.stats.denials += 1;
         updates.push(Update::ToolBegin {
             name: call.name.clone(),
-            args: self.tools.display(&call),
+            args: self.tools.detail(&call),
         });
         updates.push(Update::ToolEnd {
             status: ToolStatus::Failed,
@@ -789,7 +789,7 @@ impl Agent {
             let text = decision.refuse_text();
             updates.push(Update::ToolBegin {
                 name: call.name.clone(),
-                args: command_of(&call),
+                args: self.tools.detail(&call),
             });
             updates.push(Update::ToolEnd {
                 status: ToolStatus::Failed,
@@ -852,7 +852,7 @@ impl Agent {
         }
         updates.push(Update::ToolBegin {
             name: call.name.clone(),
-            args: self.tools.display(&call),
+            args: self.tools.detail(&call),
         });
         updates.push(Update::Status(self.running(WaitingReason::ToolRunning)));
         self.phase = Phase::Running { call, action };
@@ -925,7 +925,7 @@ impl Agent {
             }
             None => body.push_str("（只读工具，不占用 Jev）"),
         }
-        ApprovalRequest::new(call.name.clone(), self.tools.display(call)).with_body(body)
+        ApprovalRequest::new(call.name.clone(), self.tools.detail(call)).with_body(body)
     }
 
     /// 材料与投影一次装出：装进去的对象就是登记读取的对象（否则快照校验会报漂移）。
