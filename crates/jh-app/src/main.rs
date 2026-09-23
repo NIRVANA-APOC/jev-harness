@@ -1,8 +1,10 @@
-//! `jev` 命令：`chat` / `ask` 未接线；`run` 跑一个任务族 A 任务的匹配循环；`exp` 跑 M0 初始任务集
+//! `jev` 命令：`chat` 进真实终端跑会话（LLM 主循环 + Jev 判定门控 + 工具审批）；`ask` 未接线；
+//! `run` 跑一个任务族 A 任务的匹配循环；`exp` 跑 M0 初始任务集
 //! 的 JSON 基线；`compare` 跑 H1/H2 四组臂对照；`h3` 跑任务族 B 的 H3 对照（固定问题集合 vs 允许精化）；
 //! `h4` 跑任务族 C 的 H4 三臂对照（固定测试 / 通用测试生成 / 针对缺口建设观测器）。
 //!
 //! ```text
+//! cargo run -p jh-app -- chat                      # TUI 会话：真实模型 + Jev 门控（需要真实终端）
 //! cargo run -p jh-app -- exp                       # 离线默认：规则 + 模拟真值
 //! cargo run -p jh-app -- run --task A5 --judge rule        # 单任务端到端（含 §5.4 受控演示）
 //! cargo run -p jh-app -- compare --judge rule              # 四组臂离线对照
@@ -14,8 +16,10 @@
 //! cargo run -p jh-app -- h4 --contracts var/.../contracts.json --tests var/.../tests.json
 //! ```
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use jh_app::compare::{self, CompareOptions};
@@ -28,6 +32,7 @@ use jh_app::judge::JudgeName;
 use jh_app::m4::{self, M4Options};
 use jh_app::matching::{Arm, Cadence};
 use jh_app::report;
+use jh_app::session::{self, ChatOptions};
 use jh_app::tasks::TaskSet;
 
 #[derive(Parser)]
@@ -43,8 +48,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 交互式对话（TUI）
-    Chat,
+    /// 交互式对话（TUI）：真实模型 + Jev 判定门控 + 工具审批
+    Chat(ChatArgs),
     /// 单次 Jev 判定
     Ask,
     /// 跑一个任务族 A 任务的匹配循环（端到端）
@@ -102,6 +107,28 @@ struct M4Args {
     /// 报告输出路径；缺省 var/m4/<run>.json
     #[arg(long = "out", value_name = "FILE")]
     out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ChatArgs {
+    /// 工作区：工具的读写边界与 `bash` 的工作目录；缺省当前目录
+    #[arg(long = "workspace", value_name = "DIR")]
+    workspace: Option<PathBuf>,
+    /// 门控判断器（缺凭据时如实标「不可用」，该次调用交人工裁决）
+    #[arg(long = "judge", value_enum, default_value = "jev", value_name = "NAME")]
+    judge: JudgeName,
+    /// 防抖窗口（秒）：同一条命令在窗口内复用上一次判定
+    #[arg(long = "debounce", default_value_t = 30, value_name = "SECONDS")]
+    debounce: u64,
+    /// 本轮模型调用上限
+    #[arg(long = "max-rounds", default_value_t = 8, value_name = "N")]
+    max_rounds: usize,
+    /// 调用记录落盘路径（JSONL，追加写）
+    #[arg(long = "calls", default_value = "var/calls.jsonl", value_name = "FILE")]
+    calls: PathBuf,
+    /// 运行产物目录（证据文件写这里）；缺省 var/chat/<run>
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -234,7 +261,8 @@ struct ExpArgs {
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Chat | Command::Ask => {
+        Command::Chat(args) => run_chat(args).await,
+        Command::Ask => {
             eprintln!("未实现");
             ExitCode::from(2)
         }
@@ -343,6 +371,60 @@ async fn run_m4(args: M4Args) -> ExitCode {
             "有失败调用／被拒契约：见报告里的 calls.failed、channel_setup 与各格的 verification（如实计入，不重试）"
         );
         ExitCode::from(1)
+    }
+}
+
+/// `jev chat`：进真实终端跑会话，退出时打一行读数。
+async fn run_chat(args: ChatArgs) -> ExitCode {
+    // TUI 要有真终端才有 raw mode / 备用屏可言：管道里跑只会得到一串转义序列。
+    if !std::io::stdout().is_terminal() {
+        eprintln!("chat 需要真实终端（当前标准输出不是 TTY）：请在终端里直接运行 `jev chat`");
+        return ExitCode::from(2);
+    }
+    let workspace = match &args.workspace {
+        Some(dir) => dir.clone(),
+        None => match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                eprintln!("取不到当前工作目录：{error}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let run = compare::new_run_id();
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("var/chat/{run}")));
+    let options = ChatOptions {
+        workspace,
+        judge: args.judge,
+        run,
+        calls_path: args.calls,
+        out_dir,
+        debounce: Duration::from_secs(args.debounce),
+        max_rounds: args.max_rounds,
+    };
+
+    match session::chat(options).await {
+        Ok(stats) => {
+            println!(
+                "会话结束：{} 轮 · 模型 {} 次 · 判定 {} 次（防抖复用 {}）· 工具 {} 次 \
+                 · 门控拒绝 {} · 人工拒绝 {}",
+                stats.turns,
+                stats.model_calls,
+                stats.judgments,
+                stats.judge_reuses,
+                stats.tool_calls,
+                stats.refusals,
+                stats.denials
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
     }
 }
 

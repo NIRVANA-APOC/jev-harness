@@ -58,6 +58,7 @@ pub mod matching;
 pub mod metrics;
 pub mod promotion;
 pub mod report;
+pub mod session;
 pub mod shadow;
 pub mod tasks;
 pub mod validation;

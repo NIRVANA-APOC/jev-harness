@@ -1147,9 +1147,13 @@ name = "jh-app"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crossterm",
+ "futures",
  "jh-core",
  "jh-jev",
  "jh-openai",
+ "jh-tui",
+ "ratatui",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
