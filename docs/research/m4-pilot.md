@@ -46,7 +46,7 @@
 
 ## 2. 单元与端到端测试（离线）
 
-`cargo test -p jh-app --test m4` 共 7 个用例（另有 9 个模块内单元测试），钉住的是结构与口径（不是会被调参改变的那部分）：
+`cargo test -p jh-app --test m4` 共 8 个用例（另有 9 个模块内单元测试），钉住的是结构与口径（不是会被调参改变的那部分）：
 
 - 四组臂只切所属维度：结构维落到 H1/H2 两个开关（`loop-*` = `h1off-h2full`、`maintained-*` = `h1on-h2inc`）；
 - 诊断对照确实把证据差异抹平：循环臂两段的询问量相同，依赖维护臂在诊断段重查不少于主对照；
@@ -303,11 +303,14 @@
   落在 `maintained-llm` 的 A4（`diagnostic` 段）与 A5 / A6（`density` 段）判分上；这是 M0 就登记过的
   同一形态（`docs/roadmap-1.0.md` §5 M0），本批 5 次失败里占 3 次，说明它不是一次性抖动。
   解析层按「形状不符即显式失败」处理，不猜、不重试。
-- **契约生成被截断 2 次**（都是 `lost_update`，都是 39 / 45 s 后 `Incomplete`，
+- **契约生成被截断 2 次**（都是 `lost_update`，都是 `Incomplete`、
   `incomplete_details.reason=MaxOutputTokens`）：一次在 `contract` 段（决定观察通道的那次生成，见 §5.4），
   一次在 `reuse` 段的**逐用例重建侧**（该侧为这个用例重建通道的那次生成，见 §5.6）。
-  两次都不是实现缺陷：契约生成没设 `max_output_tokens`（仓库别处也没设），截断来自服务端默认上限；
-  按项目口径不重试、显式失败。
+  **截断的是本仓自己的输出上限**：契约生成走 `judge/llm.rs::complete`，那条路径显式设
+  `max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS = 16384`（`crates/jh-app/src/judge/llm.rs:59/128`），
+  而该模型的 reasoning token 也计入这个上限（M14 已登记）——16384 被吃满，不是服务端默认上限。
+  两条失败记录都**没有上报延迟与 usage**（`latency_ms = 0`、`usage = null`），项目口径不补写耗时；
+  §5.4 表里的 39.3 s / 30.5 s 是 `cancel_after_confirm` 与 `duplicate_after_restart` 那次**成功**生成的耗时。
 - 按用途（与 §5.8 的失败列一致）：`diagnostic` 1（漂移）、`density` 2（漂移）、`contract` 1（截断）、
   `reuse` 1（截断）；`main` / `native` / `channel` 三段的调用全部成功。
   失败让进程退出码非 0（`clean=false`），这是如实报账的一部分，不是「跑挂了」。
@@ -359,7 +362,7 @@ cargo run -p jh-app -- m4 --repeats 2 --max-schedules 2 --cadence triggered --ca
 #    索引键是（快照, 问题, 版本）且后写覆盖先写，所以重复跑内容等价；要干净对比就先复制一份再跑。
 
 # 5) 端到端测试（离线、确定性、不碰网络）
-cargo test -p jh-app --test m4        # 7 个用例
+cargo test -p jh-app --test m4        # 8 个用例
 cargo test -p jh-app --lib m4         # 9 个单元测试
 
 # 6) 把报告折成读数表（临时脚本，不入库）
@@ -430,3 +433,28 @@ python3 var/m4/power.py var/m4/pilot.json
 - **单元测试计数（第 4 条）**：§2 由 8 改成 **9**（第 9 个是 `the_native_cell_labels_itself_apart_from_the_two_by_two`）。
 - **原生基线机械差异（第 5 条）**：写进报告 `protocol.native` 与本文 §1.1 / §8.5 两处。
 - 这些修正都不动读数与结论；重跑真调（§7 命令 1）即按新口径产出。B0 之后的定稿主对照应引用**修后口径**。
+
+### 8.11 评审 r2 的修正留档（截断归因、耗时与测试判别力）
+
+- **截断的归因改准（§5.9，第 1 条）**：此前写「截断来自服务端默认上限」是错的——契约生成走
+  `judge/llm.rs::complete`，那条路径**显式设** `max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS = 16384`
+  （`crates/jh-app/src/judge/llm.rs:59` 定义、`:128` 使用；依据见该文件 47–58 行：该模型的 reasoning
+  token 也计入这个上限，M14 已登记）。所以两次 `Incomplete (MaxOutputTokens)` 是**本仓自己的上限被吃满**。
+  结论方向未变（不重试、显式失败），但归因对象改了：要处理它得动那个 cap 或改契约生成的输出预算。
+  这条错误口径的源头是 r1 的漏检（作者照抄），已撤回并改写。
+- **耗时写准（§5.9，第 2 条）**：两条截断记录的调用记录里 `latency_ms = 0`、`usage = null`（响应不完整，
+  项目口径不补写耗时）。此前写的「39 / 45 s 后 Incomplete」没有产物支撑：39.3 s 是
+  `cancel_after_confirm`、30.5 s 是 `duplicate_after_restart` 那次**成功**生成的耗时（§5.4 表）。
+- **回归测试的判别力（第 3 条）**：选用「收窄声称」而不是补 seam（补 seam 要加逐用例变化的契约来源，
+  只是为了测试而加一层 API，与项目的奥卡姆剃刀相冲）。三条变异自做实测（逐条还原后重跑）：
+
+  | 变异 | 结果 | 说明 |
+  | --- | --- | --- |
+  | 去掉 `merge_channel_cells` 里的 verification 重算 | **红**（`the_reuse_ablation_marks_unavailable_channels_and_merges_its_verification`） | 这条测试确实钉住合并后的文案 |
+  | 去掉 `setups.remove(family)` | 绿 | 该测试**钉不住**「重建先成功后失败」形态 |
+  | `channel_available` 回退成 `setups.contains_key(family)` | 绿 | 该测试**钉不住**「通道在但材料不在」形态 |
+
+  两种未被钉住的形态只靠代码复核与本节留档（真调里出现过「22 对 16」的那个形态正是它们）；测试注释
+  已按此收窄，不再声称「钉住三件」。若后续要真钉住它们，做法是加一个逐用例变化的契约来源（seam），
+  这件事留给统计冻结前的测试补强，不在本批。
+- **集成测试计数（第 4 条）**：§2 与 §7 都由 7 改成 **8**（`cargo test -p jh-app --test m4` 实际 8 个）。

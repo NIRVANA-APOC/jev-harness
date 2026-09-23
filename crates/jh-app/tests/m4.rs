@@ -417,8 +417,18 @@ async fn a_rejected_contract_leaves_that_family_without_a_channel() {
 
 #[tokio::test]
 async fn the_reuse_ablation_marks_unavailable_channels_and_merges_its_verification() {
-    // 两处口径钉在这里：① 「通道可用」要求本用例真有材料（被拒的那一族整段没有材料）；
-    // ② 重建侧不许沿用旧通道；③ 重复合并后 verification 文案用合并计数。
+    // 这条钉住两件事（**只有这两件**，别按更强的说法引用它）：
+    // ① 重复合并后 channel 格的 verification 文案与合并计数一致（去掉重算这一步会红）；
+    // ② 在 setup 阶段就被拒的族，在复用两侧都算「没有材料」，而沿用计数在重建侧为 0、复用侧大于 0。
+    //
+    // 它**钉不住**下面两种形态（fixture 只有静态契约文件，构不出「先成功、后失败」的逐用例序列）：
+    // - 「这一族的通道在、但这一用例的材料不在」——需要主 setup 与消融侧对同一族给出不同的可用性；
+    // - 「一次重建成功之后，下一个用例的重建被拒」——需要逐用例变化的契约来源。
+    // 这两种形态靠代码复核 + 文档 §8.10 留档，不靠这条测试。
+    //
+    // 变异实测（r2 自做，逐条还原后重跑）：去掉合并后的 verification 重算 → **本用例红**；
+    // 去掉 `setups.remove(family)` → 仍绿；把 `channel_available` 回退成 `setups.contains_key(family)`
+    // → 仍绿。后两条因此明确**不在**这条测试的覆盖范围内。
     let dir = TempDir::new("reuse-rejected");
     let mut entries = contracts();
     for entry in &mut entries {
