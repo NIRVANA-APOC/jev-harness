@@ -1646,28 +1646,13 @@ async fn run_channel_cell(
             Structure::Maintained => "channel",
         }
         .to_owned(),
-        verification: if counts.cases > 0
-            && counts.failures == counts.cases
-            && !case_errors.is_empty()
-        {
-            Verification {
-                status: VerificationStatus::NotVerified,
-                detail: format!("本格全部用例判定失败：{}", case_errors[0]),
-            }
-        } else if arm.channel().live() {
-            Verification {
-                status: VerificationStatus::Verified,
-                detail: format!(
-                    "真实通道调用 {} 次，失败 {} 次",
-                    counts.calls, counts.failures
-                ),
-            }
-        } else {
-            Verification {
-                status: VerificationStatus::Simulated,
-                detail: "本地判定器".to_owned(),
-            }
-        },
+        verification: channel_verification(
+            arm.channel().live(),
+            counts.cases,
+            counts.calls,
+            counts.failures,
+            case_errors.first().cloned(),
+        ),
         repeats: 1,
         cases: counts.cases,
         opportunities: counts.opportunities,
@@ -2174,8 +2159,10 @@ pub struct ReuseSide {
     pub input_tokens: Option<u64>,
     /// 生成输出 token。
     pub output_tokens: Option<u64>,
-    /// 通道可用的用例数。
+    /// 通道可用的用例数：**既要有这一族的通道、也要有这一用例的材料**（口径见文档 §5.6）。
     pub channel_available: u32,
+    /// 其中通道沿用自更早用例的用例数（复用侧的形态；重建侧修好口径后应为 0）。
+    pub channel_from_earlier_case: u32,
     /// 检出数。
     pub detections: u32,
     /// 误放行数。
@@ -2555,6 +2542,14 @@ fn merge_channel_cells(left: &ChannelCell, right: &ChannelCell) -> ChannelCell {
         entry.inconclusive_on_clean += counts.inconclusive_on_clean;
     }
     merged.by_implementation = by_implementation;
+    // 验证状态按合并后的计数重算：读数用的是结构化字段，但报告读者会读这串文案。
+    merged.verification = channel_verification(
+        left.verification.status != VerificationStatus::Simulated,
+        merged.cases,
+        merged.calls,
+        merged.failures,
+        None,
+    );
     merged
 }
 
@@ -2581,8 +2576,10 @@ pub struct ReuseCaseReading {
     pub probabilities: BTreeMap<String, f64>,
     /// 本用例是否新建了通道。
     pub channel_built_this_case: bool,
-    /// 本用例上通道是否可用（契约被拒或检验没过时为 false）。
+    /// 本用例上通道是否可用：**既要有这一族的通道、也要有这一用例的材料**（口径见 §5.6）。
     pub channel_available: bool,
+    /// 本用例的通道是否沿用自更早的用例（重建侧修好口径后恒为 false）。
+    pub channel_from_earlier_case: bool,
     /// 本用例的生成调用数。
     pub generation_calls: u32,
     /// 契约被拒原因。
@@ -2612,6 +2609,7 @@ async fn run_reuse_side(
     let mut curve = Vec::new();
     let mut counts = ChannelCounts::default();
     let mut available = 0;
+    let mut from_earlier_cases = 0;
     let mut generation_calls = 0;
     let mut generation_failures = 0;
     let mut index = 0;
@@ -2628,6 +2626,11 @@ async fn run_reuse_side(
                 ChannelReuse::Rebuild => true,
             };
             if needs_build {
+                // 重建侧不许沿用旧通道：先清掉这一族此前留下的装置，重建失败就没有通道
+                // （「一次被拒后仍用先前启用的通道」本身就是跨用例复用，与这一侧的定义相冲）。
+                if matches!(side, ChannelReuse::Rebuild) {
+                    setups.remove(family);
+                }
                 let (report, setup) =
                     setup_channel(contracts, &mut library, &mut state, *family, &run_id, calls)
                         .await?;
@@ -2652,12 +2655,17 @@ async fn run_reuse_side(
                     }
                 }
             }
-            let channel_available = setups.contains_key(family);
+            // 「通道可用」= 本用例真的能拿材料判读：既要有这一族的通道，也要有这一用例的材料
+            // （材料是 setup 阶段预计算的 `case.channel`，通道被拒的那一族整段没有材料）。
+            let material = case.channel.clone();
+            let channel_available = setups.contains_key(family) && material.is_some();
             if channel_available {
                 available += 1;
+                if !built_this_case {
+                    from_earlier_cases += 1;
+                }
             }
-            let material = case.channel.clone();
-            let (verdict, probabilities, error) = match (channel_available, material) {
+            let (verdict, probabilities, error) = match (setups.contains_key(family), material) {
                 (false, _) => (
                     c_measure::Verdict::failed("本用例上没有可用的观察通道"),
                     BTreeMap::new(),
@@ -2748,6 +2756,7 @@ async fn run_reuse_side(
                 probabilities,
                 channel_built_this_case: built_this_case,
                 channel_available,
+                channel_from_earlier_case: channel_available && !built_this_case,
                 generation_calls: generation_this_case,
                 rejection,
                 error,
@@ -2780,6 +2789,7 @@ async fn run_reuse_side(
         input_tokens: bucket.usage().input_tokens,
         output_tokens: bucket.usage().output_tokens,
         channel_available: available,
+        channel_from_earlier_case: from_earlier_cases,
         detections: counts.detections,
         false_passes: counts.false_passes,
         inconclusive: counts.inconclusive_on_opportunity + counts.inconclusive_on_clean,
@@ -2924,6 +2934,36 @@ impl RawCell {
             usage: bucket.usage(),
             traces: self.traces.clone(),
             evidence_files: self.evidence_files.clone(),
+        }
+    }
+}
+
+/// 判读臂的验证状态：重复合并之后要按**合并计数**重算，否则读者会看到半样本的数字
+/// （例如结构化字段 failures = 16、文案却写「失败 8 次」）。
+fn channel_verification(
+    live: bool,
+    cases: u32,
+    calls: u32,
+    failures: u32,
+    reason: Option<String>,
+) -> Verification {
+    if cases > 0 && failures == cases {
+        Verification {
+            status: VerificationStatus::NotVerified,
+            detail: match reason {
+                Some(reason) => format!("本格全部用例判定失败：{reason}"),
+                None => format!("本格全部用例判定失败（{failures} 次）"),
+            },
+        }
+    } else if live {
+        Verification {
+            status: VerificationStatus::Verified,
+            detail: format!("真实通道调用 {calls} 次，失败 {failures} 次"),
+        }
+    } else {
+        Verification {
+            status: VerificationStatus::Simulated,
+            detail: "本地判定器".to_owned(),
         }
     }
 }
@@ -3710,7 +3750,10 @@ fn protocol_declaration(
         native: format!(
             "原生基线臂（{}）：生成模型直接协调动作，无类型化问题、无 Jev 判断、无依赖维护；\
              环境、动作候选集、计价与独立验收与对照组相同。动作表只给 id / 计价 / 是否观察类，\
-             不给前提门；完成声明与循环式控制一样在轮末写一条，同样不作证据。",
+             不给前提门；完成声明与循环式控制一样在轮末写一条，同样不作证据。\
+             两处与循环臂的机械差异如实登记：① 第三条验收（完成声明绑定交付物当前版本）由代码直接构造\
+             输入投影，只要交付物存在即成立、不需要任何一次「读交付物」的判断（对基线偏宽的处置）；\
+             ② 动作在当轮的提问后扰动注入之前执行，而循环臂的决策发生在注入之后。",
             options.native
         ),
         ablations: vec![

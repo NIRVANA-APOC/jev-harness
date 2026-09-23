@@ -416,6 +416,80 @@ async fn a_rejected_contract_leaves_that_family_without_a_channel() {
 }
 
 #[tokio::test]
+async fn the_reuse_ablation_marks_unavailable_channels_and_merges_its_verification() {
+    // 两处口径钉在这里：① 「通道可用」要求本用例真有材料（被拒的那一族整段没有材料）；
+    // ② 重建侧不许沿用旧通道；③ 重复合并后 verification 文案用合并计数。
+    let dir = TempDir::new("reuse-rejected");
+    let mut entries = contracts();
+    for entry in &mut entries {
+        if entry.family == CFamily::DuplicateAfterRestart {
+            let mut contract = contract_of(CFamily::DuplicateAfterRestart);
+            contract.proposition = c_measure::BANNED_SUBSTITUTIONS[0].to_owned();
+            let check = c_measure::check_contract(
+                &contract,
+                CFamily::DuplicateAfterRestart,
+                ProgramVersion::V1,
+            );
+            entry.contract = Some(contract);
+            entry.check = Some(check);
+        }
+    }
+    let contracts_path = dir.join("contracts.json");
+    write(&contracts_path, &entries);
+
+    let options = M4Options {
+        run: "m4-offline-reuse-rejected".to_owned(),
+        calls_path: dir.join("calls.jsonl"),
+        out_dir: dir.join("run"),
+        command: "cargo test -p jh-app --test m4".to_owned(),
+        arms: vec![Arm::ALL[2]],
+        repeats: 2,
+        max_tasks: Some(1),
+        max_schedules: Some(1),
+        cadences: vec![Cadence::Triggered],
+        scales: vec![1],
+        native: false,
+        ablate_reuse: true,
+        channel_override: Some(JudgeName::Rule),
+        contracts: Some(contracts_path),
+    };
+    let outcome = m4::run(&options).await.expect("离线复用消融应跑到底");
+    let report = &outcome.report;
+
+    let reuse = report.reuse.reuse.as_ref().expect("复用一侧");
+    let rebuild = report.reuse.rebuild.as_ref().expect("逐用例重建一侧");
+    // 被拒的族（duplicate_after_restart）在两侧都没有材料：可用用例数 < 用例总数。
+    assert!(reuse.channel_available < reuse.cases, "{reuse:?}");
+    assert!(rebuild.channel_available < rebuild.cases, "{rebuild:?}");
+    assert_eq!(
+        reuse.channel_available + 4,
+        reuse.cases,
+        "只有被拒那一族没有材料"
+    );
+    // 重建侧不许沿用旧通道：沿用计数必须是 0。
+    assert_eq!(rebuild.channel_from_earlier_case, 0);
+    assert!(reuse.channel_from_earlier_case > 0, "复用侧本来就靠沿用");
+
+    // 重复合并之后，verification 文案里的失败数与结构化字段一致（不再显示半样本）。
+    for cell in &report.channel {
+        assert_eq!(
+            cell.failures, cell.cases,
+            "本测试的规则判定器答不了判读问题"
+        );
+        assert!(
+            cell.verification
+                .detail
+                .contains(&format!("{} 次", cell.failures)),
+            "{}｜{}：文案 `{}` 与 failures {} 不一致",
+            cell.arm,
+            cell.family,
+            cell.verification.detail,
+            cell.failures
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_report_carries_the_frozen_protocol_and_its_definitions() {
     let dir = TempDir::new("protocol");
     let outcome = run_offline(&dir, vec![Arm::ALL[0]], contracts(), false).await;
