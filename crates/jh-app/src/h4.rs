@@ -523,6 +523,8 @@ pub struct MaintenanceTotal {
     pub inconclusive_on_clean: u32,
     /// 误报数。
     pub false_alarms: u32,
+    /// 无违反且判「成立」的用例数（clean 侧三分的中间那一项）。
+    pub correct_clears: u32,
     /// 变更前的检出率（同一个臂在 v1 上的同批读数）。
     pub detection_rate_before: Option<f64>,
     /// 变更后的检出率。
@@ -554,6 +556,30 @@ pub struct MaintenanceReading {
     pub false_pass_rate_after: Option<f64>,
     /// 这一行是怎么来的。
     pub note: String,
+}
+
+/// 每族实际发起过的生成调用数（按用途分）。契约/测试各一次生成一个条目，条目数就是调用数。
+#[derive(Debug, Clone, Default)]
+pub struct GenerationCalls {
+    /// 族 → 契约生成的调用数。
+    pub contracts: BTreeMap<String, u32>,
+    /// 族 → 测试生成的调用数。
+    pub tests: BTreeMap<String, u32>,
+}
+
+impl GenerationCalls {
+    /// 从产物条目里数出每族的调用数（一个条目 = 一次调用，含失败的那些）。
+    fn of(artifacts: &Artifacts) -> Self {
+        let mut contracts: BTreeMap<String, u32> = BTreeMap::new();
+        for entry in &artifacts.contracts {
+            *contracts.entry(entry.family.id().to_owned()).or_default() += 1;
+        }
+        let mut tests: BTreeMap<String, u32> = BTreeMap::new();
+        for entry in &artifacts.tests {
+            *tests.entry(entry.family.id().to_owned()).or_default() += 1;
+        }
+        Self { contracts, tests }
+    }
 }
 
 /// 摊薄曲线的一行。
@@ -925,6 +951,7 @@ pub async fn run(options: &H4Options) -> Result<H4Outcome, Error> {
             (ArtifactSource::Generate, ArtifactSource::Generate) => "generate",
             _ => "file",
         },
+        &GenerationCalls::of(&artifacts),
     );
     let hypothesis = hypothesis_section(&arms, &amortization, &transfer);
 
@@ -1600,6 +1627,7 @@ fn maintenance_section(
             inconclusive_on_opportunity: sum(&after, |report| report.inconclusive_on_opportunity),
             inconclusive_on_clean: sum(&after, |report| report.inconclusive_on_clean),
             false_alarms,
+            correct_clears: sum(&after, |report| report.correct_clears),
             detection_rate_before: rate(
                 sum(&before, |report| report.detections),
                 sum(&before, |report| report.opportunities),
@@ -1709,6 +1737,7 @@ fn amortization_section(
     arms: &[ArmReport],
     v2_arms: &[ArmReport],
     cost_basis: &str,
+    generation_calls: &GenerationCalls,
 ) -> AmortizationSection {
     let mut points = Vec::new();
     for covered in 1..=families.len() {
@@ -1726,14 +1755,26 @@ fn amortization_section(
                 .iter()
                 .filter(|report| report.arm == arm && target.contains(&report.family.as_str()))
                 .collect();
-            // 生成调用数：每族各一次生成（固定臂不生成任何东西）。契约被拒的那一族没有可用观测器，
-            // 它的那次生成仍然花掉了——所以按契约条目数算，按臂的可用性算会低估成本。
+            // 生成调用数：按**实际发起过的生成调用**算（每族一次），不看那一臂最后可不可用。
+            // 契约被拒的那一族没有可用观测器，但它的那次生成照样花掉了；按臂的可用性算会低估
+            // 这一列，而偏的方向恰好对「观测器更省预算」这个被测假说有利。
             let calls: u32 = match arm {
                 ARM_FIXED => 0,
-                _ => reports
+                ARM_OBSERVER => target
                     .iter()
-                    .filter(|report| report.verification.status != VerificationStatus::NotVerified)
-                    .count() as u32,
+                    .map(|family| {
+                        generation_calls
+                            .contracts
+                            .get(*family)
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .sum(),
+                ARM_GENERATED => target
+                    .iter()
+                    .map(|family| generation_calls.tests.get(*family).copied().unwrap_or(0))
+                    .sum(),
+                _ => 0,
             };
             let total_opportunities: u32 = reports.iter().map(|report| report.opportunities).sum();
             let total_detections: u32 = reports.iter().map(|report| report.detections).sum();
@@ -1776,9 +1817,10 @@ fn amortization_section(
         cost_basis: cost_basis.to_owned(),
         points,
         after_version_change,
-        note: "横轴是覆盖到第 k 个族时的累积**生成调用数**（固定臂为 0，因为它不生成任何东西）；\
-               纵轴是同一批族上的累积检出数与「每检出一次要花多少次调用」。\
-               验证运行与重复运行不折算成调用数——它们不花钱，花的是机器时间，\
+        note: "横轴是覆盖到第 k 个族时的累积**实际发起的生成调用数**（固定臂为 0，因为它不生成任何\
+               东西）：那一族的生成即使最后被协议核对拒了、那一臂因此不可用，这一次调用照样花掉了，\
+               所以这一列按发起数算，不按臂的可用性算。纵轴是同一批族上的累积检出数与「每检出一次要\
+               花多少次调用」。验证运行与重复运行不折算成调用数——它们不花钱，花的是机器时间，\
                在 maintenance 一节里单独记。"
             .to_owned(),
     }

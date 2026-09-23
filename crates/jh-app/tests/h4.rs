@@ -16,6 +16,7 @@ use jh_app::c_measure::{
     self, BANNED_SUBSTITUTIONS, GeneratedContract, GeneratedTests, MeasureCall, RawCheck, RawPlan,
 };
 use jh_app::c_program::{self, CFamily, ProgramVersion};
+use jh_app::calls::{CallEntry, CallLog};
 use jh_app::h4::{
     self, ARM_FIXED, ARM_GENERATED, ARM_GENERATED_V2, ARM_OBSERVER, ARM_OBSERVER_V2_NO_COUNTER,
     ARM_OBSERVER_V2_REVERIFIED, ARM_OBSERVER_V2_SUPPORT_ONLY, ArtifactSource, H4Options,
@@ -189,6 +190,37 @@ fn tests() -> Vec<GeneratedTests> {
             }
         })
         .collect()
+}
+
+/// 往调用记录里塞合成调用：离线路径一次调用都不发，不塞的话成本断言会退化成 0 == 0。
+/// 每条对应一次生成调用（run 名与 `cost_section` 的分组口径对得上），用于验证合计与分项自洽。
+fn seed_calls(path: &Path, run: &str) {
+    let mut log = CallLog::open(path).expect("调用记录可开");
+    for (suffix, input_tokens, output_tokens, latency_ms) in [
+        ("-contract", 100u64, 200u64, 30u64),
+        ("-tests", 110, 210, 40),
+        ("-tests-v2", 120, 220, 50),
+    ] {
+        for index in 0..3u64 {
+            log.append(&CallEntry::ModelCall {
+                run: format!("{run}{suffix}"),
+                purpose: suffix.trim_start_matches('-').to_owned(),
+                case: format!("case-{index}"),
+                source: jh_core::JudgeSource::Llm,
+                version: Some("seeded".to_owned()),
+                request_id: Some(format!("seeded-{suffix}-{index}")),
+                usage: Some(jh_core::Usage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                }),
+                input_bytes: 1,
+                output_bytes: 1,
+                latency_ms: latency_ms + index,
+                error: None,
+            })
+            .expect("合成调用可写");
+        }
+    }
 }
 
 fn write<T: serde::Serialize>(path: &Path, value: &T) {
@@ -690,6 +722,13 @@ async fn a_weakened_contract_leaves_that_family_without_an_observer() {
     );
     assert_eq!(observer.detections, 0);
     assert_eq!(observer.false_passes, 0, "没有观测器时就出不了「命题成立」");
+    // 摊薄曲线的横轴按**实际发起过的生成调用**算：这一族的契约被拒了，但那一次生成照样花掉了。
+    let last = report.amortization.points.last().expect("摊薄曲线有读数");
+    assert_eq!(
+        last.cumulative_calls[ARM_OBSERVER], 3,
+        "三个族各一次契约生成，被拒的那一次也要计进去（按臂的可用性算会少一次）"
+    );
+    assert_eq!(last.cumulative_calls[ARM_FIXED], 0, "固定臂不生成任何东西");
     assert_eq!(
         observer.inconclusive(),
         observer.runs,
@@ -736,11 +775,32 @@ async fn reusing_preloaded_artifacts_still_runs_the_generated_arm_on_v2() {
 #[tokio::test]
 async fn the_cost_total_agrees_with_its_own_parts() {
     let dir = TempDir::new("cost");
+    // 夹具里先塞 9 条合成调用（三个用途各 3 条）：不塞的话离线路径一条调用都不发，
+    // `total.calls = 0`，下面的断言会全部退化成 `0 == 0` / `false == false`，抓不住任何缺陷。
+    seed_calls(&dir.join("calls.jsonl"), "h4-offline");
     let outcome = run_offline(&dir).await;
     let cost = &outcome.report.cost;
 
+    assert_eq!(cost.total.calls, 9, "读到的调用数不对：夹具塞了 9 条");
     let by_parts: u32 = cost.by_purpose.iter().map(|entry| entry.calls).sum();
     assert_eq!(cost.total.calls, by_parts, "合计的调用数要等于分项之和");
+    assert_eq!(
+        cost.by_purpose
+            .iter()
+            .map(|entry| entry.purpose.as_str())
+            .collect::<Vec<_>>(),
+        vec!["contract", "tests", "tests_regenerated"],
+        "三个用途都要在"
+    );
+    for entry in &cost.by_purpose {
+        assert_eq!(entry.calls, 3, "每个用途 3 条：{entry:?}");
+        assert_eq!(entry.succeeded, 3);
+        assert_eq!(entry.failed, 0);
+        assert_eq!(entry.stats.attempted, entry.calls);
+        assert_eq!(entry.latency.samples, entry.calls);
+        assert_eq!(entry.usage.calls_with_usage, entry.calls);
+        assert!(entry.latency.min.is_some() && entry.latency.max.is_some());
+    }
     assert_eq!(
         cost.total.stats.attempted, cost.total.calls,
         "同一个对象里 `calls` 与调用统计的样本数不能各说各话"
@@ -749,17 +809,24 @@ async fn the_cost_total_agrees_with_its_own_parts() {
         cost.total.latency.samples, cost.total.calls,
         "延迟样本数要与调用数一致"
     );
-    let with_usage: u32 = cost
+    assert_eq!(cost.total.usage.calls_with_usage, cost.total.calls);
+    assert_eq!(
+        cost.total.input_tokens,
+        Some(3 * (100 + 110 + 120)),
+        "合计的输入 token 要等于三条分项之和"
+    );
+    assert_eq!(cost.total.output_tokens, Some(3 * (200 + 210 + 220)));
+    // 逐用途的 token 也要真的读到，而不是一律 null。
+    for entry in &cost.by_purpose {
+        assert!(entry.input_tokens.is_some(), "{entry:?}");
+        assert!(entry.output_tokens.is_some(), "{entry:?}");
+    }
+    let by_parts_input: u64 = cost
         .by_purpose
         .iter()
-        .map(|entry| entry.usage.calls_with_usage)
+        .map(|entry| entry.input_tokens.unwrap_or(0))
         .sum();
-    assert_eq!(cost.total.usage.calls_with_usage, with_usage);
-    assert_eq!(
-        cost.total.input_tokens.is_some(),
-        with_usage > 0,
-        "有上报过用量的调用时合计不能是 null"
-    );
+    assert_eq!(cost.total.input_tokens, Some(by_parts_input));
 }
 
 #[tokio::test]
@@ -779,10 +846,8 @@ async fn the_transfer_cells_can_be_closed_against_their_own_counts() {
         );
         assert_eq!(
             cell.clean_runs,
-            cell.false_alarms
-                + cell.inconclusive_on_clean
-                + (cell.clean_runs - cell.false_alarms - cell.inconclusive_on_clean),
-            "{cell:?}"
+            cell.false_alarms + cell.correct_clears + cell.inconclusive_on_clean,
+            "无违反用例上的三种结果要加起来等于干净用例数：{cell:?}"
         );
         assert!(
             cell.inconclusive_on_clean <= cell.clean_runs,
@@ -811,6 +876,16 @@ async fn the_maintenance_totals_close_over_the_whole_batch() {
     assert_eq!(
         reverified.opportunities + reverified.clean_runs,
         reverified.runs
+    );
+    assert_eq!(
+        reverified.opportunities,
+        reverified.detections + reverified.false_passes + reverified.inconclusive_on_opportunity,
+        "机会侧三分要闭合"
+    );
+    assert_eq!(
+        reverified.clean_runs,
+        reverified.false_alarms + reverified.correct_clears + reverified.inconclusive_on_clean,
+        "clean 侧三分要闭合（`correct_clears` 这一列不能只靠残差推）"
     );
     assert!(
         reverified.detection_rate_after.unwrap_or(0.0)
