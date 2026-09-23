@@ -1679,6 +1679,9 @@ fn hypothesis_section(
     let observer_fp = rate(observer_false_passes, observer_opportunities);
     let fixed_fp = rate(fixed_false_passes, fixed_opportunities);
     let generated_fp = rate(generated_false_passes, generated_opportunities);
+    let (_, _, fixed_balanced) = totals_two_sided(arms, ARM_FIXED);
+    let (_, _, generated_balanced) = totals_two_sided(arms, ARM_GENERATED);
+    let (_, _, observer_balanced) = totals_two_sided(arms, ARM_OBSERVER);
 
     let last = amortization.points.last();
     let observer_cpd = last.and_then(|point| {
@@ -1727,7 +1730,13 @@ fn hypothesis_section(
             percent(observer_rate),
         ),
         format!(
-            "观测器臂弃权（失败态）{observer_inconclusive} 次：记录器被绕过或被篡改时它拒绝作证——             这正是扣掉它检出率的那部分",
+            "两侧读数（检出率与「无误违反时判对率」的平均，用来检查判据站不站得住）：固定臂 {}｜通用测试生成臂 {}｜观测器臂 {}",
+            percent(fixed_balanced),
+            percent(generated_balanced),
+            percent(observer_balanced),
+        ),
+        format!(
+            "观测器臂弃权（失败态）{observer_inconclusive} 次：记录器被绕过或被篡改时它拒绝作证，这正是扣掉它检出率的那部分"
         ),
         format!(
             "每检出一次所花的生成调用数：通用测试生成臂 {}｜观测器臂 {}",
@@ -1781,40 +1790,81 @@ fn hypothesis_section(
             parts.join("，")
         )
     } else {
-        "建设观测器只增加了测试数量：既没有改善后续任务的结果（误放行率不低于两个基线臂），         也没有改善预算利用（每检出一次所花的生成调用数不低于通用测试生成臂）。         **不支持累积能力假说。**"
-            .to_owned()
+        concat!(
+            "建设观测器既没有改善后续任务的结果（误放行率不低于两个基线臂），",
+            "也没有改善预算利用（每检出一次所花的生成调用数不低于通用测试生成臂）：",
+            "**不支持累积能力假说。**",
+        )
+        .to_owned()
     };
 
     let mut caveats = vec![
-        "判据用的是误放行率而不是原始检出率，理由是本节 criteria 里写的那条：观测器在记录器被绕过时         落进失败态（拒绝作证）会被检出率口径当成「没检出」。**按原始检出率排序，观测器臂在这一批         读数里输给两个基线臂**——两种读法都在 readings 里，别只看一个"
-            .to_owned(),
-        "三个族是同一实验环境里的三条顺序约束，不是三个独立领域：迁移读数只说明「换个故障族就得         重新建设」，不构成对别的领域的结论"
-            .to_owned(),
-        "固定测试臂在 C2 上本来就够用（终态计数看得见丢失更新），它 0 次生成调用、每检出一次的         调用数天然最低——「预算利用」这一项对基线更有利，这一点没有被抹平"
-            .to_owned(),
-        "契约与测试计划各只有一次真实生成：模型这一次的输出质量会直接进到读数里，         这里没有做多次采样的稳定性估计"
-            .to_owned(),
-        "观测器臂的读数里有一大块是「失败态」：那是它对自己测量能力边界的如实报告，不是检出。         把失败态折成「成立」会变成误放行，折成「违反」会变成误报"
-            .to_owned(),
+        concat!(
+            "判据用的是误放行率而不是原始检出率，理由是 criteria 里写的那条：观测器在记录器被绕过时",
+            "落进失败态（拒绝作证），会被检出率口径当成「没检出」。**按原始检出率排序，观测器臂在这一批",
+            "读数里输给两个基线臂**——两种读法都在 readings 里，别只看一个",
+        )
+        .to_owned(),
+        concat!(
+            "只用一侧的错误率是不够的：一个「一律判违反」的臂误放行率天然为 0。报告里的 `by_schedule`",
+            "与 `clean_runs` 列把它照得出来——哪一臂在无违反的用例上一次都没判对，那里看得见。",
+            "readings 里的「两侧读数」就是为这件事加的",
+        )
+        .to_owned(),
+        concat!(
+            "三个族是同一实验环境里的三条顺序约束，不是三个独立领域：迁移读数只说明「换个故障族就得",
+            "重新建设」，不构成对别的领域的结论",
+        )
+        .to_owned(),
+        concat!(
+            "固定测试臂在 C2 上本来就够用（终态计数看得见丢失更新），它 0 次生成调用、每检出一次的",
+            "调用数天然最低——「预算利用」这一项对基线更有利，这一点没有被抹平",
+        )
+        .to_owned(),
+        concat!(
+            "契约与测试计划各只有一次真实生成：模型这一次的输出质量会直接进到读数里，",
+            "这里没有做多次采样的稳定性估计",
+        )
+        .to_owned(),
+        concat!(
+            "观测器臂的读数里有一大块是「失败态」：那是它对自己测量能力边界的如实报告，不是检出。",
+            "把失败态折成「成立」会变成误放行，折成「违反」会变成误报",
+        )
+        .to_owned(),
     ];
     if !off_diagonal.is_empty() {
         caveats.push(
-            "观测器跨族套用基本检出不到东西，还带上了误报与误放行：为单个族建的观测器不会迁移到             别的故障族，迁移要另建一份契约（那笔账记在摊薄曲线的第二个账期里）"
-                .to_owned(),
+            concat!(
+                "观测器跨族套用基本检出不到东西，还带上了误报与误放行：为单个族建的观测器不会迁移到",
+                "别的故障族，迁移要另建一份契约（那笔账记在摊薄曲线的第二个账期里）",
+            )
+            .to_owned(),
         );
     }
 
     HypothesisSection {
-        statement: "在一系列相关但不同的故障任务上，针对认知缺口建设观测器，是否比固定测试、                    通用测试生成更能改善后续任务的结果或预算利用（研究目标 §7.4）"
-            .to_owned(),
+        statement: concat!(
+            "在一系列相关但不同的故障任务上，针对认知缺口建设观测器，是否比固定测试、",
+            "通用测试生成更能改善后续任务的结果或预算利用（研究目标 §7.4）",
+        )
+        .to_owned(),
         criteria: vec![
-            "§7.4 把误放行列在要报告的第一位：结果质量以**误放行率**衡量——违反被放过去是这条要求上             最贵的错误，而「拒绝作证」（失败态）不是放行"
-                .to_owned(),
-            "改善结果 = 观测器臂的误放行率严格低于固定臂与通用测试生成臂中较低的那个，且它确实             作出过判定（检出数 > 0，不是靠全程弃权换来的零误放行）"
-                .to_owned(),
+            concat!(
+                "§7.4 把误放行列在要报告的第一位：结果质量以**误放行率**衡量——违反被放过去是这条要求上",
+                "最贵的错误，而「拒绝作证」（失败态）不是放行",
+            )
+            .to_owned(),
+            concat!(
+                "改善结果 = 观测器臂的误放行率严格低于固定臂与通用测试生成臂中较低的那个，且它确实",
+                "作出过判定（检出数 > 0，不是靠全程弃权换来的零误放行）",
+            )
+            .to_owned(),
             "改善预算利用 = 观测器臂「每检出一次所花生成调用数」不高于通用测试生成臂".to_owned(),
-            "两条都不成立时，结论写「不支持累积能力假说」；成立时也要写清是哪一条成立，             并把另一种读法（原始检出率）一并给出"
-                .to_owned(),
+            concat!(
+                "两条都不成立时，结论写「不支持累积能力假说」；成立时也要写清是哪一条成立，",
+                "并把另一种读法与「两侧读数」一并给出",
+            )
+            .to_owned(),
         ],
         readings,
         improves_results,
@@ -1823,6 +1873,25 @@ fn hypothesis_section(
         conclusion,
         caveats,
     }
+}
+
+/// 两侧读数里的那一项：检出率与「无误违反时判对率」的平均。
+fn totals_two_sided(arms: &[ArmReport], arm: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let reports: Vec<&ArmReport> = arms
+        .iter()
+        .filter(|report| report.arm == arm && report.version == ProgramVersion::V1.id())
+        .collect();
+    let detections: u32 = reports.iter().map(|report| report.detections).sum();
+    let opportunities: u32 = reports.iter().map(|report| report.opportunities).sum();
+    let clears: u32 = reports.iter().map(|report| report.correct_clears).sum();
+    let clean_runs: u32 = reports.iter().map(|report| report.clean_runs).sum();
+    let sensitivity = rate(detections, opportunities);
+    let specificity = rate(clears, clean_runs);
+    let balanced = match (sensitivity, specificity) {
+        (Some(left), Some(right)) => Some((left + right) / 2.0),
+        _ => None,
+    };
+    (sensitivity, specificity, balanced)
 }
 
 fn percent(value: Option<f64>) -> String {
@@ -1945,14 +2014,13 @@ async fn generate_tests(
     } else {
         "tests_regenerated"
     };
+    let run = format!(
+        "{}{}",
+        options.run,
+        if suffix.is_empty() { "-tests" } else { suffix }
+    );
     for entry in &generated {
-        log_call(
-            calls,
-            &format!("{}{suffix}", options.run),
-            purpose,
-            entry.family,
-            &entry.call,
-        )?;
+        log_call(calls, &run, purpose, entry.family, &entry.call)?;
         if !entry.call.succeeded() {
             *clean = false;
         }
