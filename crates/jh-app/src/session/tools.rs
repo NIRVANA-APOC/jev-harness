@@ -1,4 +1,4 @@
-//! 工具集：工作区内只读（读文件 / 列目录 / 搜内容）+ `bash` 命令执行。
+//! 工具集：工作区内只读三件（读文件 / 列目录 / 搜内容）+ 写与编辑文件 + `bash` 命令执行。
 //!
 //! 设计来源：`docs/tui-design.md` §5.4 与 §2.6——**每个工具调用都要过审批卡**，
 //! 所以工具表只需要如实描述「这个调用要做什么」，裁决权在门控与人工那里（[`crate::session::gate`]、
@@ -6,9 +6,13 @@
 //!
 //! 边界：
 //!
-//! - 三个只读工具的路径一律解析到工作区内（`canonicalize` 之后再比对前缀，指到工作区外的软链接
-//!   同样拦下），越界显式失败；`search` 遍历时**逐个**解析并比对前缀，且**不跟随目录软链接**
-//!   （`self_link -> .` 这类自环会让遍历永不结束），跳过的项在结果里如实计数；
+//! - 只读三个与 `write_file` / `edit_file` 的路径一律解析到工作区内——写入路径按**父目录**
+//!   `canonicalize` 后比对前缀（目标文件还不存在，没法 canonicalize 它自己），`../` 与指向
+//!   工作区外的软链接目录同样拦下，越界显式失败；`search` 遍历时**逐个**解析并比对前缀，
+//!   且**不跟随目录软链接**（`self_link -> .` 这类自环会让遍历永不结束），跳过的项在结果里如实计数；
+//! - `edit_file` 的锚点必须**唯一命中**：找不到、命中多处都显式失败，不做「大概改这里」的猜测；
+//! - 覆盖已有文件在确定性层算**破坏性**（内容会丢），`write_file` 新建文件算「会改动工作区」——
+//!   这条区分直接决定 `auto` 模式下要不要上卡（`docs/tui-design.md` §5.4）；
 //! - `bash` 以工作区为工作目录，但**不**限制它能读写什么——它的边界由审批卡划定，
 //!   不靠代码假装兜住（`AGENTS.md`「禁止过度防御性编程」）。
 //! - 工具执行失败**不是**宿主错误：失败原文作为结果回给模型（它要据此改主意），
@@ -24,6 +28,7 @@ use jh_openai::Tool;
 use jh_tui::blocks::ToolStatus;
 use serde::Deserialize;
 
+use crate::session::gate::{self, Risk};
 use crate::session::model::ToolCall;
 
 /// 读文件的默认行数上限（不给 `limit` 时）。
@@ -38,6 +43,8 @@ const SEARCH_MAX_HITS: usize = 200;
 const SEARCH_MAX_FILES: usize = 5000;
 /// 工具输出进上下文前的字符上限（超出部分截断并注明）。
 const MAX_OUTPUT_CHARS: usize = 4000;
+/// 单次写入的字节上限：拦住「把整个仓库塞进一个文件」这种调用（超出显式失败，不截断）。
+const WRITE_MAX_BYTES: usize = 256 * 1024;
 /// 遍历时跳过的目录：构建产物与本仓库的忽略目录。
 const SKIPPED_DIRS: [&str; 3] = [".git", "target", "var"];
 /// 子进程里要摘掉的环境变量。
@@ -52,6 +59,10 @@ pub const READ_FILE: &str = "read_file";
 pub const LIST_DIR: &str = "list_dir";
 /// 只读工具：搜内容。
 pub const SEARCH: &str = "search";
+/// 副作用工具：写一个文件（覆盖已有内容）。
+pub const WRITE_FILE: &str = "write_file";
+/// 副作用工具：把文件里唯一一处锚点替换成新内容。
+pub const EDIT_FILE: &str = "edit_file";
 /// 副作用工具：执行一条 shell 命令。
 pub const BASH: &str = "bash";
 
@@ -141,6 +152,34 @@ impl Tools {
                 }),
             ),
             Tool::function(
+                WRITE_FILE,
+                "在工作区里写一个文本文件（父目录要在；已有文件会被**覆盖**，覆盖会走人工确认）。\
+                 写完返回写了多少字节。",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "相对工作区根的路径"},
+                        "content": {"type": "string", "description": "文件的完整内容"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+            Tool::function(
+                EDIT_FILE,
+                "把工作区文件里**唯一**一处 `old_string` 替换成 `new_string`。\
+                 找不到或多处命中都会显式失败（不猜）；要替换全部相同片段时把 replace_all 设为 true。",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "相对工作区根的路径"},
+                        "old_string": {"type": "string", "description": "要被替换的原文（要唯一）"},
+                        "new_string": {"type": "string", "description": "替换成什么"},
+                        "replace_all": {"type": "boolean", "description": "是否替换全部命中，缺省 false"}
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }),
+            ),
+            Tool::function(
                 BASH,
                 "在工作区里执行一条 shell 命令（`sh -c`，工作目录是工作区根）。\
                  每次调用都要经用户授权：被拒绝时如实收到「已拒绝」，请换个做法而不是重复同一条命令。",
@@ -172,6 +211,25 @@ impl Tools {
                 Some(path) => format!("{}（{}）", args.pattern.unwrap_or_default(), path),
                 None => args.pattern.unwrap_or_default(),
             },
+            WRITE_FILE => format!(
+                "{}（写 {} 字节{}）",
+                args.path.unwrap_or_default(),
+                args.content.as_deref().unwrap_or_default().len(),
+                if self.existing(&call.arguments) {
+                    "，覆盖已有文件"
+                } else {
+                    ""
+                }
+            ),
+            EDIT_FILE => format!(
+                "{}（{}）",
+                args.path.unwrap_or_default(),
+                if args.replace_all.unwrap_or(false) {
+                    "替换全部命中"
+                } else {
+                    "替换一处"
+                }
+            ),
             _ => call.arguments.clone(),
         }
     }
@@ -191,6 +249,8 @@ impl Tools {
             READ_FILE => self.read_file(&args),
             LIST_DIR => self.list_dir(&args),
             SEARCH => self.search(&args),
+            WRITE_FILE => self.write_file(&args),
+            EDIT_FILE => self.edit_file(&args),
             BASH => self.bash(&args).await,
             other => ToolOutcome::failed(format!("没有名为 `{other}` 的工具")),
         }
@@ -199,6 +259,58 @@ impl Tools {
     fn args(&self, call: &ToolCall) -> Result<Args, String> {
         serde_json::from_str(&call.arguments)
             .map_err(|error| format!("参数不是合法 JSON（{}）：{}", call.arguments, error))
+    }
+
+    /// 这个工具是不是**只读工具**（只读三件）：决定要不要问 Jev。
+    ///
+    /// 与 [`Tools::risk`] 是两件事：`bash` 无论命令多安全都算副作用工具（要过判定与审批），
+    /// 而它的**风险类别**才由命令本身决定（`ls` 是只读、`rm -rf` 是破坏性）。
+    pub fn is_read_only(&self, name: &str) -> bool {
+        matches!(name, READ_FILE | LIST_DIR | SEARCH)
+    }
+
+    /// 这次调用的确定性风险类别（`gate::assess` 只管 shell 命令，工具各自报自己的）。
+    ///
+    /// 只读三件 → [`Risk::ReadOnly`]；`write_file` 覆盖已有文件 → [`Risk::Destructive`]
+    /// （内容会丢）、新建文件 → [`Risk::Mutating`]；`edit_file` → [`Risk::Mutating`]。
+    /// 这条区分直接决定 `auto` 模式下要不要上卡：破坏性一律上卡，其余采纳即执行。
+    pub fn risk(&self, call: &ToolCall) -> Risk {
+        match call.name.as_str() {
+            BASH => {
+                #[derive(Deserialize)]
+                struct CommandArg {
+                    #[serde(default)]
+                    command: Option<String>,
+                }
+                let command = serde_json::from_str::<CommandArg>(&call.arguments)
+                    .ok()
+                    .and_then(|args| args.command)
+                    .unwrap_or_else(|| call.arguments.clone());
+                gate::assess(&command)
+            }
+            WRITE_FILE => {
+                if self.existing(&call.arguments) {
+                    Risk::Destructive
+                } else {
+                    Risk::Mutating
+                }
+            }
+            EDIT_FILE => Risk::Mutating,
+            _ => Risk::ReadOnly,
+        }
+    }
+
+    /// 目标文件是否已存在（解析不到就当作不存在；真正的失败由 `write_file` 自己报）。
+    fn existing(&self, arguments: &str) -> bool {
+        #[derive(Deserialize)]
+        struct PathArg {
+            #[serde(default)]
+            path: Option<String>,
+        }
+        serde_json::from_str::<PathArg>(arguments)
+            .ok()
+            .and_then(|args| args.path)
+            .is_some_and(|raw| self.resolve_for_write(&raw).is_ok_and(|path| path.exists()))
     }
 
     /// 把参数里的路径解析到工作区内：先解析成绝对路径，再看它是否落在工作区前缀下。
@@ -219,6 +331,116 @@ impl Tools {
             return Err(format!("路径越出工作区：{raw}"));
         }
         Ok(resolved)
+    }
+
+    /// 写入路径解析：目标文件**可能还不存在**，所以按**父目录** canonicalize 后比对前缀
+    /// （父目录必须在；`../` 与指向工作区外的软链接目录在这一步被拦下）。
+    fn resolve_for_write(&self, raw: &str) -> Result<PathBuf, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("路径不能为空".to_owned());
+        }
+        let joined = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            self.root.join(raw)
+        };
+        let name = joined
+            .file_name()
+            .ok_or_else(|| format!("路径没有文件名：{raw}"))?
+            .to_owned();
+        let parent = joined
+            .parent()
+            .ok_or_else(|| format!("路径没有父目录：{raw}"))?;
+        let parent = parent
+            .canonicalize()
+            .map_err(|error| format!("父目录不可用（{raw}）：{error}"))?;
+        if !parent.starts_with(&self.root) {
+            return Err(format!("路径越出工作区：{raw}"));
+        }
+        Ok(parent.join(name))
+    }
+
+    /// 写一个文件（覆盖已有内容）。
+    fn write_file(&self, args: &Args) -> ToolOutcome {
+        let (Some(raw), Some(content)) = (&args.path, &args.content) else {
+            return ToolOutcome::failed("缺少参数 path 或 content");
+        };
+        if content.len() > WRITE_MAX_BYTES {
+            return ToolOutcome::failed(format!(
+                "内容太大（{} 字节，上限 {WRITE_MAX_BYTES}）：请分次写或换 bash",
+                content.len()
+            ));
+        }
+        let path = match self.resolve_for_write(raw) {
+            Ok(path) => path,
+            Err(message) => return ToolOutcome::failed(message),
+        };
+        let existed = path.exists();
+        if let Err(error) = std::fs::write(&path, content) {
+            return ToolOutcome::failed(format!("写不了 {raw}：{error}"));
+        }
+        let verb = if existed { "覆盖写" } else { "新建" };
+        ToolOutcome::ok(format!(
+            "{verb} {}（{} 字节）",
+            self.display_path(&path),
+            content.len()
+        ))
+    }
+
+    /// 把文件里唯一一处锚点替换成新内容。
+    fn edit_file(&self, args: &Args) -> ToolOutcome {
+        let Some(raw) = &args.path else {
+            return ToolOutcome::failed("缺少参数 path");
+        };
+        let (Some(old), Some(new)) = (&args.old_string, &args.new_string) else {
+            return ToolOutcome::failed("缺少参数 old_string 或 new_string");
+        };
+        if old.is_empty() {
+            return ToolOutcome::failed("old_string 不能为空（要新建内容请用 write_file）");
+        }
+        let path = match self.resolve(raw) {
+            Ok(path) => path,
+            Err(message) => return ToolOutcome::failed(message),
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => return ToolOutcome::failed(format!("读不了 {raw}：{error}")),
+        };
+        let hits = text.matches(old.as_str()).count();
+        if hits == 0 {
+            return ToolOutcome::failed(format!(
+                "{} 里找不到 old_string（原文要逐字节一致，包括缩进）",
+                self.display_path(&path)
+            ));
+        }
+        let replace_all = args.replace_all.unwrap_or(false);
+        if hits > 1 && !replace_all {
+            return ToolOutcome::failed(format!(
+                "old_string 在 {} 里命中 {hits} 处：请给更长的上下文让它唯一，或把 replace_all 设为 true",
+                self.display_path(&path)
+            ));
+        }
+        let updated = if replace_all {
+            text.replace(old.as_str(), new.as_str())
+        } else {
+            text.replacen(old.as_str(), new.as_str(), 1)
+        };
+        if updated.len() > WRITE_MAX_BYTES {
+            return ToolOutcome::failed(format!(
+                "改完会超过 {WRITE_MAX_BYTES} 字节上限；请分次编辑"
+            ));
+        }
+        if let Err(error) = std::fs::write(&path, &updated) {
+            return ToolOutcome::failed(format!("写不了 {raw}：{error}"));
+        }
+        ToolOutcome::ok(format!(
+            "改好 {}（替换 {} 处，{} → {} 字节）",
+            self.display_path(&path),
+            if replace_all { hits } else { 1 },
+            text.len(),
+            updated.len()
+        ))
     }
 
     /// 展示用路径：工作区内用相对路径，根自己显示成 `.`。
@@ -464,6 +686,14 @@ struct Args {
     max_hits: Option<usize>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: Option<bool>,
 }
 
 /// 按字符上限截断（截断处注明被截掉多少字符，不静默）。
@@ -534,7 +764,10 @@ mod tests {
             .iter()
             .map(|tool| tool.name().to_owned())
             .collect();
-        assert_eq!(names, vec![READ_FILE, LIST_DIR, SEARCH, BASH]);
+        assert_eq!(
+            names,
+            vec![READ_FILE, LIST_DIR, SEARCH, WRITE_FILE, EDIT_FILE, BASH]
+        );
         assert_eq!(
             tools.display(&call(
                 BASH,
@@ -562,6 +795,140 @@ mod tests {
             outcome.text
         );
         assert!(outcome.text.contains("端口 8080"), "{}", outcome.text);
+    }
+
+    /// `write_file`：新建、覆盖、越界、缺父目录、超上限，逐条如实报。
+    #[test]
+    fn write_file_creates_and_overwrites_with_explicit_failures() {
+        let (tools, dir) = tools();
+        let workspace = dir.join("workspace");
+
+        // 新建
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            WRITE_FILE,
+            serde_json::json!({"path": "src/new.rs", "content": "pub fn a() {}\n"}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.text);
+        assert!(outcome.text.contains("新建 src/new.rs"), "{}", outcome.text);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src/new.rs")).expect("读回"),
+            "pub fn a() {}
+"
+        );
+
+        // 覆盖：内容换掉，风险类别升级成破坏性
+        assert_eq!(
+            tools.risk(&call(
+                WRITE_FILE,
+                serde_json::json!({"path": "src/new.rs", "content": "x"})
+            )),
+            Risk::Destructive
+        );
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            WRITE_FILE,
+            serde_json::json!({"path": "src/new.rs", "content": "pub fn b() {}\n"}),
+        )));
+        assert!(
+            outcome.text.contains("覆盖写 src/new.rs"),
+            "{}",
+            outcome.text
+        );
+
+        // 新建（不存在的路径）在门控里算「会改动工作区」，不是只读
+        assert_eq!(
+            tools.risk(&call(
+                WRITE_FILE,
+                serde_json::json!({"path": "src/another.rs", "content": "x"})
+            )),
+            Risk::Mutating
+        );
+
+        // 越界
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            WRITE_FILE,
+            serde_json::json!({"path": "../outside.txt", "content": "x"}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Failed);
+        assert!(outcome.text.contains("越出工作区"), "{}", outcome.text);
+
+        // 父目录不存在：不偷偷建目录
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            WRITE_FILE,
+            serde_json::json!({"path": "no/such/dir/a.rs", "content": "x"}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Failed);
+        assert!(outcome.text.contains("父目录不可用"), "{}", outcome.text);
+
+        // 超上限：显式失败，不截断内容
+        let huge = "a".repeat(super::WRITE_MAX_BYTES + 1);
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            WRITE_FILE,
+            serde_json::json!({"path": "big.txt", "content": huge}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Failed);
+        assert!(outcome.text.contains("内容太大"), "{}", outcome.text);
+    }
+
+    /// `edit_file`：唯一命中才改；找不到、命中多处、锚点为空都显式失败；`replace_all` 才全换。
+    #[test]
+    fn edit_file_requires_a_unique_anchor() {
+        let (tools, dir) = tools();
+        let workspace = dir.join("workspace");
+
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            EDIT_FILE,
+            serde_json::json!({"path": "src/main.rs", "old_string": "端口 8080", "new_string": "端口 9090"}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.text);
+        let text = std::fs::read_to_string(workspace.join("src/main.rs")).expect("读回");
+        assert!(text.contains("端口 9090"), "{text}");
+        assert!(!text.contains("端口 8080"), "{text}");
+
+        // 找不到
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            EDIT_FILE,
+            serde_json::json!({"path": "src/main.rs", "old_string": "端口 1234", "new_string": "x"}),
+        )));
+        assert!(
+            outcome.text.contains("找不到 old_string"),
+            "{}",
+            outcome.text
+        );
+
+        // 多处命中：不猜
+        std::fs::write(workspace.join("dup.txt"), "aa\naa\n").expect("写文件");
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            EDIT_FILE,
+            serde_json::json!({"path": "dup.txt", "old_string": "aa", "new_string": "bb"}),
+        )));
+        assert!(outcome.text.contains("命中 2 处"), "{}", outcome.text);
+
+        // replace_all 才全换
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            EDIT_FILE,
+            serde_json::json!({"path": "dup.txt", "old_string": "aa", "new_string": "bb", "replace_all": true}),
+        )));
+        assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.text);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("dup.txt")).expect("读回"),
+            "bb\nbb\n"
+        );
+
+        // 空锚点：让用户改用 write_file，而不是做「清空文件」这种意外操作
+        let outcome = crate::session::test_support::block_on(tools.execute(&call(
+            EDIT_FILE,
+            serde_json::json!({"path": "dup.txt", "old_string": "", "new_string": "x"}),
+        )));
+        assert!(outcome.text.contains("不能为空"), "{}", outcome.text);
+
+        // 编辑也是「会改动工作区」，不是只读
+        assert_eq!(
+            tools.risk(&call(
+                EDIT_FILE,
+                serde_json::json!({"path": "dup.txt", "old_string": "b", "new_string": "c"})
+            )),
+            Risk::Mutating
+        );
     }
 
     #[test]

@@ -57,6 +57,10 @@ pub enum ActionId {
     StepOnce,
     /// 暂停 / 继续（研究视图；副作用由宿主执行）。
     PauseToggle,
+    /// 接受补全：把选中的命令填进输入框（`/` 命令补全列表展开时的 `Tab`）。
+    AcceptCompletion,
+    /// 粘贴提示：告诉用户这个终端上粘贴该按哪个键（应用读不到系统剪贴板）。
+    PasteHint,
 }
 
 impl ActionId {
@@ -87,6 +91,8 @@ impl ActionId {
         ActionId::PrevPanel,
         ActionId::StepOnce,
         ActionId::PauseToggle,
+        ActionId::AcceptCompletion,
+        ActionId::PasteHint,
     ];
 }
 
@@ -127,6 +133,28 @@ impl KeyOwner {
             KeyOwner::Prompt => When::PromptFocused,
             KeyOwner::Scrollback => When::ScrollbackFocused,
             KeyOwner::Research => When::ResearchFocused,
+        }
+    }
+}
+
+/// 快捷键栏上的一条提示：键位（供鼠标命中查表）+ 上屏用的键位文案 + 短标签。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyHint {
+    pub chord: KeyChord,
+    /// 上屏文案：`hint_key` 覆盖优先，否则是 `chord.display()`。
+    pub key_text: String,
+    pub label: &'static str,
+}
+
+impl KeyHint {
+    fn of(def: &ActionDef) -> Self {
+        KeyHint {
+            chord: def.default_key,
+            key_text: def
+                .hint_key
+                .map(str::to_owned)
+                .unwrap_or_else(|| def.default_key.display()),
+            label: def.label,
         }
     }
 }
@@ -182,6 +210,13 @@ impl KeyChord {
         KeyChord {
             code,
             modifiers: KeyModifiers::ALT,
+        }
+    }
+
+    pub const fn shift(code: KeyCode) -> Self {
+        KeyChord {
+            code,
+            modifiers: KeyModifiers::SHIFT,
         }
     }
 
@@ -321,20 +356,28 @@ pub struct ActionDef {
     pub alt_keys: &'static [KeyChord],
     /// `None`＝不上快捷键栏；`Some(0)` 优先级最高（上游 `actions/mod.rs:213`）。
     pub hint_priority: Option<u8>,
+    /// 快捷键栏上的键位文案；`None` = 用 [`ActionDef::default_key`] 的显示写法。
+    ///
+    /// 只在「一个键位说不清」时用：换行有 `Shift+Enter`（需终端支持 Kitty 协议）与 `Ctrl+J`
+    /// （任何终端都送得出来）两条路，只写默认键会让不支持协议的终端用户按了个寂寞。
+    pub hint_key: Option<&'static str>,
 }
 
 /// 备用键位：写成 `const` 而不是内联数组字面量——内联数组是临时值，借不出去 `'static`。
 /// 放在一处也让「同一键位的第二种写法」看得见。
-const ALT_NEWLINE: &[KeyChord] = &[
-    KeyChord {
-        code: KeyCode::Enter,
-        modifiers: KeyModifiers::SHIFT,
-    },
-    KeyChord {
-        code: KeyCode::Char('j'),
-        modifiers: KeyModifiers::CONTROL,
-    },
-];
+/// 换行的备用键位：`Shift+Enter` 是默认键，但它需要终端支持键盘增强协议（Kitty 的
+/// `DISAMBIGUATE_ESCAPE_CODES`，由 `terminal.rs` 在进屏时推）才与裸 `Enter` 分得开；
+/// `Ctrl+J` 是**不依赖该协议**的退路（裸 LF，任何终端都送得出来）。
+const ALT_NEWLINE: &[KeyChord] = &[KeyChord::ctrl(KeyCode::Char('j'))];
+
+/// 粘贴提示的备用键：`Ctrl+Shift+V`。
+///
+/// Windows Terminal 默认把 `Ctrl+V` 发给应用、把 `Ctrl+Shift+V` 留给自己粘贴；万一某个终端
+/// 反过来（或用户改过键位），漏下来的那一个也会走到同一条「告诉你该按哪个键」的提示。
+const PASTE_HINTS: &[KeyChord] = &[KeyChord {
+    code: KeyCode::Char('v'),
+    modifiers: KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+}];
 const ALT_CURSOR_UP: &[KeyChord] = &[KeyChord {
     code: KeyCode::Char('p'),
     modifiers: KeyModifiers::CONTROL,
@@ -394,15 +437,18 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::ctrl(KeyCode::Char('c')),
             alt_keys: &[],
             hint_priority: Some(0),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::Interrupt,
+            // 空闲时 `Esc` 什么都不做（退出只走 `Ctrl+C` / `/quit`）：文案就是字面意思。
             label: "取消",
             description: "取消当前轮（无在途轮次时退出）",
             context: When::Always,
             default_key: KeyChord::plain(KeyCode::Esc),
             alt_keys: &[],
             hint_priority: Some(1),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::Submit,
@@ -412,15 +458,41 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Enter),
             alt_keys: &[],
             hint_priority: Some(2),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::InsertNewline,
             label: "换行",
             description: "在提示框里插入硬换行",
             context: When::PromptFocused,
-            default_key: KeyChord::alt(KeyCode::Enter),
+            default_key: KeyChord::shift(KeyCode::Enter),
             alt_keys: ALT_NEWLINE,
             hint_priority: Some(3),
+            // `Shift+Enter` 只在支持 Kitty 键盘协议的终端可分（WT 稳定版不支持）；
+            // `Ctrl+J` 是裸 LF，任何终端都送得出来——两个都写出来，用户不必猜。
+            hint_key: Some("Shift+Enter/Ctrl+J"),
+        },
+        ActionDef {
+            id: ActionId::PasteHint,
+            label: "粘贴提示",
+            description: "说明这个终端上粘贴该按哪个键（应用读不到系统剪贴板）",
+            context: When::PromptFocused,
+            default_key: KeyChord::ctrl(KeyCode::Char('v')),
+            alt_keys: PASTE_HINTS,
+            hint_priority: None,
+            // 幽灵文案里的粘贴键取自这里：终端不同、键位改了，这句话跟着变。
+            hint_key: Some("Ctrl+Shift+V"),
+        },
+        ActionDef {
+            id: ActionId::AcceptCompletion,
+            label: "补全",
+            description: "把选中的命令填入输入框（命令补全列表展开时）",
+            context: When::PromptFocused,
+            default_key: KeyChord::plain(KeyCode::Tab),
+            alt_keys: &[],
+            // 不上快捷键栏：只在补全列表展开时才有意义，常驻一条会误导。
+            hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::CursorLeft,
@@ -430,6 +502,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Left),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::CursorRight,
@@ -439,6 +512,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Right),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::CursorUp,
@@ -448,6 +522,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Up),
             alt_keys: ALT_CURSOR_UP,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::CursorDown,
@@ -457,6 +532,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Down),
             alt_keys: ALT_CURSOR_DOWN,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::CursorHome,
@@ -466,6 +542,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Home),
             alt_keys: ALT_CURSOR_HOME,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::CursorEnd,
@@ -475,6 +552,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::End),
             alt_keys: ALT_CURSOR_END,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::DeleteBackward,
@@ -484,6 +562,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Backspace),
             alt_keys: ALT_DELETE_BACKWARD,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::DeleteForward,
@@ -493,6 +572,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Delete),
             alt_keys: ALT_DELETE_FORWARD,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollLineUp,
@@ -502,6 +582,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Up),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollLineDown,
@@ -511,6 +592,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Down),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollPageUp,
@@ -520,6 +602,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::PageUp),
             alt_keys: &[],
             hint_priority: Some(4),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollPageDown,
@@ -529,6 +612,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::PageDown),
             alt_keys: &[],
             hint_priority: Some(5),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollToBottom,
@@ -538,6 +622,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::End),
             alt_keys: ALT_SCROLL_TO_BOTTOM,
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ApproveOnce,
@@ -547,6 +632,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Char('y')),
             alt_keys: ALT_APPROVE_ONCE,
             hint_priority: Some(0),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ApproveAlways,
@@ -556,6 +642,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Char('a')),
             alt_keys: ALT_APPROVE_ALWAYS,
             hint_priority: Some(1),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::Deny,
@@ -565,6 +652,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Char('n')),
             alt_keys: ALT_DENY,
             hint_priority: Some(2),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ToggleResearch,
@@ -574,6 +662,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::ctrl(KeyCode::Char('o')),
             alt_keys: &[],
             hint_priority: Some(6),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::NextPanel,
@@ -583,6 +672,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Tab),
             alt_keys: &[],
             hint_priority: Some(2),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::PrevPanel,
@@ -592,6 +682,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::BackTab),
             alt_keys: ALT_PREV_PANEL,
             hint_priority: Some(3),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::StepOnce,
@@ -601,6 +692,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Char('s')),
             alt_keys: &[],
             hint_priority: Some(4),
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::PauseToggle,
@@ -610,6 +702,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Char(' ')),
             alt_keys: &[],
             hint_priority: Some(5),
+            hint_key: None,
         },
         // 滚动动作在研究视图里再注册一份：同一个动作在两个上下文各有绑定，
         // 面板吃 `↑ ↓ PgUp PgDn`，回滚区那份不受影响。
@@ -621,6 +714,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Up),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollLineDown,
@@ -630,6 +724,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::Down),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollPageUp,
@@ -639,6 +734,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::PageUp),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
         ActionDef {
             id: ActionId::ScrollPageDown,
@@ -648,6 +744,7 @@ pub fn default_actions() -> Vec<ActionDef> {
             default_key: KeyChord::plain(KeyCode::PageDown),
             alt_keys: &[],
             hint_priority: None,
+            hint_key: None,
         },
     ]
 }
@@ -748,7 +845,7 @@ impl Keymap {
     /// 快捷键栏数据源：按 `hint_priority` 升序（`Some(0)` 最靠前），只取本上下文可见的条目。
     ///
     /// 上游同样是「哪些动作上栏由 `hint_priority` 决定」（`actions/defaults.rs` 里只有 8 条设了它）。
-    pub fn hints(&self, owner: KeyOwner) -> Vec<(KeyChord, &'static str)> {
+    pub fn hints(&self, owner: KeyOwner) -> Vec<KeyHint> {
         let mut items: Vec<&ActionDef> = self
             .defs
             .iter()
@@ -760,10 +857,12 @@ impl Keymap {
             })
             .collect();
         items.sort_by_key(|def| (def.hint_priority.unwrap_or(u8::MAX), def.label));
-        items
-            .into_iter()
-            .map(|def| (def.default_key, def.label))
-            .collect()
+        items.into_iter().map(KeyHint::of).collect()
+    }
+
+    /// 某个动作在快捷键栏上显示的键位文案（提示框幽灵文案也从这里取，免得两处各写一份）。
+    pub fn hint_key_text(&self, id: ActionId) -> Option<String> {
+        self.action(id).map(|def| KeyHint::of(def).key_text)
     }
 
     /// 注册表完备性检查：同一上下文里不允许同键双绑（上游没有这道检查，冲突只在
@@ -948,13 +1047,36 @@ mod tests {
     fn hints_are_ordered_and_context_aware() {
         let keymap = Keymap::from_defaults();
         let prompt_hints = keymap.hints(KeyOwner::Prompt);
-        assert_eq!(prompt_hints[0].1, "退出");
-        assert!(prompt_hints.iter().any(|(_, label)| *label == "发送"));
-        assert!(prompt_hints.iter().any(|(_, label)| *label == "上翻"));
+        assert_eq!(prompt_hints[0].label, "退出");
+        assert!(prompt_hints.iter().any(|hint| hint.label == "发送"));
+        assert!(prompt_hints.iter().any(|hint| hint.label == "上翻"));
 
         let approval_hints = keymap.hints(KeyOwner::Approval);
-        assert_eq!(approval_hints[0].1, "允许一次");
-        assert!(!approval_hints.iter().any(|(_, label)| *label == "换行"));
+        assert_eq!(approval_hints[0].label, "允许一次");
+        assert!(!approval_hints.iter().any(|hint| hint.label == "换行"));
+    }
+
+    /// 换行有两条路，只显示默认键会让不支持 Kitty 协议的终端用户按了个寂寞：
+    /// `InsertNewline` 的 `hint_key` 必须把两条都写出来。
+    #[test]
+    fn the_newline_hint_names_both_working_keys() {
+        let keymap = Keymap::from_defaults();
+        let hint = keymap
+            .hints(KeyOwner::Prompt)
+            .into_iter()
+            .find(|hint| hint.label == "换行")
+            .expect("换行在提示栏里");
+        assert_eq!(hint.key_text, "Shift+Enter/Ctrl+J");
+        assert_eq!(
+            hint.chord,
+            KeyChord::shift(KeyCode::Enter),
+            "默认键还是 Shift+Enter"
+        );
+        // 提示文案与默认键分开取（提示框幽灵文案用前者）。
+        assert_eq!(
+            keymap.hint_key_text(ActionId::InsertNewline).as_deref(),
+            Some("Shift+Enter/Ctrl+J")
+        );
     }
 
     #[test]

@@ -334,13 +334,22 @@ fn milliseconds(value: Option<u64>) -> String {
 
 /// 写报告到文件；父目录一并创建。
 pub fn write(path: &Path, report: &ExpReport) -> Result<(), Error> {
+    write_json(path, report)
+}
+
+/// 任意可序列化报告的落盘：与 [`write`] 同一口径（pretty JSON + 结尾换行、建父目录）。
+///
+/// `ask` 的报告类型与 [`ExpReport`] 不同，共用这一条写出路径即可，不必各写一份。
+pub fn write_json<T: serde::Serialize>(path: &Path, report: &T) -> Result<(), Error> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, render(report)?)?;
+    let mut text = serde_json::to_string_pretty(report)?;
+    text.push('\n');
+    std::fs::write(path, text)?;
     Ok(())
 }
 

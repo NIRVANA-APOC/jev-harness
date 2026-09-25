@@ -376,10 +376,12 @@ pub mod objects {
     pub const SESSION_ASK: &str = "session.ask";
     /// 每次工具执行的结果（每次执行一个版本）。
     pub const TOOL_RESULT: &str = "tool.result";
+    /// 要写入或修改的文件与内容摘要（每次写/编辑调用一个版本）。
+    pub const FILE_CHANGE: &str = "file.change";
 
     /// 三个对象的标识。
     pub fn all() -> Vec<ObjectId> {
-        [SHELL_COMMAND, SESSION_ASK, TOOL_RESULT]
+        [SHELL_COMMAND, SESSION_ASK, TOOL_RESULT, FILE_CHANGE]
             .into_iter()
             .map(ObjectId::from)
             .collect()

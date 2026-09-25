@@ -6,6 +6,9 @@
 //! - [`judge`]：五种判断器适配同一接口、可配置切换——Jev 真调（`jh-jev`）、LLM 结构化判断
 //!   （`jh-openai`）、确定性规则、录制回放、模拟真值；
 //! - [`tasks`]：初始任务集（中文合成样本：state + 类型化问题 + 隐藏真值）；
+//! - [`ask`]：`jev ask`——**一次**判断调用（单问单答，不采纳、不套门槛、不产生行动）；
+//! - [`session`]：`jev chat` 的会话宿主（模型主循环 + Jev 判定门控 + 审批卡 + 工具执行），
+//!   实现口径见 `docs/tui-design.md` §9；
 //! - [`calls`]：调用记录落盘（JSONL：来源标签、版本、延迟、usage、request_id）；
 //! - [`metrics`]：一致率、Brier、对数损失与延迟分位数的口径实现；
 //! - [`report`] 与 [`exp`]：`jev exp` 的运行与 JSON 基线报告；
@@ -41,6 +44,7 @@
 //!   （`docs/RESEARCH_GOALS.md` §9.2、§10.2）；它不出现在任务族 A 与任务族 B 的对照里。
 #![warn(missing_docs)]
 
+pub mod ask;
 pub mod c_measure;
 pub mod c_program;
 pub mod calls;
@@ -57,6 +61,7 @@ pub mod m4;
 pub mod matching;
 pub mod metrics;
 pub mod promotion;
+pub mod provider;
 pub mod report;
 pub mod session;
 pub mod shadow;

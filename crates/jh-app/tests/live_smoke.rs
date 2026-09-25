@@ -107,9 +107,10 @@ async fn jev_judge_sends_one_real_request() {
     smoke(JudgeName::Jev).await;
 }
 
-/// LLM 真调 smoke：`OPENAI_API_KEY` + `OPENAI_MODEL` + `OPENAI_BASE_URL`（三者都必填）。
+/// LLM 真调 smoke：默认 provider 是 DeepSeek，配 `DEEPSEEK_API_KEY` 即可
+/// （`JEV_LLM_PROVIDER` / `OPENAI_MODEL` / `OPENAI_BASE_URL` 可覆盖，见 `crate::provider`）。
 #[tokio::test]
-#[ignore = "需要 OPENAI_API_KEY / OPENAI_MODEL 与真实网络：cargo test -p jh-app --test live_smoke -- --ignored"]
+#[ignore = "需要 LLM 凭据（默认 DEEPSEEK_API_KEY）与真实网络：cargo test -p jh-app --test live_smoke -- --ignored"]
 async fn llm_judge_sends_one_real_request() {
     smoke(JudgeName::Llm).await;
 }

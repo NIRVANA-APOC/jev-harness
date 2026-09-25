@@ -92,6 +92,34 @@ pub struct ApprovalCard;
 /// 强调轨与内容列的固定偏移（上游 `content_x = area.x + 3`）。
 const CONTENT_X: usize = 3;
 
+/// 审批卡的渲染结果：行 + 选项行上的可点区（供鼠标点击命中，坐标相对卡片左上角）。
+#[derive(Debug, Clone)]
+pub struct ApprovalCardReading {
+    pub lines: Vec<BlockLine>,
+    /// 每个选项在卡片里的位置与它对应的裁决；选项行被折行或裁掉时该选项不进这里
+    /// （宁可点不到，也不要点错）。
+    pub options: Vec<ApprovalOptionHit>,
+}
+
+/// 一个可点的审批选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalOptionHit {
+    /// 行号（相对卡片首行）。
+    pub row: usize,
+    /// 起始列（相对卡片左边缘）。
+    pub column: usize,
+    /// 显示宽度。
+    pub width: usize,
+    /// 命中后执行的动作（与快捷键同一个动作 ID）。
+    pub action: ActionId,
+}
+
+/// 卡片里的一行：普通文本，或「选项行」（要额外记下每个选项的列范围）。
+enum Row {
+    Text(String, ratatui::style::Style),
+    Options(Vec<(String, ActionId)>),
+}
+
 impl ApprovalCard {
     /// 渲染卡片。`max_rows` 是可用高度，超出时折叠并在末尾标出被折掉的行数；
     /// `focused` 为 false 时整体降饱和（失焦）。
@@ -101,7 +129,7 @@ impl ApprovalCard {
         ctx: &BlockCtx,
         focused: bool,
         max_rows: usize,
-    ) -> Vec<BlockLine> {
+    ) -> ApprovalCardReading {
         let rail = ctx.glyphs.resolve(glyphs::accent_bar());
         let ellipsis = ctx.glyphs.resolve(glyphs::ellipsis());
         let separator = ctx.glyphs.resolve(glyphs::separator());
@@ -117,24 +145,76 @@ impl ApprovalCard {
         };
         let body_width = ctx.width.saturating_sub(CONTENT_X).max(1);
 
-        let mut rows: Vec<(String, ratatui::style::Style)> = Vec::new();
-        rows.push((format!("权限请求 {separator} {}", request.tool), accent));
-        rows.push((format!("命令  {}", request.command), body_style));
+        let mut rows: Vec<Row> = Vec::new();
+        rows.push(Row::Text(
+            format!("权限请求 {separator} {}", request.tool),
+            accent,
+        ));
+        rows.push(Row::Text(format!("命令  {}", request.command), body_style));
         if let Some(body) = &request.body {
-            rows.push((body.clone(), ctx.theme.muted()));
+            rows.push(Row::Text(body.clone(), ctx.theme.muted()));
         }
-        let options = ApprovalOption::from_keymap(keymap)
-            .into_iter()
-            .map(|option| format!("{} {}", option.key.display(), option.label))
-            .collect::<Vec<_>>()
-            .join("   ");
-        rows.push((options, accent));
+        rows.push(Row::Options(
+            ApprovalOption::from_keymap(keymap)
+                .into_iter()
+                .map(|option| {
+                    (
+                        format!("{} {}", option.key.display(), option.label),
+                        option.action,
+                    )
+                })
+                .collect(),
+        ));
 
         // 折行：正文按内容列宽换行，装饰轨只画在首行。
         let mut lines: Vec<(String, ratatui::style::Style)> = Vec::new();
-        for (text, style) in rows {
-            for wrapped in width::wrap_words(&text, body_width) {
-                lines.push((wrapped, style));
+        let mut options: Vec<ApprovalOptionHit> = Vec::new();
+        for row in rows {
+            match row {
+                Row::Text(text, style) => {
+                    for wrapped in width::wrap_words(&text, body_width) {
+                        lines.push((wrapped, style));
+                    }
+                }
+                Row::Options(items) => {
+                    let joined = items
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("   ");
+                    let start = lines.len();
+                    let wrapped = width::wrap_words(&joined, body_width);
+                    let single_line = wrapped.len() == 1;
+                    for line in wrapped {
+                        lines.push((line, accent));
+                    }
+                    // 只有整行放得下时才登记可点区：折行与裁剪都会让列范围对不上。
+                    if single_line {
+                        let visible = width::display_width(&width::clip_with_ellipsis(
+                            &joined, body_width, ellipsis,
+                        ));
+                        let mut column = CONTENT_X;
+                        let mut used = 0usize;
+                        for (index, (text, action)) in items.iter().enumerate() {
+                            if index > 0 {
+                                column += 3;
+                                used += 3;
+                            }
+                            let width = width::display_width(text);
+                            if used + width > visible {
+                                break;
+                            }
+                            options.push(ApprovalOptionHit {
+                                row: start,
+                                column,
+                                width,
+                                action: *action,
+                            });
+                            column += width;
+                            used += width;
+                        }
+                    }
+                }
             }
         }
 
@@ -156,7 +236,12 @@ impl ApprovalCard {
             let text = format!("{ellipsis} 已折叠 {collapsed} 行");
             output.push(card_line(rail, rail_style, ctx, &text, ctx.theme.dim()));
         }
-        output
+        // 折叠掉的选项不登记：行号已经不在屏幕上。
+        options.retain(|option| option.row < output.len());
+        ApprovalCardReading {
+            lines: output,
+            options,
+        }
     }
 }
 
@@ -213,7 +298,7 @@ mod tests {
         let request = ApprovalRequest::new("bash", "git push --force origin main")
             .with_body("该命令会改写远端历史");
         let keymap = Keymap::from_defaults();
-        let lines = ApprovalCard::render(&request, &keymap, &ctx(&theme, 60), true, 10);
+        let lines = ApprovalCard::render(&request, &keymap, &ctx(&theme, 60), true, 10).lines;
         assert!(lines.len() >= 4);
         for line in &lines {
             assert!(
@@ -239,6 +324,7 @@ mod tests {
         let keymap = Keymap::from_defaults();
         let request = ApprovalRequest::new("bash", "ls");
         let text: String = ApprovalCard::render(&request, &keymap, &ctx(&theme, 80), true, 10)
+            .lines
             .iter()
             .map(BlockLine::text)
             .collect::<Vec<_>>()
@@ -261,6 +347,7 @@ mod tests {
             KeyChord::plain(crossterm::event::KeyCode::Char('o')),
         )]);
         let text: String = ApprovalCard::render(&request, &remapped, &ctx(&theme, 80), true, 10)
+            .lines
             .iter()
             .map(BlockLine::text)
             .collect::<Vec<_>>()
@@ -273,8 +360,8 @@ mod tests {
         let theme = Theme::DARK;
         let request = ApprovalRequest::new("bash", "ls");
         let keymap = Keymap::from_defaults();
-        let focused = ApprovalCard::render(&request, &keymap, &ctx(&theme, 60), true, 10);
-        let unfocused = ApprovalCard::render(&request, &keymap, &ctx(&theme, 60), false, 10);
+        let focused = ApprovalCard::render(&request, &keymap, &ctx(&theme, 60), true, 10).lines;
+        let unfocused = ApprovalCard::render(&request, &keymap, &ctx(&theme, 60), false, 10).lines;
         assert_eq!(focused.len(), unfocused.len());
         // 降饱和：强调轨不再是警示色，而是弱化样式。
         assert_eq!(
@@ -290,7 +377,7 @@ mod tests {
         let keymap = Keymap::from_defaults();
         let request =
             ApprovalRequest::new("bash", "a".repeat(400)).with_body("很长的说明 ".repeat(20));
-        let lines = ApprovalCard::render(&request, &keymap, &ctx(&theme, 40), true, 5);
+        let lines = ApprovalCard::render(&request, &keymap, &ctx(&theme, 40), true, 5).lines;
         assert!(lines.len() <= 5, "折叠后不得超过可用高度：{}", lines.len());
         assert!(
             lines.last().unwrap().text().contains("已折叠"),

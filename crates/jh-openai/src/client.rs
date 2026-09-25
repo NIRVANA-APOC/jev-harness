@@ -127,12 +127,15 @@ fn retry_after(response: &reqwest::Response) -> Option<String> {
 /// Configures a [`Client`].
 ///
 /// `model` is mandatory — there is no built-in default model; `base_url` falls
-/// back to [`BASE_URL`] and no total request timeout is set unless one is given.
+/// back to [`BASE_URL`]; the API key is read from [`API_KEY_ENV`] unless
+/// [`ClientBuilder::api_key_env`] names another variable; no total request
+/// timeout is set unless one is given.
 #[derive(Debug, Default)]
 pub struct ClientBuilder {
     base_url: Option<String>,
     model: Option<String>,
     timeout: Option<Duration>,
+    api_key_env: Option<&'static str>,
 }
 
 impl ClientBuilder {
@@ -146,6 +149,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Names the environment variable the API key is read from.
+    ///
+    /// Providers that are not OpenAI keep their key under their own variable
+    /// (DeepSeek: `DEEPSEEK_API_KEY`); this crate only knows the name, never the
+    /// value, and the key still comes from the environment either way.
+    pub fn api_key_env(mut self, name: &'static str) -> Self {
+        self.api_key_env = Some(name);
+        self
+    }
+
     /// Caps the whole request, including the time spent reading a stream.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -153,7 +166,11 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client, Error> {
-        let api_key = std::env::var(API_KEY_ENV).map_err(|_| Error::MissingApiKey(API_KEY_ENV))?;
+        let key_env = self.api_key_env.unwrap_or(API_KEY_ENV);
+        let api_key = std::env::var(key_env)
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or(Error::MissingApiKey(key_env))?;
         let model = self.model.ok_or(Error::Config("model is required"))?;
 
         let mut http = reqwest::Client::builder();

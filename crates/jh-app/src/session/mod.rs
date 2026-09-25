@@ -37,7 +37,9 @@
 mod agent;
 mod approval;
 mod gate;
+mod log;
 mod model;
+mod store;
 mod tools;
 mod tui;
 mod view;
@@ -56,9 +58,11 @@ use crate::calls::CallLog;
 use crate::judge::{self, JudgeName};
 
 pub use agent::{Agent, AgentConfig, DEFAULT_MAX_ROUNDS, Stats, Step, Update};
-pub use approval::ApprovalPolicy;
+pub use approval::{ApprovalPolicy, PermissionMode};
 pub use gate::DEFAULT_WINDOW as DEFAULT_DEBOUNCE;
+pub use log::{SessionEvent, SessionLog, read_events};
 pub use model::{Model, ResponsesModel};
+pub use store::{ConversationLog, SessionList, SessionMeta, SessionStore};
 pub use tools::Tools;
 
 /// `jev chat` 的运行参数（CLI 给，缺省值见 `main.rs` 的 `ChatArgs`）。
@@ -85,28 +89,90 @@ pub struct ChatOptions {
 /// 缺凭据**不**阻止进入界面：判定器缺凭据时门控如实标「不可用」（交人工裁决），模型缺配置时
 /// 提交后如实上屏失败原因，界面本身照常可用（`AGENTS.md`「不虚构」）。
 pub async fn chat(options: ChatOptions) -> Result<Stats, crate::Error> {
-    std::fs::create_dir_all(&options.out_dir)?;
+    // **不在这里建目录**：`jev chat` 开着不用时不该在磁盘上留痕（目录由第一次落盘创建，
+    // 见 `Agent::ensure_session`）。证据日志的 `open` 只读不建，第一次追加前目录已经在。
     let state = SemanticState::new(Box::new(JsonlEvidenceLog::open(
         options.out_dir.join("evidence.jsonl"),
     )?));
     let calls = CallLog::open(options.calls_path.clone())?;
 
+    // 会话历史：目录由 main.rs 决定（缺省 `~/.jev-harness/sessions/<run>`）。
+    // **这里不建任何文件**：Agent 在第一次提交时才落盘（开着不用的会话不该留空目录）。
+    // 取不到根目录时不阻断会话——`/sessions` 与 `/resume` 会如实说「历史不可用」。
+    let store = SessionStore::open_default().ok();
+
     let channels = channels(options.judge);
+    let model_label = channels.model_label.clone();
+    // 日志里的 model 只写模型标识本身（信息行是另一回事，别把整行塞进这个字段）。
+    let log_model = model_label.clone();
+    let judge_label = options.judge.cli_name().to_owned();
+
+    // 开场事件：延迟到第一次落盘时写，于是日志永远以 `session_start` 开头。
+    let session_start = SessionEvent::SessionStart {
+        at_unix_ms: crate::exp::unix_ms(),
+        run: options.run.clone(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        workspace: options.workspace.display().to_string(),
+        judge: judge_label.clone(),
+        model: log_model.clone(),
+        max_rounds: options.max_rounds,
+        debounce_ms: options.debounce.as_millis() as u64,
+        color: String::new(),
+        glyphs: String::new(),
+        tty: false,
+    };
     let mut agent = Agent::new(AgentConfig {
-        workspace: options.workspace,
+        workspace: options.workspace.clone(),
         judge_name: options.judge,
         judge: channels.judge,
         model: channels.model,
-        model_label: channels.model_label,
-        run: options.run,
+        model_label,
+        run: options.run.clone(),
         state,
         calls,
         debounce: options.debounce,
         max_rounds: options.max_rounds,
+        session_dir: Some(options.out_dir.clone()),
+        session_start: Some(session_start),
+        store,
+        session_id: options.run.clone(),
     })?;
 
     let capabilities = Capabilities::detect();
-    tui::run(&mut agent, &capabilities).await
+    // 开场事件里的环境读数要等能力探测出来才知道：补进 Agent 手里那份待写事件。
+    agent.set_session_start_env(
+        format!("{:?}", capabilities.color).to_ascii_lowercase(),
+        format!("{:?}", capabilities.glyphs).to_ascii_lowercase(),
+        capabilities.is_tty,
+    );
+
+    let started_at_unix_ms = crate::exp::unix_ms();
+    let outcome = tui::run(&mut agent, &capabilities).await;
+
+    // 收尾：结束事件 + 会话摘要（失败也照写，方便事后看出这次是异常结束的）。
+    let stats = agent.stats();
+    if let Some(error) = agent.log_event(SessionEvent::SessionEnd {
+        at_unix_ms: crate::exp::unix_ms(),
+        duration_ms: crate::exp::unix_ms().saturating_sub(started_at_unix_ms),
+        turns: stats.turns,
+        model_calls: stats.model_calls,
+        tool_calls: stats.tool_calls,
+        judgments: stats.judgments,
+        judge_reuses: stats.judge_reuses,
+        refusals: stats.refusals,
+        denials: stats.denials,
+    }) {
+        eprintln!("会话日志没写上：{error}");
+    }
+    // 只有真的落过盘（提交过或 `/resume` 过）才写收尾摘要：
+    // 一次没用过的会话本来就没目录，也不该在这一步补一个出来。
+    if agent.session_started()
+        && let Some(store) = agent.store()
+        && let Err(error) = store.write_meta(&agent.meta())
+    {
+        eprintln!("会话摘要没写上：{error}");
+    }
+    outcome.map(|_| stats)
 }
 
 /// 取通道错误的一句话原因。

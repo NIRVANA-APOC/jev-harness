@@ -116,6 +116,36 @@ fn scrollback_snapshot_scrolled_up_shifts_the_window() {
 }
 
 #[test]
+fn assistant_block_snapshot_renders_the_markdown_subset() {
+    let theme = capabilities().theme();
+    let ctx = ctx_for(&theme, 40);
+    // 一张图看全子集：标题 / 列表（行内代码与链接）/ 引用 / 代码块 / 分隔线。
+    let block = Block::assistant(
+        "# 结论\n\n- 先看 `git status`\n- 再看 [文档](https://x.dev)\n\n> 引用一行\n\n```rust\nlet a = **1**;\n```\n\n---",
+    );
+    let output = block.output(&ctx);
+    let screen = render_lines(
+        40,
+        14,
+        output.lines.into_iter().map(|line| line.content).collect(),
+    );
+    assert_screen(
+        &screen,
+        "◆ 结论
+
+  • 先看 git status
+  • 再看 文档 (https://x.dev)
+
+  ▏ 引用一行
+
+    rust
+    let a = **1**;
+
+  ──────────────────────────────────────",
+    );
+}
+
+#[test]
 fn streaming_assistant_snapshot_marks_the_growing_text() {
     let mut app = App::new(&capabilities());
     app.set_viewport(44, 8, 40);
@@ -219,7 +249,7 @@ fn prompt_snapshot_renders_multiline_input_flat() {
         40,
         2,
         prompt
-            .render(&ctx, &PromptChrome::default(), true)
+            .render(&ctx, &PromptChrome::default(), true, "Shift+Enter/Ctrl+J")
             .into_iter()
             .map(|line| line.content)
             .collect(),
@@ -237,7 +267,7 @@ fn prompt_snapshot_soft_wraps_long_input_flat() {
     let ctx = ctx_for(&theme, 24);
     let prompt =
         Prompt::with_text("这是一条很长的输入，用来验证软折行之后每一行都不会超过内容宽度。");
-    let lines = prompt.render(&ctx, &PromptChrome::default(), true);
+    let lines = prompt.render(&ctx, &PromptChrome::default(), true, "Shift+Enter/Ctrl+J");
     let screen = render_lines(
         24,
         lines.len() as u16,
@@ -259,7 +289,7 @@ fn prompt_snapshot_draws_the_box_with_title_and_info() {
     let chrome = PromptChrome::default()
         .with_title("会话 1")
         .with_info("deepseek-chat · jev-1.13.0 · always-approve");
-    let lines = prompt.render(&ctx, &chrome, true);
+    let lines = prompt.render(&ctx, &chrome, true, "Shift+Enter/Ctrl+J");
     let screen = render_lines(
         40,
         lines.len() as u16,
@@ -285,7 +315,7 @@ fn prompt_snapshot_degrades_without_color_and_glyphs() {
     };
     let prompt = Prompt::with_text("hi");
     let chrome = PromptChrome::default().with_info("未接线");
-    let lines = prompt.render(&ctx, &chrome, false);
+    let lines = prompt.render(&ctx, &chrome, false, "Shift+Enter/Ctrl+J");
     let screen = render_lines(
         30,
         lines.len() as u16,
@@ -381,11 +411,11 @@ fn shortcut_bar_snapshot_lists_registry_hints() {
     let theme = capabilities().theme();
     let ctx = ctx_for(&theme, 72);
     let keymap = jh_tui::actions::Keymap::from_defaults();
-    let bar = ShortcutBar::render(&ctx, &keymap, KeyOwner::Prompt);
+    let bar = ShortcutBar::render(&ctx, &keymap, KeyOwner::Prompt).line;
     let screen = render_lines(72, 1, vec![bar.content]);
     assert_screen(
         &screen,
-        "Ctrl+c 退出 · Esc 取消 · Enter 发送 · Alt+Enter 换行 · PgUp 上翻 …",
+        "Ctrl+c 退出 · Esc 取消 · Enter 发送 · Shift+Enter/Ctrl+J 换行 …",
     );
 }
 
@@ -394,7 +424,7 @@ fn shortcut_bar_snapshot_truncates_on_a_narrow_screen() {
     let theme = capabilities().theme();
     let ctx = ctx_for(&theme, 24);
     let keymap = jh_tui::actions::Keymap::from_defaults();
-    let bar = ShortcutBar::render(&ctx, &keymap, KeyOwner::Prompt);
+    let bar = ShortcutBar::render(&ctx, &keymap, KeyOwner::Prompt).line;
     let screen = render_lines(24, 1, vec![bar.content]);
     // 整条放不下的提示直接丢掉，不留半截。
     assert_screen(&screen, "Ctrl+c 退出 · Esc 取消 …");
@@ -405,7 +435,7 @@ fn shortcut_bar_snapshot_for_the_research_screen() {
     let theme = capabilities().theme();
     let ctx = ctx_for(&theme, 84);
     let keymap = jh_tui::actions::Keymap::from_defaults();
-    let bar = ShortcutBar::render(&ctx, &keymap, KeyOwner::Research);
+    let bar = ShortcutBar::render(&ctx, &keymap, KeyOwner::Research).line;
     let screen = render_lines(84, 1, vec![bar.content]);
     assert_screen(
         &screen,
@@ -420,7 +450,7 @@ fn approval_card_snapshot_renders_rail_body_and_options() {
     let request = ApprovalRequest::new("bash", "git push --force origin main")
         .with_body("该命令会改写远端历史，且无法从本地恢复。");
     let ctx = ctx_for(&theme, 52);
-    let lines = ApprovalCard::render(&request, &keymap, &ctx, true, 8);
+    let lines = ApprovalCard::render(&request, &keymap, &ctx, true, 8).lines;
     let screen = render_lines(
         52,
         lines.len() as u16,
@@ -441,7 +471,7 @@ fn approval_card_snapshot_recedes_when_unfocused() {
     let keymap = jh_tui::actions::Keymap::from_defaults();
     let request = ApprovalRequest::new("bash", "ls -la");
     let ctx = ctx_for(&theme, 40);
-    let lines = ApprovalCard::render(&request, &keymap, &ctx, false, 8);
+    let lines = ApprovalCard::render(&request, &keymap, &ctx, false, 8).lines;
     let (screen, buffer) = render_lines_cells(
         40,
         lines.len() as u16,
@@ -456,7 +486,7 @@ fn approval_card_snapshot_recedes_when_unfocused() {
     // 失焦的判定打在缓冲区单元格上：强调轨不是警示色，而是弱化色。
     assert_eq!(buffer[(0, 0)].fg, theme.gray_dim);
 
-    let focused = ApprovalCard::render(&request, &keymap, &ctx, true, 8);
+    let focused = ApprovalCard::render(&request, &keymap, &ctx, true, 8).lines;
     let (_, focused_buffer) = render_lines_cells(
         40,
         focused.len() as u16,
@@ -535,7 +565,7 @@ fn startup_screen_snapshot_has_the_centered_panel() {
 
 
 ╭──────────────────────────────────────────────────────────────────────────╮
-│ ❯ 输入消息，Enter 发送，Alt+Enter 换行                                   │
+│ ❯ Enter 发送，Shift+Enter/Ctrl+J 换行 · Ctrl+Shift+V 粘贴 · /help 看命令 │
 ╰─ 未接线 · 不调用模型与 API ──────────────────────────────────────────────╯
                                                                rule · 未接线",
     );
@@ -567,7 +597,7 @@ fn agent_screen_snapshot_has_every_component() {
 ╭──────────────────────────────────────────────────────────────────────────╮
 │ ❯ 顺便看一下 CI 配置                                                     │
 ╰─ deepseek-chat · jev-1.13.0 · always-approve ────────────────────────────╯
-Ctrl+c 退出 · Esc 取消 · Enter 发送 · Alt+Enter 换行 · PgUp 上翻 …",
+Ctrl+c 退出 · Esc 取消 · Enter 发送 · Shift+Enter/Ctrl+J 换行 · PgUp 上翻 …",
     );
 }
 

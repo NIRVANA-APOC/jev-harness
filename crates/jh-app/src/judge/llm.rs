@@ -67,11 +67,7 @@ pub struct LlmJudge {
 }
 
 impl LlmJudge {
-    /// 从环境变量构造：`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 三者都必填。
-    ///
-    /// 端点不设默认值：`jh-openai` 的缺省端点是官方 `https://api.openai.com/v1`，而本项目 LLM 侧
-    /// 走的是 DeepSeek；只给模型不给端点会把 key 发到不是本人配置的端点上，所以宁可显式失败。
-    /// 自建兼容端点写成不带尾斜杠的形式（例如 `https://api.deepseek.com`）。
+    /// 从环境变量构造（provider 解析见 [`crate::provider`]：默认 DeepSeek，缺配置显式失败）。
     pub fn from_env() -> Result<Self, Error> {
         Ok(Self {
             client: from_env_client()?,
@@ -93,26 +89,16 @@ pub(crate) struct Completion {
     pub latency: Duration,
 }
 
-/// 从环境变量构造 `jh-openai` 客户端：`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 三者都必填。
+/// 从环境变量构造 `jh-openai` 客户端。
 ///
-/// 结构化判断与候选问题生成（M19 的生成步骤）共用这一份构造：两条路都走同一个模型、同一个端点、
-/// 同一套「缺配置就显式失败」的口径。
+/// 端点、模型与密钥变量都由 [`crate::provider`] 解析：**默认 provider 是 DeepSeek**，只配
+/// `DEEPSEEK_API_KEY` 就能跑；`OPENAI_BASE_URL` / `OPENAI_MODEL` 仍可覆盖。结构化判断与候选问题
+/// 生成（M19 的生成步骤）共用这一份构造：两条路都走同一个模型、同一个端点、同一套「缺配置就
+/// 显式失败」的口径。
 pub(crate) fn from_env_client() -> Result<jh_openai::Client, Error> {
-    let model = std::env::var("OPENAI_MODEL").map_err(|_| {
-        Error::Unavailable("缺少 OPENAI_MODEL：LLM 通道必须显式给出模型 ID".to_owned())
-    })?;
-    let base_url = std::env::var("OPENAI_BASE_URL").map_err(|_| {
-        Error::Unavailable(
-            "缺少 OPENAI_BASE_URL：LLM 通道必须显式给出端点，\
-             否则 key 会被发往 jh-openai 的官方缺省端点"
-                .to_owned(),
-        )
-    })?;
-
-    jh_openai::Client::builder()
-        .model(model)
-        .base_url(base_url)
-        .timeout(DEFAULT_TIMEOUT)
+    let config = crate::provider::from_env()?;
+    config
+        .client_builder(DEFAULT_TIMEOUT)
         .build()
         .map_err(map_error)
 }

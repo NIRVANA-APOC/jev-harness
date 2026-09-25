@@ -10,13 +10,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jh_core::{
-    Answer, ChoiceAnswer, Error, Judge, JudgeRequest, JudgeResponse, JudgeSource, QuestionId,
-};
+use jh_core::{Answer, ChoiceAnswer, Error, Judge, JudgeRequest, JudgeResponse, JudgeSource};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::session::gate::{OPTION_ALLOW, OPTION_DENY, QUESTION_ID};
+use crate::session::gate::{OPTION_ALLOW, OPTION_DENY};
 use crate::session::model::{Model, ModelFuture, ModelRequest, ModelTurn, ToolCall};
 
 /// 临时目录：建在系统临时目录下，`Drop` 时删掉。
@@ -69,7 +67,7 @@ struct ChoiceStub {
 impl Judge for ChoiceStub {
     fn judge<'a>(
         &'a self,
-        _request: &'a JudgeRequest,
+        request: &'a JudgeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<JudgeResponse, Error>> + Send + 'a>> {
         Box::pin(async move {
             let probabilities = std::collections::BTreeMap::from([
@@ -81,17 +79,25 @@ impl Judge for ChoiceStub {
             } else {
                 OPTION_DENY
             };
+            // 请求里问什么就答什么（真判定器也是这样）：`/jev` 的问题 ID 与门控不同。
+            let answers = request
+                .questions
+                .keys()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        Answer::Choice(ChoiceAnswer {
+                            choice: choice.to_owned(),
+                            probabilities: probabilities.clone(),
+                            confidence: self.confidence,
+                        }),
+                    )
+                })
+                .collect();
             Ok(JudgeResponse {
                 source: JudgeSource::RealApi,
                 version: "stub-1".to_owned(),
-                answers: std::collections::BTreeMap::from([(
-                    QuestionId::from(QUESTION_ID),
-                    Answer::Choice(ChoiceAnswer {
-                        choice: choice.to_owned(),
-                        probabilities,
-                        confidence: self.confidence,
-                    }),
-                )]),
+                answers,
                 usage: None,
                 request_id: Some("req-stub".to_owned()),
             })

@@ -16,12 +16,14 @@
 //! cargo run -p jh-app -- h4 --contracts var/.../contracts.json --tests var/.../tests.json
 //! ```
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use jh_app::ask::{self, AskOptions};
 use jh_app::compare::{self, CompareOptions};
 use jh_app::exp::{self, RunOptions};
 use jh_app::family::FamilyA;
@@ -50,19 +52,19 @@ struct Cli {
 enum Command {
     /// 交互式对话（TUI）：真实模型 + Jev 判定门控 + 工具审批
     Chat(ChatArgs),
-    /// 单次 Jev 判定
-    Ask,
-    /// 跑一个任务族 A 任务的匹配循环（端到端）
+    /// 单次判定：一个问题 + 一组选项，出一份读数（不采纳、不产生行动）
+    Ask(AskArgs),
+    /// 研究臂：跑一个任务族 A 任务的匹配循环（端到端；逐任务排查用）
     Run(RunArgs),
-    /// 实验：跑初始任务集并输出 JSON 基线
+    /// 研究臂：跑初始任务集并输出 JSON 基线（M0 读数；最小的一条端到端）
     Exp(ExpArgs),
-    /// 对照：H1（依赖失效传播开 / 关）× H2（增量 / 全量）四组臂跑任务族 A
+    /// 研究臂：H1 × H2 四组臂跑任务族 A（M1 读数；报告见 docs/m4-report.md）
     Compare(CompareArgs),
-    /// H3：固定问题集合 vs 允许精化（任务族 B），一条命令出 JSON 报告
+    /// 研究臂：H3 固定问题集合 vs 允许精化（任务族 B；M2 读数）
     H3(H3Args),
-    /// H4：任务族 C 的三臂对照（固定测试 / 通用测试生成 / 建设观测器），一条命令出 JSON 报告
+    /// 研究臂：H4 三臂对照（固定测试 / 通用测试生成 / 建设观测器；M3 读数）
     H4(H4Args),
-    /// M4：主对照 2×2（循环式控制/依赖维护 × LLM/Jev）+ 诊断对照 + 原生基线 + 两条残余消融 + 密度扫描
+    /// 研究臂：M4 综合评估（主对照 2×2 + 诊断对照 + 原生基线 + 两条残余消融 + 密度扫描）
     M4(M4Args),
 }
 
@@ -120,13 +122,13 @@ struct ChatArgs {
     /// 防抖窗口（秒）：同一条命令在窗口内复用上一次判定
     #[arg(long = "debounce", default_value_t = 30, value_name = "SECONDS")]
     debounce: u64,
-    /// 本轮模型调用上限
-    #[arg(long = "max-rounds", default_value_t = 8, value_name = "N")]
+    /// 本轮模型调用上限；0 = 不限（缺省 32）
+    #[arg(long = "max-rounds", default_value_t = session::DEFAULT_MAX_ROUNDS, value_name = "N")]
     max_rounds: usize,
     /// 调用记录落盘路径（JSONL，追加写）
     #[arg(long = "calls", default_value = "var/calls.jsonl", value_name = "FILE")]
     calls: PathBuf,
-    /// 运行产物目录（证据文件写这里）；缺省 var/chat/<run>
+    /// 会话目录（证据与会话日志写这里）；缺省 ~/.jev-harness/sessions/<run>
     #[arg(long = "out-dir", value_name = "DIR")]
     out_dir: Option<PathBuf>,
 }
@@ -178,6 +180,29 @@ struct H3Args {
     #[arg(long = "out-dir", value_name = "DIR")]
     out_dir: Option<PathBuf>,
     /// 报告输出路径；缺省 var/h3/<run>.json
+    #[arg(long = "out", value_name = "FILE")]
+    out: Option<PathBuf>,
+}
+
+/// `jev ask`：单次判定。
+#[derive(Args)]
+struct AskArgs {
+    /// 要判定什么（写进问题的 instructions，越具体越好）
+    #[arg(long = "question", value_name = "TEXT")]
+    question: String,
+    /// 选项名；至少两个，可重复（顺序即上屏顺序）
+    #[arg(long = "label", value_name = "NAME", required = true)]
+    labels: Vec<String>,
+    /// 给某个选项补一句判据：`--describe allow=证据齐全`
+    #[arg(long = "describe", value_name = "NAME=TEXT")]
+    describes: Vec<String>,
+    /// 交给判定器的材料（一段文本）；不给就是「没有附加材料」
+    #[arg(long = "material", value_name = "TEXT")]
+    material: Option<String>,
+    /// 用哪个判定器（`ask` 只支持不需要任务集的三个）
+    #[arg(long = "judge", value_enum, default_value_t = JudgeName::Jev)]
+    judge: JudgeName,
+    /// 报告落盘路径（JSON）
     #[arg(long = "out", value_name = "FILE")]
     out: Option<PathBuf>,
 }
@@ -262,10 +287,7 @@ struct ExpArgs {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Chat(args) => run_chat(args).await,
-        Command::Ask => {
-            eprintln!("未实现");
-            ExitCode::from(2)
-        }
+        Command::Ask(args) => run_ask(args).await,
         Command::Run(args) => run_task(args).await,
         Command::Exp(args) => run_exp(args).await,
         Command::Compare(args) => run_compare(args).await,
@@ -374,6 +396,48 @@ async fn run_m4(args: M4Args) -> ExitCode {
     }
 }
 
+/// `jev ask`：一次判定，出一份读数。
+///
+/// 不打任务集、不进会话：**只问一句**。缺凭据、选项不合法、判定器不支持一律显式退 2。
+async fn run_ask(args: AskArgs) -> ExitCode {
+    let mut describes = BTreeMap::new();
+    for spec in &args.describes {
+        let Some((name, text)) = spec.split_once('=') else {
+            eprintln!("--describe 的写法是 `--describe 选项名=说明`，收到：{spec}");
+            return ExitCode::from(2);
+        };
+        describes.insert(name.trim().to_owned(), text.trim().to_owned());
+    }
+    let options = AskOptions {
+        question: args.question,
+        labels: args.labels,
+        describes,
+        material: args.material,
+        judge: args.judge,
+        run: compare::new_run_id(),
+    };
+    let report = match ask::ask(options).await {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("判定失败：{error}");
+            return ExitCode::from(2);
+        }
+    };
+    for line in ask::lines(&report) {
+        println!("{line}");
+    }
+    if let Some(path) = &args.out {
+        match report::write_json(path, &report) {
+            Ok(()) => println!("报告：{}", path.display()),
+            Err(error) => {
+                eprintln!("报告没写上：{error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// `jev chat`：进真实终端跑会话，退出时打一行读数。
 async fn run_chat(args: ChatArgs) -> ExitCode {
     // TUI 要有真终端才有 raw mode / 备用屏可言：管道里跑只会得到一串转义序列。
@@ -392,10 +456,18 @@ async fn run_chat(args: ChatArgs) -> ExitCode {
         },
     };
     let run = compare::new_run_id();
-    let out_dir = args
-        .out_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("var/chat/{run}")));
+    // 会话历史默认落在 `~/.jev-harness/sessions/<run>`（`JEV_HARNESS_HOME` 可覆盖）；
+    // 取不到根目录时如实说一句再退回工作区的 `var/chat/<run>`，不假装历史可用。
+    let out_dir = match args.out_dir.clone() {
+        Some(dir) => dir,
+        None => match session::SessionStore::open_default() {
+            Ok(store) => store.paths(&run).dir,
+            Err(error) => {
+                eprintln!("会话历史目录取不到（{error}）；本次产物改落 var/chat/{run}");
+                PathBuf::from(format!("var/chat/{run}"))
+            }
+        },
+    };
     let options = ChatOptions {
         workspace,
         judge: args.judge,

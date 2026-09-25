@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use crossterm::event::EventStream;
 use futures::StreamExt;
-use jh_tui::app::{App, Effect};
+use jh_tui::app::{App, CommandCall, Effect};
 use jh_tui::blocks::Block;
 use jh_tui::components::{PromptChrome, StatusModel};
 use jh_tui::render;
@@ -39,6 +39,19 @@ use crate::session::tools::ToolOutcome;
 
 /// 进门控判定的 future。
 type GateFuture = Pin<Box<dyn Future<Output = GateDecision>>>;
+/// `/jev` 手工判定的 future：结果是判定器响应（或显式失败）加上这次调用的耗时。
+/// 判定器句柄是 `Arc<dyn Judge>`（无 `Send` 约束，与门控那条 future 同一情形），
+/// 所以这里不要求 `Send`：整个会话循环跑在同一个任务里。
+type JudgeAskFuture =
+    Pin<Box<dyn Future<Output = (Result<jh_core::JudgeResponse, jh_core::Error>, u64)>>>;
+
+/// `/jev` 的在途状态：判定调用 + 发起时留下的问题读数（结果回来时配着它结算）。
+#[derive(Default)]
+struct JudgeAsk {
+    future: Option<JudgeAskFuture>,
+    pending: Option<crate::ask::QuestionReport>,
+}
+
 /// 进工具执行的 future。
 type ToolFuture = Pin<Box<dyn Future<Output = ToolOutcome> + Send>>;
 
@@ -69,16 +82,24 @@ async fn session_loop(
     let mut model_future: Option<ModelFuture> = None;
     let mut model_deltas: Option<UnboundedReceiver<String>> = None;
     let mut gate_future: Option<GateFuture> = None;
+    // `/jev` 的在途状态（判定 future + 发起时留下的问题读数）。
+    let mut judge_ask = JudgeAsk::default();
     let mut tool_future: Option<ToolFuture> = None;
     // 研究视图按了单步：暂停中也放行一格。
     let mut step_requested = true;
 
     while !app.should_quit() {
-        // 1) 三条件重绘闸门：dirty ∧ 无在途帧 ∧ writer 排空（画完 flush 再 ack）。
+        // 1) 三条件重绘闸门：dirty ∧ 无在途帧 ∧ writer 排空（`Terminal::draw` 内部已把这一帧写进
+        //    后端并调 `Backend::flush`，画完即可 ack）。
+        //
+        //    这里**不能**再补一次 `Terminal::flush()`：ratatui 的 `try_draw` 在写完 diff 后会调
+        //    `swap_buffers()`，把「上一帧」那块缓冲重置成空白；此时 `previous` 是空缓冲、
+        //    `current` 才是刚上屏的帧，再 flush 会把这一帧当成「与空白不同的差异」写回空格——
+        //    等于每帧画完立刻自己擦掉。首屏只剩右下注解、提交后整屏空白都是这个原因；
+        //    回归测试 `an_extra_terminal_flush_after_draw_wipes_the_frame` 钉住这条语义。
         if app.gate().should_draw() {
             let sequence = app.gate_mut().queue_frame();
             terminal.draw(|frame| render::draw(frame, app))?;
-            terminal.flush()?;
             app.gate_mut().acknowledge(sequence);
         }
 
@@ -86,7 +107,8 @@ async fn session_loop(
         let busy = model_future.is_some()
             || model_deltas.is_some()
             || gate_future.is_some()
-            || tool_future.is_some();
+            || tool_future.is_some()
+            || judge_ask.future.is_some();
         let mut advanced = false;
         if !busy && (!app.paused() || step_requested) {
             step_requested = false;
@@ -121,7 +143,8 @@ async fn session_loop(
             event = events.next() => {
                 match event {
                     Some(Ok(event)) => {
-                        interrupt = handle_event(app, agent, event, &mut step_requested);
+                        interrupt =
+                            handle_event(app, agent, event, &mut step_requested, &mut judge_ask);
                     }
                     // 输入通道断了（终端关了、stdin 关了）：退出循环，走正常恢复路径。
                     Some(Err(_)) | None => break,
@@ -145,6 +168,23 @@ async fn session_loop(
                 tool_future = None;
                 apply(app, agent.on_tool_result(outcome));
             }
+            (result, latency_ms) = poll_judge_ask(&mut judge_ask.future), if judge_ask.future.is_some() => {
+                judge_ask.future = None;
+                // 问题读数在发起时就留下了；真丢了也要如实说，不编一份出来。
+                match judge_ask.pending.take() {
+                    Some(question) => {
+                        let mut updates = Vec::new();
+                        agent.on_manual_judgment(result, latency_ms, question, &mut updates);
+                        apply(app, updates);
+                    }
+                    None => {
+                        app.push_block(Block::plain_notice(
+                            "`/jev` 的结果对不上这次请求：读数没有记下来".to_owned(),
+                        ));
+                        app.gate_mut().mark_dirty();
+                    }
+                }
+            }
             _ = &mut sleep => {
                 app.advance_tick();
             }
@@ -156,6 +196,8 @@ async fn session_loop(
             model_deltas = None;
             gate_future = None;
             tool_future = None;
+            judge_ask.future = None;
+            judge_ask.pending = None;
         }
 
         // 4) 卡片被 Esc 关掉但没给裁决：这次调用不执行，如实回给模型。
@@ -172,6 +214,7 @@ fn handle_event(
     agent: &mut Agent,
     event: crossterm::event::Event,
     step: &mut bool,
+    judge_ask: &mut JudgeAsk,
 ) -> bool {
     let Some(effect) = app.handle_event(event) else {
         return false;
@@ -196,6 +239,67 @@ fn handle_event(
         }
         Effect::Approval(outcome) => {
             apply(app, agent.on_approval(outcome));
+            false
+        }
+        // 会话命令：参数与会话状态都在宿主这边，界面只负责分流与上屏。
+        Effect::Command(call) => {
+            // `/jev` 要调判定器（可能过网络）：交给在途 future，别在事件循环里等。
+            if call.name == "jev" {
+                match agent.manual_judgment_request(&call.args) {
+                    Ok((request, question)) => match agent.judge_handle() {
+                        Some(judge) => {
+                            let prompt = question.instructions.clone();
+                            judge_ask.pending = Some(question);
+                            let started = Instant::now();
+                            judge_ask.future = Some(Box::pin(async move {
+                                (
+                                    judge.judge(&request).await,
+                                    started.elapsed().as_millis() as u64,
+                                )
+                            }));
+                            app.push_block(Block::plain_notice(format!(
+                                "问到判定器了（{prompt}）：等它回答…"
+                            )));
+                            app.gate_mut().mark_dirty();
+                        }
+                        None => {
+                            app.push_block(Block::plain_notice(
+                                "`/jev` 用不了：这次会话没有可用的判定器（启动时的提示说了原因）"
+                                    .to_owned(),
+                            ));
+                            app.gate_mut().mark_dirty();
+                        }
+                    },
+                    Err(error) => {
+                        app.push_block(Block::plain_notice(error));
+                        app.gate_mut().mark_dirty();
+                    }
+                }
+                return false;
+            }
+            apply(app, agent.on_command(call));
+            false
+        }
+        // 拖选结束：把文本送进终端剪贴板（OSC 52）。终端不支持时它会静默忽略，
+        // 所以回执只说「送出去了」，不替终端打包票。
+        Effect::Copy { text, rows } => {
+            let bytes = text.len();
+            let text = match jh_tui::terminal::copy_to_clipboard(&text) {
+                Ok(()) => format!("已复制 {rows} 行 / {bytes} 字节（OSC 52；终端不支持时不生效）"),
+                Err(error) => format!("复制失败：{error}"),
+            };
+            app.push_block(Block::plain_notice(text));
+            false
+        }
+        // 选项列表里按了 Enter：用选中的值执行那一条命令（命令名跟着列表走）。
+        Effect::Choice { command, value } => {
+            apply(
+                app,
+                agent.on_command(CommandCall {
+                    name: command,
+                    args: value,
+                }),
+            );
             false
         }
         Effect::Step => {
@@ -263,6 +367,12 @@ fn apply(app: &mut App, updates: Vec<Update>) {
                 });
             }
             Update::HeaderTitle(title) => app.header_model_mut().title = title,
+            // 命令的选项列表：界面开选择列表（`↑↓` 选、`Enter` 用选中的值执行命令）。
+            Update::Choices {
+                command,
+                title,
+                entries,
+            } => app.open_choices(command, title, entries),
         }
     }
     let demand = app.tick_demand();
@@ -295,6 +405,16 @@ async fn next_delta(deltas: &mut Option<UnboundedReceiver<String>>) -> Option<St
 async fn poll_model(
     future: &mut Option<ModelFuture>,
 ) -> Result<crate::session::model::ModelTurn, jh_core::Error> {
+    match future {
+        Some(future) => future.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 轮询 `/jev` 的判定调用；没有在途调用时让它永远挂起。
+async fn poll_judge_ask(
+    future: &mut Option<JudgeAskFuture>,
+) -> (Result<jh_core::JudgeResponse, jh_core::Error>, u64) {
     match future {
         Some(future) => future.as_mut().await,
         None => std::future::pending().await,
@@ -379,6 +499,10 @@ mod tests {
             calls,
             debounce: std::time::Duration::from_secs(30),
             max_rounds: 4,
+            session_dir: None,
+            session_start: None,
+            store: None,
+            session_id: "tui-test".to_owned(),
         })
         .expect("建会话");
         agent.submit("第一句".to_owned());
@@ -402,7 +526,8 @@ mod tests {
             &mut app,
             &mut agent,
             enter,
-            &mut step_requested
+            &mut step_requested,
+            &mut JudgeAsk::default()
         ));
 
         assert_eq!(agent.stats().turns, 1, "忙碌中不开第二轮");
@@ -414,6 +539,35 @@ mod tests {
         let screen = screen(&mut app);
         assert!(screen.contains("还在跑"), "{screen}");
         assert!(screen.contains("第二句"), "{screen}");
+    }
+
+    /// 回归：`Terminal::draw` 已经把这一帧写进后端并交换缓冲，宿主**不得**在它之后再调
+    /// `Terminal::flush()`——那时 `previous` 已被 `swap_buffers()` 重置成空白，再 flush 会把
+    /// 刚画的内容当成「差异」写回空格，等于每帧画完立刻自己擦掉。M25 起首屏只剩右下注解、
+    /// 提交后整屏空白，根因就是这一行多余的 flush（实测：164×40 与 80×24 恢复）。
+    #[test]
+    fn an_extra_terminal_flush_after_draw_wipes_the_frame() {
+        let mut app = app();
+        app.set_screen(Screen::Startup);
+        app.set_startup_note("rule · 未接线");
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("TestBackend");
+
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .expect("绘制不失败");
+        let drawn = render::screen_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            drawn.contains("新建会话"),
+            "draw 之后后端就该持有这一帧：{drawn}"
+        );
+
+        // 这一调用正是宿主必须避免的：它把刚上屏的帧擦掉。
+        terminal.flush().expect("flush 不失败");
+        let wiped = render::screen_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            !wiped.contains("新建会话"),
+            "再 flush 一次会擦掉这一帧，宿主不得补这一调用：{wiped}"
+        );
     }
 
     /// P1-1 的回归：宿主必须喂 `TickDemand`，否则 `poll_timeout()` 永远是空闲长睡，

@@ -2,7 +2,7 @@
 //!
 //! 设计来源：`docs/grok-tui-design.md` §4.4 与专题
 //! `docs/research/grok-tui/11-prompt-widget.md`（软折行是显示层缓存、纵向移动走**可视行**
-//! 且带粘性目标列、`Enter` 提交而 `Shift/Alt+Enter` 与 `Ctrl+J` 插硬换行、光标位置由渲染
+//! 且带粘性目标列、`Enter` 提交而 `Shift+Enter` 与 `Ctrl+J` 插硬换行、光标位置由渲染
 //! 结果回报给宿主）。
 //!
 //! 与上游的差异：
@@ -349,9 +349,15 @@ impl Prompt {
     ///
     /// `chrome.info` 为 `None` 时是平铺形态（标记列 + 内容列）；给了信息行就画四边盒，
     /// 标题内嵌顶边、信息行内嵌底边（与面板壳同一个形状，见 `docs/tui-design.md` §5.1）。
-    pub fn render(&self, ctx: &BlockCtx, chrome: &PromptChrome, focused: bool) -> Vec<BlockLine> {
+    pub fn render(
+        &self,
+        ctx: &BlockCtx,
+        chrome: &PromptChrome,
+        focused: bool,
+        hints: &str,
+    ) -> Vec<BlockLine> {
         if !chrome.boxed() {
-            return self.content_lines(ctx, focused);
+            return self.content_lines(ctx, focused, hints);
         }
         let inner = BlockCtx {
             width: chrome.inner_width(ctx.width),
@@ -362,7 +368,7 @@ impl Prompt {
         } else {
             ctx.theme.prompt_border
         });
-        let lines = self.content_lines(&inner, focused);
+        let lines = self.content_lines(&inner, focused, hints);
         let mut output = Vec::with_capacity(lines.len() + 2);
         output.push(border_line(ctx, border, chrome.title.as_deref(), true));
         for line in lines {
@@ -373,7 +379,7 @@ impl Prompt {
     }
 
     /// 平铺形态：标记列 + 内容列；空输入时画幽灵文案。
-    fn content_lines(&self, ctx: &BlockCtx, focused: bool) -> Vec<BlockLine> {
+    fn content_lines(&self, ctx: &BlockCtx, focused: bool, hints: &str) -> Vec<BlockLine> {
         let marker = ctx.glyphs.resolve(glyphs::prompt());
         let prefix_width = width::display_width(marker);
         let content_width = ctx.content_width(prefix_width).max(1);
@@ -398,7 +404,11 @@ impl Prompt {
                 ];
                 if self.is_empty() && output.is_empty() {
                     spans.push(Span::styled(
-                        "输入消息，Enter 发送，Alt+Enter 换行",
+                        // 键位文案由调用方从 keymap 取（换行、粘贴都算）：键位改了、
+                        // 或终端不支持 Shift+Enter 只能走 Ctrl+J 时，这句话跟着变，不写死。
+                        // 一行放不下太多：`❯` 已经表明这是输入框，于是省掉「输入消息，」，
+                        // 把位置让给粘贴键（Ctrl+V 是终端的事，不说用户会以为程序坏了）。
+                        format!("Enter 发送，{hints} · /help 看命令"),
                         ctx.theme.dim(),
                     ));
                 }
@@ -556,6 +566,10 @@ fn grapheme_at_column(line: &str, row: &(usize, usize), target_column: usize) ->
     row.1
 }
 
+/// 测试里用的键位文案（生产路径由 keymap 给：换行 + 粘贴）。
+#[cfg(test)]
+const NEWLINE_HINT: &str = "Shift+Enter/Ctrl+J 换行 · Ctrl+Shift+V 粘贴";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,7 +693,12 @@ mod tests {
     fn flat_render_marks_the_first_row_and_keeps_rows_aligned() {
         let theme = Theme::DARK;
         let prompt = Prompt::with_text("hi\nthere");
-        let lines = prompt.render(&ctx(&theme, 20), &PromptChrome::default(), true);
+        let lines = prompt.render(
+            &ctx(&theme, 20),
+            &PromptChrome::default(),
+            true,
+            NEWLINE_HINT,
+        );
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text(), "❯ hi");
         assert_eq!(lines[1].text(), "  there");
@@ -695,7 +714,7 @@ mod tests {
         let chrome = PromptChrome::default()
             .with_title("会话 1")
             .with_info("deepseek-chat · rule · always-approve");
-        let lines = prompt.render(&ctx(&theme, 40), &chrome, true);
+        let lines = prompt.render(&ctx(&theme, 40), &chrome, true, NEWLINE_HINT);
         assert_eq!(lines.len(), 3, "顶边 + 内容 + 底边");
         let text: Vec<String> = lines.iter().map(BlockLine::text).collect();
         assert!(text[0].starts_with("╭─ 会话 1 "), "{}", text[0]);
@@ -732,9 +751,23 @@ mod tests {
     fn empty_prompt_shows_ghost_text() {
         let theme = Theme::DARK;
         let prompt = Prompt::new();
-        let lines = prompt.render(&ctx(&theme, 40), &PromptChrome::default(), false);
+        let lines = prompt.render(
+            &ctx(&theme, 40),
+            &PromptChrome::default(),
+            false,
+            NEWLINE_HINT,
+        );
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].text().contains("输入消息"));
+        assert!(
+            lines[0].text().contains("Enter 发送"),
+            "{}",
+            lines[0].text()
+        );
+        assert!(
+            lines[0].text().contains("Ctrl+Shift+V 粘贴"),
+            "{}",
+            lines[0].text()
+        );
         assert!(prompt.is_empty());
     }
 

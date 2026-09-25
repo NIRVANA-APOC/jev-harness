@@ -87,27 +87,24 @@ pub struct ResponsesModel {
 }
 
 impl ResponsesModel {
-    /// 从环境变量构造：`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 三者都必填。
-    ///
-    /// 端点不设默认值，理由与 `judge/llm.rs::from_env_client` 相同：`jh-openai` 的缺省端点是
-    /// 官方 `https://api.openai.com/v1`，只给模型不给端点会把 key 发到不是本人配置的端点上。
+    /// 从环境变量构造：端点在**前**、模型与密钥变量由 [`crate::provider`] 解析——
+    /// 默认 provider 是 DeepSeek，只配 `DEEPSEEK_API_KEY` 即可；`OPENAI_BASE_URL` /
+    /// `OPENAI_MODEL` 仍可覆盖。缺凭据显式失败，不静默回退到别的端点。
     pub fn from_env() -> Result<Self, Error> {
-        let model = std::env::var("OPENAI_MODEL").map_err(|_| {
-            Error::Unavailable("缺少 OPENAI_MODEL：会话通道必须显式给出模型 ID".to_owned())
-        })?;
-        let base_url = std::env::var("OPENAI_BASE_URL").map_err(|_| {
-            Error::Unavailable(
-                "缺少 OPENAI_BASE_URL：会话通道必须显式给出端点，\
-                 否则 key 会被发往 jh-openai 的官方缺省端点"
-                    .to_owned(),
-            )
-        })?;
+        Self::from_config(&crate::provider::from_env()?)
+    }
 
+    /// 换一个模型 ID、其余照环境配置（`/model <id>` 用）。
+    pub fn with_model(model: &str) -> Result<Self, Error> {
+        let config = crate::provider::from_env()?.with_model(model);
+        Self::from_config(&config)
+    }
+
+    /// 按一份解析好的配置构造。
+    pub fn from_config(config: &crate::provider::LlmConfig) -> Result<Self, Error> {
         Ok(Self {
-            client: jh_openai::Client::builder()
-                .model(model)
-                .base_url(base_url)
-                .timeout(DEFAULT_TIMEOUT)
+            client: config
+                .client_builder(DEFAULT_TIMEOUT)
                 .build()
                 .map_err(map_error)?,
         })
@@ -116,6 +113,11 @@ impl ResponsesModel {
     /// 通道的模型 ID（提示框信息行与顶栏用）。
     pub fn model_id(&self) -> &str {
         self.client.model()
+    }
+
+    /// 通道的端点（`/model` 上屏用；不含凭据）。
+    pub fn base_url(&self) -> &str {
+        self.client.base_url()
     }
 }
 

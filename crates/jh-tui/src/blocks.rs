@@ -13,6 +13,8 @@
 //!   `bg_start_col` / `indent_width` / `link_target`，本项目暂无消费者。
 //! - 决策轨迹块是本项目专有：把 Jev 的 `Choice` 概率与 `confidence` 画到屏上，
 //!   全程不塌缩成布尔（AGENTS.md「概率优先」）。
+//! - 助手正文不是纯文本：走 [`crate::markdown`] 的轻量 markdown 子集（用户、工具、
+//!   阶段行仍是纯文本）。
 
 use std::ops::Range;
 
@@ -20,6 +22,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::glyphs::{self, Glyphs};
+use crate::markdown;
 use crate::theme::Theme;
 use crate::width;
 
@@ -292,6 +295,9 @@ pub enum ToolStatus {
     Running,
     Ok,
     Failed,
+    /// 从历史会话接回来的调用：对话记录里只有调用与输出，**没有当时的状态**，
+    /// 所以既不算成功也不算失败（`/resume` 回放专用）。
+    Restored,
 }
 
 /// 用户消息块。
@@ -460,22 +466,10 @@ impl Block {
                         .has_color()
                         .then_some(ctx.theme.user_block_bg),
                     tail: block.timestamp.as_deref(),
-                    streaming: false,
                 },
                 &block.text,
             ),
-            Block::Assistant(block) => text_block_lines(
-                ctx,
-                &TextBlock {
-                    // 标记后留一列空格：与参考截图的 `◆ Thought for 0.3s` 同形。
-                    marker: format!("{} ", ctx.glyphs.resolve(glyphs::diamond())),
-                    style: ctx.theme.fg(),
-                    fill: None,
-                    tail: None,
-                    streaming: block.streaming,
-                },
-                &block.text,
-            ),
+            Block::Assistant(block) => assistant_lines(ctx, block),
             Block::Tool(block) => tool_lines(ctx, block),
             Block::Decision(block) => decision_lines(ctx, &block.trace),
             Block::Notice(block) => notice_lines(ctx, block),
@@ -491,7 +485,7 @@ fn with_bg(style: Style, fill: Option<ratatui::style::Color>) -> Style {
     }
 }
 
-/// 文本类块（用户 / 助手 / 阶段行）的渲染参数。
+/// 文本类块的渲染参数（用户块）。
 struct TextBlock<'a> {
     /// 标记列（已解析字形，含尾随空格）：续行缩进与正文列都按它的宽度算。
     marker: String,
@@ -500,7 +494,6 @@ struct TextBlock<'a> {
     fill: Option<ratatui::style::Color>,
     /// 首行右对齐的尾注（用户块的时间戳）。
     tail: Option<&'a str>,
-    streaming: bool,
 }
 
 /// 消息类块的共用渲染：标记列 + 词级换行 + 续行缩进（+ 可选填充条与尾注）。
@@ -511,11 +504,11 @@ fn text_block_lines(ctx: &BlockCtx, spec: &TextBlock, text: &str) -> BlockOutput
     let mut output = BlockOutput::default();
 
     let paragraphs: Vec<&str> = text.split('\n').collect();
-    let last_paragraph = paragraphs.len() - 1;
     for (paragraph_index, paragraph) in paragraphs.iter().enumerate() {
-        let wrapped = width::wrap_words(paragraph, content_width);
-        let last_row = wrapped.len() - 1;
-        for (line_index, text) in wrapped.iter().enumerate() {
+        for (line_index, text) in width::wrap_words(paragraph, content_width)
+            .iter()
+            .enumerate()
+        {
             let head = if paragraph_index == 0 && line_index == 0 {
                 marker.to_owned()
             } else {
@@ -525,13 +518,6 @@ fn text_block_lines(ctx: &BlockCtx, spec: &TextBlock, text: &str) -> BlockOutput
                 Span::styled(head, with_bg(ctx.theme.dim(), spec.fill)),
                 Span::styled(text.clone(), with_bg(spec.style, spec.fill)),
             ];
-            // 流式末尾画一个「还在长」的三角，与软换行标记一样只是行级元数据之外的装饰。
-            if spec.streaming && paragraph_index == last_paragraph && line_index == last_row {
-                spans.push(Span::styled(
-                    ctx.glyphs.resolve(glyphs::triangle_right()),
-                    ctx.theme.dim(),
-                ));
-            }
             // 尾注贴在填充条的右端：先补间隙再写尾注，尾注之后不再补空白。
             let tail = match (paragraph_index, line_index) {
                 (0, 0) => spec.tail,
@@ -573,6 +559,83 @@ fn text_block_lines(ctx: &BlockCtx, spec: &TextBlock, text: &str) -> BlockOutput
         ));
     }
     output
+}
+
+/// 助手正文：轻量 markdown 子集（[`crate::markdown`]）+ 按显示宽度折行。
+///
+/// 与用户 / 工具块的区别只在正文：正文不是纯文本，标题、列表、代码块、引用与行内标记
+/// 各有样式（映射表见 [`crate::markdown`]）。流式正文可能停在半个标记上，
+/// 降级规则在 markdown 侧：未闭合的围栏把它之后的内容全当代码块，未闭合的行内标记原样落字。
+fn assistant_lines(ctx: &BlockCtx, block: &AssistantBlock) -> BlockOutput {
+    // 标记后留一列空格：与参考截图的 `◆ Thought for 0.3s` 同形。
+    let marker = format!("{} ", ctx.glyphs.resolve(glyphs::diamond()));
+    let prefix_width = width::display_width(&marker);
+    let content_width = ctx.content_width(prefix_width).max(1);
+    let logical = markdown::parse(&block.text, ctx.theme, content_width);
+    let last_logical = logical.len().saturating_sub(1);
+    let mut output = BlockOutput::default();
+
+    for (logical_index, line) in logical.into_iter().enumerate() {
+        // 逐条逻辑行折行：同一条逻辑行内的续行才算软换行（行级 `joiner`）。
+        let rows = markdown::wrap_lines(vec![line], content_width, prefix_width);
+        let last_row = rows.len().saturating_sub(1);
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+            // 块标记只画在全文第一行；其余行首列用等宽空白，续行的缩进由折行带在行内。
+            let (head, start) = if row_index == 0 {
+                let head = if logical_index == 0 {
+                    marker.clone()
+                } else {
+                    " ".repeat(prefix_width)
+                };
+                (Some(Span::styled(head, ctx.theme.dim())), prefix_width)
+            } else {
+                (None, leading_blanks(&row))
+            };
+            let end = start + width::display_width(&text);
+            let mut spans = Vec::with_capacity(row.spans.len() + 2);
+            spans.extend(head);
+            spans.extend(row.spans);
+            // 流式末尾的「还在长」三角：与纯文本块同形，且不算进可选范围。
+            if block.streaming && logical_index == last_logical && row_index == last_row {
+                spans.push(Span::styled(
+                    ctx.glyphs.resolve(glyphs::triangle_right()),
+                    ctx.theme.dim(),
+                ));
+            }
+            let line = BlockLine::new(
+                Line::from(spans),
+                Selectable::Spans(start as u16..end as u16),
+            );
+            output.push(if row_index == 0 {
+                line
+            } else {
+                line.soft_wrapped()
+            });
+        }
+    }
+    // 正文里只有一个未闭合的围栏标记时折行产不出任何行：块标记仍要上屏（同纯文本块的兜底）。
+    if output.is_empty() {
+        let mut spans = vec![Span::styled(marker, ctx.theme.dim())];
+        if block.streaming {
+            spans.push(Span::styled(
+                ctx.glyphs.resolve(glyphs::triangle_right()),
+                ctx.theme.dim(),
+            ));
+        }
+        output.push(BlockLine::new(Line::from(spans), Selectable::None));
+    }
+    output
+}
+
+/// 续行行首的空白宽度（[`crate::markdown::wrap_lines`] 补的续行缩进）：复制时不算进正文。
+fn leading_blanks(line: &Line<'static>) -> usize {
+    match line.spans.first() {
+        Some(span) if !span.content.is_empty() && span.content.chars().all(|ch| ch == ' ') => {
+            width::display_width(span.content.as_ref())
+        }
+        _ => 0,
+    }
 }
 
 /// 阶段行：标记列 + 词级换行，语气来自 [`NoticeBlock::tone`]。
@@ -618,10 +681,12 @@ fn notice_lines(ctx: &BlockCtx, block: &NoticeBlock) -> BlockOutput {
 fn tool_lines(ctx: &BlockCtx, block: &ToolBlock) -> BlockOutput {
     let marker = match block.status {
         ToolStatus::Running => glyphs::spinner_frame(ctx.glyphs, ctx.frame),
+        // 历史接回的行首用「点」而不是「三角」：一眼看得出这不是本次运行的调用。
+        ToolStatus::Restored => ctx.glyphs.resolve(glyphs::dot()),
         _ => ctx.glyphs.resolve(glyphs::triangle_right()),
     };
     let status_style = match block.status {
-        ToolStatus::Running => ctx.theme.muted(),
+        ToolStatus::Running | ToolStatus::Restored => ctx.theme.muted(),
         ToolStatus::Ok => ctx.theme.accent(ctx.theme.accent_success),
         ToolStatus::Failed => ctx.theme.accent(ctx.theme.accent_error),
     };

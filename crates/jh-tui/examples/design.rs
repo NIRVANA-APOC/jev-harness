@@ -2,7 +2,7 @@
 //!
 //! - **非 TTY**（管道 / CI）：逐屏打纯文本单帧（首屏 / 主界面 / 主界面+审批卡 /
 //!   研究视图的三个面板 / 无色回退档），离线、可复现，用来肉眼核对线框。
-//! - **TTY**：进备用屏跑交互循环：`Enter` 发送、`Alt+Enter` 换行、`Ctrl+O` 切研究视图、
+//! - **TTY**：进备用屏跑交互循环：`Enter` 发送、`Shift+Enter` 换行、`Ctrl+O` 切研究视图、
 //!   `Tab` / `Shift+Tab` 切面板、`s` 单步、`Space` 暂停、`Esc` 返回会话、`Ctrl+C` 退出。
 //!
 //! 数据全是本地的：不调模型、不联网（接线见设计文档 §9 批次四）。
@@ -161,6 +161,26 @@ fn demo_hook(app: &mut App, event: &Event) {
 /// 预览的假宿主：把副作用变成屏幕上看得见的块。
 fn apply_effect(app: &mut App, effect: Effect) {
     match effect {
+        // 预览没有真实终端剪贴板：复制只回执一句。
+        Effect::Copy { text, rows } => {
+            app.push_block(Block::plain_notice(format!(
+                "预览窗口不写剪贴板：本来要复制 {rows} 行 / {} 字节。",
+                text.len()
+            )));
+        }
+        // 预览没有会话状态：选项列表里选中什么都不执行，只回执一句。
+        Effect::Choice { command, value } => {
+            app.push_block(Block::plain_notice(format!(
+                "预览窗口没有会话状态：`/{command} {value}` 不执行。"
+            )));
+        }
+        // 预览没有会话状态：命令照实回一句「预览不支持」，不假装执行过。
+        Effect::Command(call) => {
+            app.push_block(Block::plain_notice(format!(
+                "预览窗口不接会话状态，/{0} {1} 只在这里回执。",
+                call.name, call.args
+            )));
+        }
         Effect::Submit(text) => {
             let reply =
                 format!("收到「{text}」。预览不调真实模型，这里只回显，并假装做了一次 Jev 判定。");

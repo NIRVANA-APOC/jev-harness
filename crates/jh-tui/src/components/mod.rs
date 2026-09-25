@@ -11,12 +11,17 @@ pub mod prompt;
 pub mod scrollback;
 pub mod status;
 
-pub use approval::{ActiveModal, ApprovalCard, ApprovalOption, ApprovalRequest};
+pub use approval::{
+    ActiveModal, ApprovalCard, ApprovalCardReading, ApprovalOption, ApprovalOptionHit,
+    ApprovalRequest,
+};
 pub use header::{HeaderBar, HeaderModel};
 pub use panel::{Panel, PanelLine, PanelState, PanelTitle, Tone};
 pub use prompt::{MAX_PROMPT_ROWS, Prompt, PromptChrome, TextCursor};
 pub use scrollback::{ScrollHint, ScrollWindow, Scrollback};
-pub use status::{ShortcutBar, StatusModel, TurnPhase, WaitingReason};
+pub use status::{
+    ShortcutBar, ShortcutBarReading, ShortcutChip, StatusModel, TurnPhase, WaitingReason,
+};
 
 use ratatui::style::Style;
 use ratatui::text::Span;

@@ -7,7 +7,7 @@
 //! 状态行是本项目「概率上屏」的落点（设计 §7.3 P2）：把 Jev 的 `Choice` 概率与
 //! `confidence` 直接写进文案，不塌缩成布尔、也不新增可视化组件。
 
-use crate::actions::{KeyChord, KeyOwner, Keymap};
+use crate::actions::{KeyChord, KeyHint, KeyOwner, Keymap};
 use crate::blocks::{BlockCtx, BlockLine, Selectable};
 use crate::glyphs;
 use crate::width;
@@ -171,42 +171,65 @@ impl StatusModel {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ShortcutBar;
 
+/// 快捷键栏的渲染结果：行 + 每条提示占的列范围（供鼠标点击命中）。
+#[derive(Debug, Clone)]
+pub struct ShortcutBarReading {
+    pub line: BlockLine,
+    /// 每条提示的列区间（相对栏首列）与它的键位；点它等于按这个键。
+    pub chips: Vec<ShortcutChip>,
+}
+
+/// 一条可点的快捷键提示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortcutChip {
+    pub start: usize,
+    pub width: usize,
+    pub chord: KeyChord,
+}
+
 impl ShortcutBar {
     /// 渲染一行快捷键提示：按显示列放**整条**提示，放不下的整条丢掉并在末尾补省略号。
-    pub fn render(ctx: &BlockCtx, keymap: &Keymap, owner: KeyOwner) -> BlockLine {
+    pub fn render(ctx: &BlockCtx, keymap: &Keymap, owner: KeyOwner) -> ShortcutBarReading {
         let hints = keymap.hints(owner);
-        let (full, placed) = hint_spans(&hints, ctx, ctx.width);
-        let spans = if placed == hints.len() {
-            full
+        let (full, placed, chips) = hint_spans(&hints, ctx, ctx.width);
+        let (spans, chips) = if placed == hints.len() {
+            (full, chips)
         } else {
             let ellipsis = ctx.glyphs.resolve(glyphs::ellipsis());
             let reserve = width::display_width(ellipsis) + 1;
-            let (mut clipped, _) = hint_spans(&hints, ctx, ctx.width.saturating_sub(reserve));
+            let (mut clipped, _, chips) =
+                hint_spans(&hints, ctx, ctx.width.saturating_sub(reserve));
             if !clipped.is_empty() {
                 clipped.push(Span::styled(" ".to_owned(), ctx.theme.dim()));
             }
             clipped.push(Span::styled(ellipsis.to_owned(), ctx.theme.dim()));
-            clipped
+            (clipped, chips)
         };
-        BlockLine::new(Line::from(spans), Selectable::None)
+        ShortcutBarReading {
+            line: BlockLine::new(Line::from(spans), Selectable::None),
+            chips,
+        }
     }
 }
 
-/// 在 `budget` 列内尽量多放整条提示，返回 `(spans, 放下的条数)`。
+/// 在 `budget` 列内尽量多放整条提示，返回 `(spans, 放下的条数, 每条的位置)`。
 fn hint_spans(
-    hints: &[(KeyChord, &'static str)],
+    hints: &[KeyHint],
     ctx: &BlockCtx,
     budget: usize,
-) -> (Vec<Span<'static>>, usize) {
+) -> (Vec<Span<'static>>, usize, Vec<ShortcutChip>) {
     let separator = ctx.glyphs.resolve(glyphs::separator());
     // 提示之间是「空格 + 分隔符 + 空格」，宽度跟着字形表走。
     let separator_width = width::display_width(separator) + 2;
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chips: Vec<ShortcutChip> = Vec::new();
     let mut used = 0usize;
     let mut placed = 0usize;
-    for (chord, label) in hints {
-        let piece_width = width::display_width(&chord.display()) + 1 + width::display_width(label);
-        let joined_width = used + if placed == 0 { 0 } else { separator_width } + piece_width;
+    for hint in hints {
+        let piece_width =
+            width::display_width(&hint.key_text) + 1 + width::display_width(hint.label);
+        let gap = if placed == 0 { 0 } else { separator_width };
+        let joined_width = used + gap + piece_width;
         if joined_width > budget {
             break;
         }
@@ -214,14 +237,19 @@ fn hint_spans(
             spans.push(Span::styled(format!(" {separator} "), ctx.theme.dim()));
         }
         spans.push(Span::styled(
-            chord.display(),
+            hint.key_text.clone(),
             ctx.theme.accent(ctx.theme.accent_system),
         ));
-        spans.push(Span::styled(format!(" {label}"), ctx.theme.dim()));
+        spans.push(Span::styled(format!(" {}", hint.label), ctx.theme.dim()));
+        chips.push(ShortcutChip {
+            start: used + gap,
+            width: piece_width,
+            chord: hint.chord,
+        });
         used = joined_width;
         placed += 1;
     }
-    (spans, placed)
+    (spans, placed, chips)
 }
 
 #[cfg(test)]
@@ -323,7 +351,7 @@ mod tests {
     fn shortcut_bar_uses_the_registry_and_truncates() {
         let theme = Theme::DARK;
         let keymap = Keymap::from_defaults();
-        let wide = ShortcutBar::render(&ctx(&theme, 80, None), &keymap, KeyOwner::Prompt);
+        let wide = ShortcutBar::render(&ctx(&theme, 80, None), &keymap, KeyOwner::Prompt).line;
         let text = wide.text();
         assert!(text.contains("Ctrl+c 退出"), "{text}");
         assert!(text.contains("Enter 发送"), "{text}");
@@ -331,7 +359,7 @@ mod tests {
         assert_eq!(wide.selectable, Selectable::None);
 
         // 窄屏：整条丢，末尾补省略号，不撕裂某条提示。
-        let narrow = ShortcutBar::render(&ctx(&theme, 18, None), &keymap, KeyOwner::Prompt);
+        let narrow = ShortcutBar::render(&ctx(&theme, 18, None), &keymap, KeyOwner::Prompt).line;
         assert!(
             width::display_width(&narrow.text()) <= 19,
             "{:?}",
@@ -340,7 +368,8 @@ mod tests {
         assert!(narrow.text().ends_with('…'));
 
         // 审批卡在时栏里是权限键。
-        let approval = ShortcutBar::render(&ctx(&theme, 80, None), &keymap, KeyOwner::Approval);
+        let approval =
+            ShortcutBar::render(&ctx(&theme, 80, None), &keymap, KeyOwner::Approval).line;
         assert!(
             approval.text().contains("y 允许一次"),
             "{}",

@@ -171,7 +171,7 @@ pub fn assess(command: &str) -> Risk {
 /// 门控结论：采纳了哪个选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// 采纳「允许执行」：照常走人工审批卡。
+    /// 采纳「允许执行」且过了门槛：`auto` 模式直接执行，其余模式上卡。
     Allow,
     /// 采纳「拒绝执行」且过了门槛：不上卡，直接拒绝并写明出路。
     Refuse,
@@ -427,12 +427,12 @@ fn classify(answer: Option<&Answer>, thresholds: Thresholds) -> Classified {
     };
     let margin = margin(choice, &top);
     let confidence = choice.confidence;
+    // **两个方向都要过门槛**：`auto` 模式采纳「允许」就直接执行，低置信度的允许不能算采纳
+    // （旧口径只卡拒绝，是因为那时允许也要走人工卡；现在不是了）。
+    let adopted = margin >= thresholds.margin && confidence >= thresholds.confidence;
     let verdict = match top.as_str() {
-        OPTION_ALLOW => Verdict::Allow,
-        OPTION_DENY if margin >= thresholds.margin && confidence >= thresholds.confidence => {
-            Verdict::Refuse
-        }
-        OPTION_DENY => Verdict::Ask,
+        OPTION_ALLOW if adopted => Verdict::Allow,
+        OPTION_DENY if adopted => Verdict::Refuse,
         _ => Verdict::Ask,
     };
     let lean = match verdict {
@@ -735,11 +735,13 @@ mod tests {
             refused.refuse_text()
         );
 
-        // 分布太接近：首选是允许，但差距只有 0.04——照旧上卡，理由里带着这两个读数。
+        // 分布太接近：首选是允许，但差距只有 0.04——**两个方向都卡门槛**，所以不采纳、交人工。
+        // （`auto` 模式采纳即执行，低置信度的允许不能算采纳；旧口径只卡拒绝。）
         let toss =
             crate::session::test_support::block_on(call(Stub::toss_up(), "cargo build").ask());
-        assert_eq!(toss.verdict, Verdict::Allow);
+        assert_eq!(toss.verdict, Verdict::Ask);
         assert!(toss.reason.contains("margin 0.04"), "{}", toss.reason);
+        assert!(toss.reason.contains("交人工裁决"), "{}", toss.reason);
 
         // 首选是拒绝但 confidence 没过门槛：不采纳，交人工。
         let asked = crate::session::test_support::block_on(
