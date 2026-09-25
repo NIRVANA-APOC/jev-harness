@@ -274,7 +274,8 @@ pub enum LogRow {
 #[derive(Debug)]
 pub struct JsonlEvidenceLog {
     path: PathBuf,
-    file: File,
+    /// 文件句柄：第一次写入时才开（`open` 不建文件，见 `writer`）。
+    file: Option<File>,
     memory: MemoryEvidenceLog,
 }
 
@@ -305,12 +306,37 @@ impl JsonlEvidenceLog {
             }
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| Error::Storage(format!("{} 无法写入：{error}", path.display())))?;
-        Ok(Self { path, file, memory })
+        // **不在这里建文件**：`create(true)` 会立刻落一个 0 字节文件，于是「开着不用」的会话
+        // 也会在磁盘上留痕。句柄推迟到第一次写入（见 `writer`）。
+        Ok(Self {
+            path,
+            file: None,
+            memory,
+        })
+    }
+
+    /// 第一次写入时才开文件：目录一并建（会话目录由调用方的落盘时机决定）。
+    fn writer(&mut self) -> Result<&mut File, Error> {
+        if self.file.is_none() {
+            if let Some(parent) = self
+                .path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    Error::Storage(format!("{} 无法写入：{error}", parent.display()))
+                })?;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|error| {
+                    Error::Storage(format!("{} 无法写入：{error}", self.path.display()))
+                })?;
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().expect("上面刚开出来"))
     }
 
     /// 日志文件路径。
@@ -322,10 +348,11 @@ impl JsonlEvidenceLog {
         let mut line = serde_json::to_string(row)
             .map_err(|error| Error::Storage(format!("记录无法序列化：{error}")))?;
         line.push('\n');
-        self.file
-            .write_all(line.as_bytes())
-            .and_then(|()| self.file.flush())
-            .map_err(|error| Error::Storage(format!("{} 无法写入：{error}", self.path.display())))
+        let path = self.path.clone();
+        let file = self.writer()?;
+        file.write_all(line.as_bytes())
+            .and_then(|()| file.flush())
+            .map_err(|error| Error::Storage(format!("{} 无法写入：{error}", path.display())))
     }
 }
 
@@ -375,6 +402,31 @@ mod tests {
             version: ObjectVersion(version),
             content,
         }
+    }
+
+    /// **`open` 不建文件**：所谓「开着不用的会话」不该在磁盘上留下任何东西。
+    #[test]
+    fn jsonl_open_leaves_no_file_until_the_first_write() {
+        let dir = std::env::temp_dir().join(format!("jh-evidence-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("evidence.jsonl");
+        let mut log = JsonlEvidenceLog::open(&path).expect("打开不该失败");
+        assert!(!path.exists(), "只打开不写，不该建文件");
+        assert!(!path.parent().expect("有父目录").exists(), "父目录也不该建");
+
+        // 第一次写入才建目录与文件。
+        let entry = log
+            .append(NewEvidence {
+                source: "test".to_owned(),
+                at_unix_ms: 1,
+                object: ObjectId::from("probe"),
+                version: crate::evidence::ObjectVersion(1),
+                content: json!({ "v": 1 }),
+            })
+            .expect("写入");
+        assert!(path.is_file(), "写入了就要有文件");
+        assert_eq!(entry.object, ObjectId::from("probe"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
